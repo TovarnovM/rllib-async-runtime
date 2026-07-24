@@ -346,16 +346,16 @@ class FastReplay:
         deadline = self._deadline(timeout)
         with self._condition:
             while True:
-                if (
-                    self._active_view is not None
-                    and self._active_view.sampling_index.total_transitions >= minimum
-                ):
-                    return True
                 if self._rebuild_error is not None and not self._rebuild_running:
                     error = self._rebuild_error
                     raise IndexRebuildError(
                         f"background index rebuild failed: {error}"
                     ) from error
+                if (
+                    self._active_view is not None
+                    and self._active_view.sampling_index.total_transitions >= minimum
+                ):
+                    return True
                 if self._closed:
                     return False
                 remaining = self._remaining(deadline)

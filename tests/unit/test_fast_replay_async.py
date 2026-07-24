@@ -213,6 +213,8 @@ def test_rebuild_failure_preserves_active_view_and_snapshot_can_recover() -> Non
 
     with pytest.raises(IndexRebuildError, match="controlled rebuild failure"):
         replay.wait_for_idle(timeout=2)
+    with pytest.raises(IndexRebuildError, match="controlled rebuild failure"):
+        replay.wait_for_transitions(timeout=0)
     assert replay.active_cursor is not None
     assert replay.active_cursor.mutation_seq == 1
     assert replay.sample(1, rng=random.Random(4)) == [("first", 0)]
