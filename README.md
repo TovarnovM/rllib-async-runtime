@@ -92,7 +92,7 @@ Phase 2 provides:
 - commit, duplicate, rejection, conflict, eviction, journal, and dedup metrics;
 - versioned replay state containing retention configuration, cursor, journal,
   the journal base manifest, retained payloads, and commit-ordered
-  deduplication fingerprints;
+  deduplication fingerprints with transition/byte retention metadata;
 - checksummed atomic checkpoint replacement and validate-before-swap restore;
 - a 16-producer concurrency gate and a sustained FIFO-retention stress test.
 
@@ -100,10 +100,11 @@ Replay checkpoints use pickle for trusted local Python state and must never be
 loaded from untrusted sources. The checksum detects accidental corruption; it
 does not authenticate a checkpoint.
 
-Exact duplicate/conflict detection after FIFO eviction requires retaining one
-episode ID and SHA-256 fingerprint for every successful commit in the current
+Exact duplicate/conflict detection and journal-base validation after FIFO
+eviction require retaining one episode ID, SHA-256 fingerprint, transition
+count, and approximate byte size for every successful commit in the current
 store generation. Retained training payload and the delta journal are bounded,
-but this deduplication metadata is intentionally monotonic and exposed through
+but this metadata is intentionally monotonic and exposed through
 `deduplication_entries`. A production-scale retry-horizon or generation-rotation
 policy remains required before claiming fully bounded process memory.
 

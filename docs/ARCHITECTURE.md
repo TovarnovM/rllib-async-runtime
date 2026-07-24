@@ -29,15 +29,17 @@ Phase 2 adds the authoritative process boundary:
 - one synchronous Ray actor serializes every store operation;
 - actor methods remain finite and perform no batch sampling;
 - replay checkpoints preserve retention configuration, cursor, journal and its
-  base manifest, payload manifest, exact deduplication state, and metrics;
+  base manifest, payload manifest, commit-ordered identity/retention metadata,
+  and metrics;
 - save uses checksummed atomic replacement on a POSIX filesystem;
 - restore replays and validates exact FIFO evictions before replacing live
   state.
 
 Retained episode payload and the mutation journal are bounded. Exact
-full-generation conflict detection keeps one ID and fingerprint per committed
-episode, so total deduplication metadata is not yet bounded. This limitation is
-measured explicitly rather than hidden behind the FIFO payload capacity.
+full-generation conflict detection and journal-base validation keep one ID,
+fingerprint, transition count, and approximate byte size per committed episode,
+so total metadata is not yet bounded. This limitation is measured explicitly
+rather than hidden behind the FIFO payload capacity.
 
 The project still contains no optimized learner-local replay, asynchronous
 execution loop, hierarchy, or graph encoder.

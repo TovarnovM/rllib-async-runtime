@@ -162,6 +162,76 @@ def test_checksummed_state_with_incorrect_journal_eviction_is_rejected(
         EpisodeStore.from_state(codec, checksummed_state)
 
 
+def test_checksummed_state_with_incomplete_journal_base_manifest_is_rejected(
+    tmp_path: Path,
+) -> None:
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(
+        codec,
+        capacity_transitions=1,
+        capacity_bytes=10_000,
+        journal_capacity=1,
+        store_generation="incomplete-journal-base-manifest",
+    )
+    first = make_episode(codec, 0, "first")
+    second = make_episode(codec, 1, "second")
+    store.commit_episode(first)
+    store.commit_episode(second)
+
+    state = store.export_state()
+    invalid_state = replace(
+        state,
+        journal_base_manifest=(),
+        journal=(
+            replace(
+                state.journal[0],
+                evicted_episode_ids=(),
+            ),
+        ),
+    )
+    checkpoint_path = tmp_path / "replay.snapshot"
+    write_replay_checkpoint(checkpoint_path, invalid_state)
+
+    checksummed_state = read_replay_checkpoint(checkpoint_path)
+    with pytest.raises(
+        InvalidEpisodeStoreStateError,
+        match="journal base manifest",
+    ):
+        EpisodeStore.from_state(codec, checksummed_state)
+
+
+def test_nonempty_incomplete_journal_base_manifest_is_rejected() -> None:
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(
+        codec,
+        capacity_transitions=2,
+        capacity_bytes=10_000,
+        journal_capacity=1,
+        store_generation="nonempty-incomplete-journal-base-manifest",
+    )
+    episodes = [make_episode(codec, index, index) for index in range(3)]
+    for episode in episodes:
+        store.commit_episode(episode)
+
+    state = store.export_state()
+    invalid_state = replace(
+        state,
+        journal_base_manifest=state.journal_base_manifest[1:],
+        journal=(
+            replace(
+                state.journal[0],
+                evicted_episode_ids=(),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        InvalidEpisodeStoreStateError,
+        match="journal base manifest",
+    ):
+        EpisodeStore.from_state(codec, invalid_state)
+
+
 def test_journal_cannot_move_an_eviction_between_transactions() -> None:
     codec = FlatEpisodeCodec()
     store = EpisodeStore(

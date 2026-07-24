@@ -159,7 +159,7 @@ def test_checkpoint_restore_preserves_payload_journal_and_evicted_deduplication(
         checkpoint = ray.get(source.save_snapshot.remote(str(checkpoint_path)))
         assert checkpoint.path == str(checkpoint_path)
         assert checkpoint.cursor == expected_snapshot.cursor
-        assert checkpoint.format_version == 1
+        assert checkpoint.format_version == 2
         assert checkpoint.size_bytes == checkpoint_path.stat().st_size
         assert len(checkpoint.sha256) == 64
 

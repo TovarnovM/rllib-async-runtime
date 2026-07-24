@@ -25,7 +25,8 @@ The versioned authoritative state contains:
 - store generation and mutation sequence;
 - retained episodes in FIFO order;
 - the retained mutation-journal suffix and its lightweight base manifest;
-- fingerprints for every successfully committed episode ID in commit order;
+- fingerprints plus transition/byte retention metadata for every successfully
+  committed episode ID in commit order;
 - commit, duplicate, rejection, conflict, and eviction counters.
 
 Checkpoint save serializes that immutable state with trusted-local pickle,
@@ -35,12 +36,14 @@ target and `fsync`s the directory. The checksum detects accidental corruption;
 it is not a signature and does not make pickle safe for untrusted input.
 
 Checkpoint load authenticates the byte checksum, deserializes a candidate
-state, validates its codec, capacities, manifest, fingerprints, contiguous
-journal suffix, and metric invariants. It replays the journal from its saved
-base manifest, verifies each exact FIFO eviction against transition and byte
-capacity, and requires the result to equal the retained manifest before
-constructing a separate `EpisodeStore`. The actor swaps its live store only
-after every check succeeds.
+state, validates its codec, capacities, manifest, commit metadata, contiguous
+journal suffix, and metric invariants. It independently reconstructs the
+complete manifest at the journal boundary from commit-ordered retention
+metadata, requires exact equality with the saved base manifest, then replays the
+journal while verifying each exact FIFO eviction against transition and byte
+capacity. The result must equal the retained manifest before constructing a
+separate `EpisodeStore`. The actor swaps its live store only after every check
+succeeds.
 
 ## Consequences
 
@@ -55,13 +58,14 @@ after every check succeeds.
 - The filesystem must be local or shared POSIX-compatible storage visible to
   the actor.
 - Retained training payload and journal memory are bounded by configuration.
-- Exact conflict detection after arbitrary delayed retries requires retaining
-  one episode ID and 32-byte digest per committed episode for the entire store
-  generation. Therefore total actor memory does not strictly stabilize under
-  infinite unique ingest. `deduplication_entries` exposes this growth. Before a
-  production-scale claim, the runtime must choose an explicit generation
-  rotation or bounded retry-window/watermark contract; silently discarding old
-  fingerprints would weaken the accepted Phase 1 semantics.
+- Exact conflict detection after arbitrary delayed retries and independent
+  journal-base validation require retaining one episode ID, 32-byte digest,
+  transition count, and approximate byte size per committed episode for the
+  entire store generation. Therefore total actor memory does not strictly
+  stabilize under infinite unique ingest. `deduplication_entries` exposes this
+  growth. Before a production-scale claim, the runtime must choose an explicit
+  generation rotation or bounded retry-window/watermark contract; silently
+  discarding old commit metadata would weaken the accepted semantics.
 
 ## Rejected alternatives
 
