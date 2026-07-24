@@ -11,6 +11,7 @@ from rllib_async.protocols.episodes import (
 )
 from rllib_async.protocols.replay import (
     CommitAck,
+    ReplayCheckpoint,
     ReplayCursor,
     ReplayDelta,
     ReplaySnapshot,
@@ -26,6 +27,7 @@ __all__ = [
     "FlatEpisodeCodec",
     "FlatEpisodePayload",
     "FrozenVersions",
+    "ReplayCheckpoint",
     "ReplayCursor",
     "ReplayDelta",
     "ReplaySnapshot",

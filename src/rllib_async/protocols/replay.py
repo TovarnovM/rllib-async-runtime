@@ -67,3 +67,20 @@ class ReplayStats:
     total_transitions: int
     total_estimated_bytes: int
     oldest_available_mutation_seq: int
+    journal_entries: int
+    deduplication_entries: int
+    commit_attempts: int
+    committed_episodes: int
+    duplicate_commits: int
+    rejected_commits: int
+    conflicting_commits: int
+    evicted_episodes: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayCheckpoint:
+    path: str
+    format_version: int
+    cursor: ReplayCursor
+    size_bytes: int
+    sha256: str

@@ -1,6 +1,6 @@
 # `rllib-async-runtime`: подробный план реализации
 
-**Статус:** Phase 0 и Phase 1 реализованы; следующий этап — Ray `ReplayActor`
+**Статус:** Phase 0–2 реализованы; следующий этап — learner-local `FastReplay`
 
 **Дата фиксации:** 24 июля 2026
 
@@ -623,7 +623,8 @@ rllib-async-runtime/
 │   └── adr/
 │       ├── 0001-runtime-boundary.md
 │       ├── 0002-episode-replay-quantum.md
-│       └── 0003-authoritative-and-fast-replay.md
+│       ├── 0003-authoritative-and-reference-replay.md
+│       └── 0004-replay-actor-checkpoint.md
 ├── examples/
 │   ├── async_sac_pendulum.py
 │   ├── population_two_members.py
@@ -839,7 +840,10 @@ adapter.
 - 16 concurrent producers не нарушают manifest;
 - commit acknowledgement однозначен;
 - один episode виден либо целиком, либо не виден;
-- actor memory стабилизируется при длительном FIFO test;
+- retained payload и mutation journal ограничены capacity при длительном FIFO
+  test;
+- monotonic deduplication metadata измеряется отдельно; полная стабилизация RSS
+  не заявляется до выбора generation rotation или bounded retry contract;
 - snapshot restore воспроизводит manifest и payload;
 - replay не выполняет batch sampling.
 
@@ -1322,7 +1326,7 @@ Success criterion первого PR:
 - [x] Репозиторий создан пользователем.
 - [x] Phase 0 bootstrap PR.
 - [x] Phase 1 contracts/reference replay.
-- [ ] Phase 2 Ray ReplayActor.
+- [x] Phase 2 Ray ReplayActor.
 - [ ] Phase 3 FastReplay.
 - [ ] Phase 4 SAC adapter.
 - [ ] Phase 5 rollout/version sync.

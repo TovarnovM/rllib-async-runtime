@@ -6,7 +6,7 @@ import pytest
 import ray
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def ray_runtime() -> Iterator[None]:
     """Start Ray only for tests that actually exercise remote scheduling."""
     ray.init(

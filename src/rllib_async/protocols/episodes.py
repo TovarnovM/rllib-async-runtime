@@ -170,6 +170,7 @@ class EpisodeEnvelope:
 class EpisodeCodec(Protocol):
     """Storage-independent access to an episode payload."""
 
+    codec_id: str
     schema_version: int
 
     def validate(self, episode: EpisodeEnvelope) -> None: ...
@@ -184,6 +185,7 @@ class EpisodeCodec(Protocol):
 class FlatEpisodeCodec:
     """Correctness-first codec for single-agent flat transitions."""
 
+    codec_id = "flat-pickle-v1"
     schema_version = 1
 
     def encode(self, transitions: Iterable[Any]) -> FlatEpisodePayload:

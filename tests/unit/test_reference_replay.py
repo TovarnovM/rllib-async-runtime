@@ -89,6 +89,13 @@ def test_duplicate_commit_is_idempotent_and_conflict_is_explicit() -> None:
     with pytest.raises(DuplicateEpisodeConflictError):
         store.commit_episode(replace(episode, runner_id="different-runner"))
     assert store.get_snapshot() == before
+    stats = store.get_stats()
+    assert stats.commit_attempts == 3
+    assert stats.committed_episodes == 1
+    assert stats.duplicate_commits == 1
+    assert stats.rejected_commits == 1
+    assert stats.conflicting_commits == 1
+    assert stats.evicted_episodes == 0
 
 
 def test_duplicate_commit_remains_idempotent_after_episode_eviction() -> None:
@@ -147,6 +154,8 @@ def test_oversize_and_schema_mismatch_leave_store_unchanged() -> None:
     assert transition_limited.get_stats().episode_count == 0
     assert byte_limited.cursor.mutation_seq == 0
     assert transition_limited.cursor.mutation_seq == 0
+    assert byte_limited.get_stats().rejected_commits == 1
+    assert transition_limited.get_stats().rejected_commits == 2
 
 
 def test_snapshot_plus_chunked_deltas_exactly_reconstructs_store() -> None:
@@ -310,3 +319,29 @@ def test_sampling_is_uniform_over_transitions_not_episodes() -> None:
         count / len(coordinates) == pytest.approx(0.1, abs=0.01)
         for count in counts.values()
     )
+
+
+def test_sustained_ingest_bounds_payload_and_journal_but_counts_dedup_growth() -> None:
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(
+        codec,
+        capacity_transitions=64,
+        capacity_bytes=100_000,
+        journal_capacity=32,
+        store_generation="sustained-ingest-reference",
+    )
+
+    for sequence in range(10_000):
+        store.commit_episode(make_episode(codec, sequence, [sequence]))
+
+    stats = store.get_stats()
+    assert stats.episode_count == 64
+    assert stats.total_transitions == 64
+    assert stats.journal_entries == 32
+    assert stats.deduplication_entries == 10_000
+    assert stats.committed_episodes == 10_000
+    assert stats.evicted_episodes == 10_000 - 64
+
+    restored = EpisodeStore.from_state(codec, store.export_state())
+    assert restored.get_snapshot() == store.get_snapshot()
+    assert restored.get_stats() == stats
