@@ -5,6 +5,7 @@ from rllib_async.replay.checkpoint import (
     InvalidReplayCheckpointError,
     ReplayCheckpointError,
 )
+from rllib_async.replay.fast import FastReplay
 from rllib_async.replay.reference import (
     CursorMismatchError,
     DuplicateEpisodeConflictError,
@@ -24,6 +25,7 @@ __all__ = [
     "EpisodeStore",
     "EpisodeStoreState",
     "EpisodeTooLargeError",
+    "FastReplay",
     "FullResyncRequiredError",
     "InvalidEpisodeStoreStateError",
     "InvalidReplayCheckpointError",
