@@ -1,6 +1,6 @@
 # `rllib-async-runtime`: подробный план реализации
 
-**Статус:** архитектура согласована; репозиторий создан; выполняется Phase 0
+**Статус:** Phase 0 и Phase 1 реализованы; следующий этап — Ray `ReplayActor`
 
 **Дата фиксации:** 24 июля 2026
 
@@ -814,6 +814,7 @@ adapter.
 
 - property tests для произвольных add/evict;
 - duplicate commit не меняет store;
+- delayed duplicate commit остаётся no-op после FIFO eviction;
 - oversize episode отклоняется;
 - snapshot + все последующие delta дают точное состояние store;
 - stale cursor требует full resync;
@@ -1319,8 +1320,8 @@ Success criterion первого PR:
 - [x] Имя репозитория выбрано.
 - [x] План реализации сформирован.
 - [x] Репозиторий создан пользователем.
-- [ ] Phase 0 bootstrap PR.
-- [ ] Phase 1 contracts/reference replay.
+- [x] Phase 0 bootstrap PR.
+- [x] Phase 1 contracts/reference replay.
 - [ ] Phase 2 Ray ReplayActor.
 - [ ] Phase 3 FastReplay.
 - [ ] Phase 4 SAC adapter.
