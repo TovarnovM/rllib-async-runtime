@@ -40,14 +40,18 @@ uv sync --locked --extra cu118 --group dev
 All remaining commands in this README run inside the devcontainer:
 
 ```bash
-uv run ruff check .
-uv run ruff format --check .
-uv run pytest -m "not gpu and not cluster and not stress"
-uv run pytest -m gpu tests/gpu
+uv run --locked --extra cu118 --group dev ruff check .
+uv run --locked --extra cu118 --group dev ruff format --check .
+uv run --locked --extra cu118 --group dev \
+  pytest -m "not gpu and not cluster and not stress"
+uv run --locked --extra cu118 --group dev pytest -m gpu tests/gpu
 ```
 
 The CPU-only GitHub Actions job uses the same lock file with the mutually
-exclusive `cpu` PyTorch extra.
+exclusive `cpu` PyTorch extra. Keep the selected extra on the `uv run` command,
+not only on the preceding `uv sync`: Ray 2.56 propagates the original `uv run`
+arguments to worker processes, and omitting the extra would create workers
+without PyTorch.
 
 ## Phase 0 compatibility gate
 
