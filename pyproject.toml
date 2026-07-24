@@ -1,0 +1,87 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rllib-async-runtime"
+version = "0.0.1"
+description = "Experimental Ray-native asynchronous off-policy runtime built on RLlib"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = "Apache-2.0"
+authors = [
+    { name = "Mikhail Tovarnov" },
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "ray[rllib]==2.56.1",
+]
+
+[project.optional-dependencies]
+cpu = [
+    "torch==2.7.0",
+]
+cu118 = [
+    "torch==2.7.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.4.1",
+    "ruff==0.12.5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rllib_async"]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cu118" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu118", extra = "cu118" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+markers = [
+    "cluster: requires a separately managed Ray cluster",
+    "gpu: requires NVIDIA Container Toolkit and at least one NVIDIA GPU",
+    "integration: crosses more than one RLlib component boundary",
+    "stress: long-running load or endurance test",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

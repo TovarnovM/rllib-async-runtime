@@ -1,0 +1,33 @@
+{
+  "name": "rllib-async-runtime",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "..",
+    "args": {
+      "UV_VERSION": "0.11.29"
+    }
+  },
+  "runArgs": [
+    "--gpus=all",
+    "--shm-size=8g"
+  ],
+  "remoteUser": "vscode",
+  "postCreateCommand": "uv sync --locked --extra cu118 --group dev",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.debugpy",
+        "charliermarsh.ruff"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/rllib-async-venv/bin/python",
+        "python.testing.pytestEnabled": true,
+        "python.testing.pytestArgs": [
+          "tests"
+        ],
+        "ruff.nativeServer": "on"
+      }
+    }
+  }
+}
