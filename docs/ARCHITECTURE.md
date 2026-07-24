@@ -54,9 +54,23 @@ Phase 3A adds the correctness-first learner-local materialization boundary:
 - manifest/index rebuilds reuse immutable episode envelopes rather than copying
   payloads.
 
-Index construction is still synchronous and linear in retained episodes.
-Background rebuild, bounded batch queues, collators, and hot-path metrics remain
-Phase 3B work. The project still contains no asynchronous execution loop,
+Phase 3B moves index construction and batch preparation off the consumer path:
+
+- the latest validated target manifest/cursor is distinct from the immutable
+  active sampling view;
+- one coalescing worker publishes only the latest completed index revision;
+- sampling captures a strong view lease, so an in-flight reader retains any
+  payload evicted during a concurrent swap;
+- stale and failed builds never replace the active view;
+- a flat collator produces contiguous NumPy columns;
+- one bounded batch producer provides explicit lifecycle, queue backpressure,
+  data-wait, delta-lag, and rebuild metrics.
+
+Phase 3B does not add a second payload graph. Active and retired views contain
+only tuples of references to immutable episode envelopes, and Python ownership
+defers reclamation until readers release those views.
+
+The project still contains no SAC learner adapter, rollout execution loop,
 hierarchy, or graph encoder.
 
 See [ADR 0001](adr/0001-runtime-boundary.md) for the orchestration decision and
@@ -64,5 +78,6 @@ See [ADR 0001](adr/0001-runtime-boundary.md) for the orchestration decision and
 [ADR 0003](adr/0003-authoritative-and-reference-replay.md) for replay semantics.
 [ADR 0004](adr/0004-replay-actor-checkpoint.md) records the actor and checkpoint
 boundary, and [ADR 0005](adr/0005-fast-replay-materialized-view.md) records the
-Phase 3A learner-local view.
+Phase 3A learner-local view. [ADR 0006](adr/0006-reader-safe-rebuild-and-batch-pipeline.md)
+records background publication and the bounded batch pipeline.
 See [the implementation plan](IMPLEMENTATION_PLAN.md) for phase gates.
