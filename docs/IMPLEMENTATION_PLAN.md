@@ -1,7 +1,7 @@
 # `rllib-async-runtime`: подробный план реализации
 
-**Статус:** Phase 0–3 реализованы; следующий этап — RLlib SAC learner adapter
-в Phase 4
+**Статус:** Phase 0–4 реализованы; следующий этап — episode rollout и
+versioned weights в Phase 5
 
 **Дата фиксации:** 24 июля 2026
 
@@ -626,7 +626,9 @@ rllib-async-runtime/
 │       ├── 0002-episode-replay-quantum.md
 │       ├── 0003-authoritative-and-reference-replay.md
 │       ├── 0004-replay-actor-checkpoint.md
-│       └── 0005-fast-replay-materialized-view.md
+│       ├── 0005-fast-replay-materialized-view.md
+│       ├── 0006-reader-safe-rebuild-and-batch-pipeline.md
+│       └── 0007-rllib-sac-learner-adapter.md
 ├── examples/
 │   ├── async_sac_pendulum.py
 │   ├── population_two_members.py
@@ -883,13 +885,13 @@ Phase 3 разделён на correctness-first Phase 3A и асинхронны
 
 ### Задачи
 
-1. Реализовать `SACLearnerAdapter`.
-2. Преобразовать collated batch в точный формат RLlib learner.
-3. Реализовать learning-start threshold.
-4. Реализовать target update semantics через RLlib.
-5. Реализовать publication interval весов.
-6. Реализовать полный member checkpoint.
-7. Сравнить fixed-batch updates со стандартным RLlib SAC.
+1. [x] Реализовать `SACLearnerAdapter`.
+2. [x] Преобразовать collated batch в точный формат RLlib learner.
+3. [x] Реализовать learning-start threshold.
+4. [x] Реализовать target update semantics через RLlib.
+5. [x] Реализовать publication interval весов.
+6. [x] Реализовать полный member checkpoint.
+7. [x] Сравнить fixed-batch updates со стандартным RLlib SAC.
 
 ### Критерии готовности
 
@@ -1335,7 +1337,7 @@ Success criterion первого PR:
 - [x] Phase 2 Ray ReplayActor.
 - [x] Phase 3A correctness-first FastReplay.
 - [x] Phase 3B asynchronous FastReplay hot path.
-- [ ] Phase 4 SAC adapter.
+- [x] Phase 4 SAC adapter.
 - [ ] Phase 5 rollout/version sync.
 - [ ] Phase 6 single-member AsyncSAC.
 - [ ] Phase 7 checkpoint/recovery.

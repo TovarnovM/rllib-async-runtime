@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from numbers import Number
 from typing import Any
 
@@ -19,43 +19,7 @@ from ray.rllib.utils.metrics import (
     NUM_ENV_STEPS_SAMPLED_LIFETIME,
 )
 
-SAC_TEMPERATURE_STATE = "_rllib_async_sac_temperature"
-
-
-class TemperatureCheckpointSACLearner(SACTorchLearner):
-    """Phase 0 probe for the SAC temperature checkpoint gap in RLlib 2.56.1.
-
-    This remains test-only until the production adapter boundary is implemented in
-    Phase 4. It deliberately delegates the SAC module, loss, target updates, and
-    optimizers to RLlib.
-    """
-
-    def get_state(
-        self,
-        components: str | Iterable[str] | None = None,
-        *,
-        not_components: str | Iterable[str] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        state = super().get_state(
-            components=components,
-            not_components=not_components,
-            **kwargs,
-        )
-        if components is None:
-            state[SAC_TEMPERATURE_STATE] = {
-                module_id: value.detach().cpu().numpy().copy()
-                for module_id, value in self.curr_log_alpha.items()
-            }
-        return state
-
-    def set_state(self, state: dict[str, Any]) -> None:
-        super().set_state(state)
-        for module_id, value in state.get(SAC_TEMPERATURE_STATE, {}).items():
-            target = self.curr_log_alpha[module_id]
-            restored = torch.as_tensor(value, dtype=target.dtype, device=target.device)
-            with torch.no_grad():
-                target.copy_(restored)
+from rllib_async.learner import SAC_TEMPERATURE_STATE
 
 
 def make_sac_config(

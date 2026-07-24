@@ -16,9 +16,11 @@ from ray.rllib.utils.replay_buffers.episode_replay_buffer import (
     EpisodeReplayBuffer,
 )
 
-from tests.helpers import (
+from rllib_async.learner import (
     SAC_TEMPERATURE_STATE,
-    TemperatureCheckpointSACLearner,
+    CheckpointableSACTorchLearner,
+)
+from tests.helpers import (
     assert_finite_losses,
     assert_tree_close,
     flattened_key_paths,
@@ -75,7 +77,7 @@ def test_one_env_runner_returns_a_complete_episode_and_applies_weights() -> None
 
 
 def test_fixed_replay_sample_updates_sac_and_round_trips_full_state() -> None:
-    config = make_sac_config(learner_class=TemperatureCheckpointSACLearner)
+    config = make_sac_config(learner_class=CheckpointableSACTorchLearner)
     runner = SingleAgentEnvRunner(config=config, worker_index=0)
     first = second = None
 

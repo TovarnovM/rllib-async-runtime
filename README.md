@@ -4,13 +4,12 @@ Experimental Ray-native asynchronous off-policy runtime built on RLlib.
 
 > Experimental project built on Ray/RLlib; not an official Ray project.
 
-The project has completed its bootstrap, authoritative replay, and
-learner-local replay phases. It currently contains the RLlib compatibility
-gates, deterministic replay reference model, a serialized Ray `ReplayActor`,
-atomic trusted-local replay checkpoints, reader-safe background `FastReplay`
-index publication, and a bounded local batch pipeline. It does **not** yet
-implement the SAC learner adapter, rollout execution loop, hierarchy, or graph
-encoders.
+The project has completed its bootstrap, replay, and SAC learner-adapter phases.
+It currently contains the RLlib compatibility gates, deterministic replay
+reference model, a serialized Ray `ReplayActor`, atomic trusted-local replay
+checkpoints, reader-safe background `FastReplay` index publication, a bounded
+local batch pipeline, and a checkpoint-complete local SAC adapter. It does
+**not** yet implement the rollout execution loop, hierarchy, or graph encoders.
 
 ## Development contract
 
@@ -63,9 +62,9 @@ The tests verify:
   `Trainable`.
 
 RLlib 2.56.1 does not include the current SAC `log_alpha` value in its stock
-learner state. The compatibility harness contains a minimal test-only
-state adapter, and [ADR 0001](docs/adr/0001-runtime-boundary.md) records the
-required production boundary.
+learner state. Phase 4 productionizes the minimal state adapter identified by
+this gate. [ADR 0001](docs/adr/0001-runtime-boundary.md) records the component
+ownership decision.
 
 ## Phase 1 replay contract
 
@@ -136,8 +135,26 @@ The accepted synchronization cursor may briefly lead `active_cursor` while a
 new index is built. Sampling that already captured an old view may finish on
 that view; after publication, new calls use only the new view.
 
-The pipeline still returns generic CPU NumPy batches. Pinned tensors and the
-exact RLlib SAC learner input are Phase 4 concerns.
+The pipeline returns generic CPU NumPy batches; the Phase 4 adapter owns the
+validated conversion to RLlib's exact SAC learner input.
+
+## Phase 4 SAC learner adapter
+
+Phase 4 provides:
+
+- `SACLearnerAdapter` around one local RLlib `LearnerGroup`;
+- exact `SampleBatch`/`MultiAgentBatch` construction from flat SAC transitions;
+- learning-start gating from absolute sampled-step counters;
+- RLlib-owned target-network scheduling;
+- interval-based, versioned inference-weight publication;
+- complete in-memory member state including optimizers, target networks,
+  current SAC temperature, target-update cursors, counters, and the last
+  published weights, plus CPU/CUDA RNG state and config/space compatibility;
+- fixed-batch parity and post-restore next-update tests against stock RLlib SAC.
+
+The adapter contains no SAC loss implementation. Explicit pinned-memory and
+CUDA prefetch behavior remains part of the future one-GPU `LearnerHost`
+integration.
 
 ## Architecture
 

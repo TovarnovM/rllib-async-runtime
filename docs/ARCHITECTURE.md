@@ -70,8 +70,22 @@ Phase 3B does not add a second payload graph. Active and retired views contain
 only tuples of references to immutable episode envelopes, and Python ownership
 defers reclamation until readers release those views.
 
-The project still contains no SAC learner adapter, rollout execution loop,
-hierarchy, or graph encoder.
+Phase 4 adds the algorithm boundary:
+
+- a validated flat transition schema becomes one RLlib `MultiAgentBatch`;
+- one local `LearnerGroup` continues to own SAC loss, optimizer, temperature,
+  and target-network updates;
+- absolute sampled-step counters drive learning start and RLlib's target
+  schedule;
+- inference weights are published at a bounded update interval with monotonic
+  per-module versions;
+- member state restores module, targets, optimizers, SAC temperature,
+  target-update cursors, runtime counters, the last published weights, and
+  CPU/CUDA RNG state under a checked config/space contract.
+
+The production learner subclass extends state serialization only. It does not
+override SAC loss or target-update behavior. The project still contains no
+rollout execution loop, hierarchy, or graph encoder.
 
 See [ADR 0001](adr/0001-runtime-boundary.md) for the orchestration decision and
 [ADR 0002](adr/0002-episode-replay-quantum.md) and
@@ -80,4 +94,6 @@ See [ADR 0001](adr/0001-runtime-boundary.md) for the orchestration decision and
 boundary, and [ADR 0005](adr/0005-fast-replay-materialized-view.md) records the
 Phase 3A learner-local view. [ADR 0006](adr/0006-reader-safe-rebuild-and-batch-pipeline.md)
 records background publication and the bounded batch pipeline.
+[ADR 0007](adr/0007-rllib-sac-learner-adapter.md) records the SAC adapter,
+batch schema, publication, and checkpoint boundary.
 See [the implementation plan](IMPLEMENTATION_PLAN.md) for phase gates.

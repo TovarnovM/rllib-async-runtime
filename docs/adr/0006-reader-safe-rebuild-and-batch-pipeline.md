@@ -70,8 +70,9 @@ capture the new view.
 - An empty replay causes bounded producer waiting rather than a busy failure.
 - The flat collator deliberately rejects nested, ragged, string, and arbitrary
   object columns. Graph and multi-module collation remain later phases.
-- NumPy CPU batches are not pinned and are not yet converted to RLlib's exact
-  learner input. That boundary belongs to Phase 4.
+- Phase 3B NumPy CPU batches are not pinned and are not yet converted to
+  RLlib's exact learner input. Phase 4 owns exact SAC conversion; explicit
+  pinning and CUDA prefetch remain part of the later `LearnerHost` integration.
 
 ## Rejected alternatives
 

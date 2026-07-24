@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import os
 
-import gymnasium as gym
+import numpy as np
 import pytest
 import ray
 import torch
+from ray.rllib.core.columns import Columns
+from ray.rllib.env.single_agent_env_runner import SingleAgentEnvRunner
 
+from rllib_async.learner import SACLearnerAdapter
 from tests.helpers import make_sac_config
 
 
@@ -20,19 +23,43 @@ def test_ray_actor_exposes_exactly_one_gpu_to_local_learner(
     @ray.remote(num_gpus=1)
     def build_gpu_learner() -> dict[str, object]:
         config = make_sac_config(num_gpus_per_learner=1)
-        env = gym.make("Pendulum-v1")
-        learner_group = config.build_learner_group(env=env)
+        runner = SingleAgentEnvRunner(config=config, worker_index=0)
+        adapter = SACLearnerAdapter(
+            config,
+            spaces=runner.get_spaces(),
+            member_id="member-0",
+            publication_interval_updates=1,
+        )
         try:
+            batch = {
+                Columns.OBS: np.zeros((32, 3), dtype=np.float32),
+                Columns.NEXT_OBS: np.ones((32, 3), dtype=np.float32),
+                Columns.ACTIONS: np.zeros((32, 1), dtype=np.float32),
+                Columns.REWARDS: np.zeros(32, dtype=np.float32),
+                Columns.TERMINATEDS: np.zeros(32, dtype=np.bool_),
+                Columns.TRUNCATEDS: np.zeros(32, dtype=np.bool_),
+            }
+            update = adapter.update(batch, sampled_env_steps=32)
+            checkpoint = adapter.get_state()
+            adapter.set_state(checkpoint)
             return {
                 "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
                 "device_count": torch.cuda.device_count(),
-                "is_local": learner_group.is_local,
+                "update_performed": update.performed,
+                "published_version": dict(
+                    update.published_weights.module_versions
+                    if update.published_weights is not None
+                    else {}
+                ),
+                "cuda_rng_states": len(checkpoint["torch_cuda_rng_states"]),
             }
         finally:
-            learner_group.shutdown()
-            env.close()
+            adapter.close()
+            runner.stop()
 
     result = ray.get(build_gpu_learner.remote())
     assert result["device_count"] == 1
-    assert result["is_local"] is True
+    assert result["update_performed"] is True
+    assert result["published_version"] == {"default_policy": 1}
+    assert result["cuda_rng_states"] == 1
     assert result["cuda_visible_devices"] not in (None, "")
