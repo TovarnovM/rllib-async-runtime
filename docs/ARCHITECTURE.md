@@ -85,7 +85,27 @@ Phase 4 adds the algorithm boundary:
 
 The production learner subclass extends state serialization only. It does not
 override SAC loss or target-update behavior. The project still contains no
-rollout execution loop, hierarchy, or graph encoder.
+hierarchy or graph encoder.
+
+Phase 5 adds the rollout boundary:
+
+- each actor owns one logical environment and returns one complete episode per
+  finite RPC;
+- module weights are installed only before sampling, and RLlib's per-transition
+  sequence metadata must remain equal to the installed version;
+- whole episodes are converted to the existing flat transition codec and retain
+  generation-safe, idempotent identities;
+- 4–16 actors progress independently through `ray.wait`, without an episode
+  barrier;
+- a commit slot is reserved before sampling and released only after replay
+  acknowledgement, making the high watermark strict;
+- high/low hysteresis applies backpressure only at episode boundaries;
+- policy-version lag is measured against the latest publication when an episode
+  completes.
+
+This finite rollout coordinator is not the complete training event pump. Phase
+6 will connect rollout, authoritative replay, learner-local replay, batches,
+learner updates, and reporting.
 
 See [ADR 0001](adr/0001-runtime-boundary.md) for the orchestration decision and
 [ADR 0002](adr/0002-episode-replay-quantum.md) and
@@ -96,4 +116,7 @@ Phase 3A learner-local view. [ADR 0006](adr/0006-reader-safe-rebuild-and-batch-p
 records background publication and the bounded batch pipeline.
 [ADR 0007](adr/0007-rllib-sac-learner-adapter.md) records the SAC adapter,
 batch schema, publication, and checkpoint boundary.
+[ADR 0008](adr/0008-episode-rollout-and-version-sync.md) records whole-episode
+collection, version installation, restart identity, and bounded asynchronous
+coordination.
 See [the implementation plan](IMPLEMENTATION_PLAN.md) for phase gates.

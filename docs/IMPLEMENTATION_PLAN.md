@@ -1,7 +1,7 @@
 # `rllib-async-runtime`: подробный план реализации
 
-**Статус:** Phase 0–4 реализованы; следующий этап — episode rollout и
-versioned weights в Phase 5
+**Статус:** Phase 0–5 реализованы; следующий этап — single-member Async SAC
+в Phase 6
 
 **Дата фиксации:** 24 июля 2026
 
@@ -628,7 +628,8 @@ rllib-async-runtime/
 │       ├── 0004-replay-actor-checkpoint.md
 │       ├── 0005-fast-replay-materialized-view.md
 │       ├── 0006-reader-safe-rebuild-and-batch-pipeline.md
-│       └── 0007-rllib-sac-learner-adapter.md
+│       ├── 0007-rllib-sac-learner-adapter.md
+│       └── 0008-episode-rollout-and-version-sync.md
 ├── examples/
 │   ├── async_sac_pendulum.py
 │   ├── population_two_members.py
@@ -908,12 +909,12 @@ Phase 3 разделён на correctness-first Phase 3A и асинхронны
 
 ### Задачи
 
-1. Реализовать one-env episode runner.
-2. Реализовать асинхронную группу 4–16 actors.
-3. Реализовать version check между эпизодами.
-4. Реализовать idempotent episode IDs.
-5. Реализовать pending commit watermarks.
-6. Реализовать runner restart generation.
+1. [x] Реализовать one-env episode runner.
+2. [x] Реализовать асинхронную группу 4–16 actors.
+3. [x] Реализовать version check между эпизодами.
+4. [x] Реализовать idempotent episode IDs.
+5. [x] Реализовать pending commit watermarks.
+6. [x] Реализовать runner restart generation.
 
 ### Критерии готовности
 
@@ -1338,7 +1339,7 @@ Success criterion первого PR:
 - [x] Phase 3A correctness-first FastReplay.
 - [x] Phase 3B asynchronous FastReplay hot path.
 - [x] Phase 4 SAC adapter.
-- [ ] Phase 5 rollout/version sync.
+- [x] Phase 5 rollout/version sync.
 - [ ] Phase 6 single-member AsyncSAC.
 - [ ] Phase 7 checkpoint/recovery.
 - [ ] Phase 8 two-member population.
