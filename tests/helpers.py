@@ -24,9 +24,12 @@ from rllib_async.learner import SAC_TEMPERATURE_STATE
 
 def make_sac_config(
     *,
-    learner_class: type[SACTorchLearner] = SACTorchLearner,
+    learner_class: type[SACTorchLearner] | None = None,
     num_gpus_per_learner: int = 0,
 ) -> SACConfig:
+    learner_options = (
+        {"learner_class": learner_class} if learner_class is not None else {}
+    )
     return (
         SACConfig()
         .environment("Pendulum-v1")
@@ -45,7 +48,7 @@ def make_sac_config(
         .learners(
             num_learners=0,
             num_gpus_per_learner=num_gpus_per_learner,
-            learner_class=learner_class,
+            **learner_options,
         )
         .training(
             actor_lr=3e-4,

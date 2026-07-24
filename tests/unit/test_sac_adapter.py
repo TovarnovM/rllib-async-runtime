@@ -7,6 +7,7 @@ from collections.abc import Mapping
 import numpy as np
 import pytest
 import torch
+from ray.rllib.algorithms.sac.torch.sac_torch_learner import SACTorchLearner
 from ray.rllib.core import (
     COMPONENT_OPTIMIZER,
     COMPONENT_RL_MODULE,
@@ -146,6 +147,13 @@ def test_build_rllib_sac_batch_normalizes_exact_columns() -> None:
         ),
         (
             lambda batch: batch.__setitem__(
+                "weights",
+                np.ones(4, dtype=np.complex64),
+            ),
+            "finite non-negative",
+        ),
+        (
+            lambda batch: batch.__setitem__(
                 Columns.OBS,
                 np.full((4, 3), np.nan),
             ),
@@ -169,6 +177,44 @@ def test_build_rllib_sac_batch_rejects_ambiguous_columns(
 
     with pytest.raises(SACBatchError, match=message):
         build_rllib_sac_batch(batch)
+
+
+def test_adapter_accepts_unset_default_learner_class() -> None:
+    config = make_sac_config()
+    assert config._learner_class is None
+    assert config.learner_class is SACTorchLearner
+    runner = SingleAgentEnvRunner(config=config, worker_index=0)
+    adapter = None
+
+    try:
+        adapter = SACLearnerAdapter(
+            config,
+            spaces=runner.get_spaces(),
+            member_id="member-0",
+            publication_interval_updates=1,
+        )
+        learner = adapter.get_state()["learner_group"]["learner"]
+        assert SAC_TEMPERATURE_STATE in learner
+        assert SAC_TARGET_UPDATE_STATE in learner
+    finally:
+        if adapter is not None:
+            adapter.close()
+        runner.stop()
+
+
+def test_adapter_rejects_custom_learner_class() -> None:
+    class CustomSACTorchLearner(SACTorchLearner):
+        pass
+
+    config = make_sac_config(learner_class=CustomSACTorchLearner)
+
+    with pytest.raises(ValueError, match="custom SAC learner"):
+        SACLearnerAdapter(
+            config,
+            spaces={},
+            member_id="member-0",
+            publication_interval_updates=1,
+        )
 
 
 def test_adapter_matches_stock_rllib_fixed_batch_and_target_schedule() -> None:

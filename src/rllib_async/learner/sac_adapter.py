@@ -243,7 +243,7 @@ def build_rllib_sac_batch(batch: Mapping[str, np.ndarray]) -> MultiAgentBatch:
     weights = np.asarray(batch.get("weights", np.ones(batch_size, dtype=np.float32)))
     if (
         weights.shape != (batch_size,)
-        or weights.dtype.kind not in "biufc"
+        or weights.dtype.kind not in "biuf"
         or not np.isfinite(weights).all()
         or np.any(weights < 0)
     ):
@@ -287,7 +287,9 @@ class SACLearnerAdapter:
             raise ValueError("SACLearnerAdapter requires ConnectorV2")
         if config.num_learners != 0:
             raise ValueError("SACLearnerAdapter requires one local RLlib learner")
-        if config.learner_class not in {
+        resolved_learner_class = config.learner_class
+        if resolved_learner_class not in {
+            None,
             SACTorchLearner,
             CheckpointableSACTorchLearner,
         }:
