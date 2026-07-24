@@ -60,10 +60,10 @@ temperature outside the RLModule. PyTorch optimizer state does not contain the
 current parameter value, so stock learner state is insufficient for a complete
 SAC restore.
 
-The Phase 0 harness demonstrates a minimal state-only override that adds and
-restores `curr_log_alpha`. This test-only probe copies no SAC loss, optimizer, or
-target-update code. Phase 4 must productionize that adapter and keep a parity
-test against the pinned RLlib version.
+The Phase 0 harness demonstrated a minimal state-only override that adds and
+restores `curr_log_alpha`. Phase 4 productionizes that adapter, also preserves
+the target-update cursor, and keeps a parity test against the pinned RLlib
+version. The override copies no SAC loss, optimizer, or target-update code.
 
 ### Dependency baseline
 

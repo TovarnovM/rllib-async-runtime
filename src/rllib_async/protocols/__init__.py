@@ -19,6 +19,7 @@ from rllib_async.protocols.replay import (
     ReplayStats,
     ReplayTransaction,
 )
+from rllib_async.protocols.weights import WeightsDescriptor
 
 __all__ = [
     "BatchCollator",
@@ -36,4 +37,5 @@ __all__ = [
     "ReplayStats",
     "ReplayTransaction",
     "SchemaMismatchError",
+    "WeightsDescriptor",
 ]
