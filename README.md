@@ -4,10 +4,11 @@ Experimental Ray-native asynchronous off-policy runtime built on RLlib.
 
 > Experimental project built on Ray/RLlib; not an official Ray project.
 
-The project has completed its bootstrap and in-process replay-contract phases.
-It currently contains the RLlib compatibility gates plus a deterministic
-authoritative episode store and materialized reference replay. It does **not**
-yet implement the Ray `ReplayActor`, asynchronous execution loop, hierarchy, or
+The project has completed its bootstrap, in-process replay-contract, and
+authoritative Ray actor phases. It currently contains the RLlib compatibility
+gates, deterministic replay reference model, a serialized Ray `ReplayActor`,
+and atomic trusted-local replay checkpoints. It does **not** yet implement the
+learner-local optimized replay, asynchronous execution loop, hierarchy, or
 graph encoders.
 
 ## Development contract
@@ -81,6 +82,29 @@ format. It accepts trusted internal data only and is not the planned
 high-performance learner representation. Future Ray and optimized replay
 implementations must remain behaviorally equivalent to this reference under
 the randomized model tests.
+
+## Phase 2 authoritative replay actor
+
+Phase 2 provides:
+
+- one synchronous Ray actor as the exclusive owner of `EpisodeStore`;
+- serialized commit, snapshot, delta, stats, save, and restore operations;
+- commit, duplicate, rejection, conflict, eviction, journal, and dedup metrics;
+- versioned replay state containing retention configuration, cursor, journal,
+  retained payloads, and deduplication fingerprints;
+- checksummed atomic checkpoint replacement and validate-before-swap restore;
+- a 16-producer concurrency gate and a sustained FIFO-retention stress test.
+
+Replay checkpoints use pickle for trusted local Python state and must never be
+loaded from untrusted sources. The checksum detects accidental corruption; it
+does not authenticate a checkpoint.
+
+Exact duplicate/conflict detection after FIFO eviction requires retaining one
+episode ID and SHA-256 fingerprint for every successful commit in the current
+store generation. Retained training payload and the delta journal are bounded,
+but this deduplication metadata is intentionally monotonic and exposed through
+`deduplication_entries`. A production-scale retry-horizon or generation-rotation
+policy remains required before claiming fully bounded process memory.
 
 ## Architecture
 

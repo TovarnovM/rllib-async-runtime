@@ -9,6 +9,7 @@ import uuid
 from bisect import bisect_right
 from collections import OrderedDict, deque
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from rllib_async.protocols.episodes import EpisodeCodec, EpisodeEnvelope
 from rllib_async.protocols.replay import (
@@ -19,6 +20,8 @@ from rllib_async.protocols.replay import (
     ReplayStats,
     ReplayTransaction,
 )
+
+EPISODE_STORE_STATE_VERSION = 1
 
 
 class ReplayError(RuntimeError):
@@ -45,6 +48,33 @@ class SnapshotTooLargeError(ReplayError):
     """A complete snapshot exceeds the caller's requested byte budget."""
 
 
+class InvalidEpisodeStoreStateError(ReplayError):
+    """A checkpoint cannot safely reconstruct an authoritative store."""
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeStoreState:
+    """Versioned, pickle-safe state owned by an authoritative replay actor."""
+
+    format_version: int
+    codec_id: str
+    codec_schema_version: int
+    capacity_transitions: int
+    capacity_bytes: int
+    journal_capacity: int
+    store_generation: str
+    mutation_seq: int
+    episodes: tuple[EpisodeEnvelope, ...]
+    episode_fingerprints: tuple[tuple[str, bytes], ...]
+    journal: tuple[ReplayTransaction, ...]
+    commit_attempts: int
+    committed_episodes: int
+    duplicate_commits: int
+    rejected_commits: int
+    conflicting_commits: int
+    evicted_episodes: int
+
+
 class EpisodeStore:
     """FIFO authoritative episode store without Ray process machinery."""
 
@@ -57,12 +87,16 @@ class EpisodeStore:
         journal_capacity: int = 1_024,
         store_generation: str | None = None,
     ) -> None:
-        if capacity_transitions < 1:
+        if not _is_positive_integer(capacity_transitions):
             raise ValueError("capacity_transitions must be positive")
-        if capacity_bytes < 1:
+        if not _is_positive_integer(capacity_bytes):
             raise ValueError("capacity_bytes must be positive")
-        if journal_capacity < 1:
+        if not _is_positive_integer(journal_capacity):
             raise ValueError("journal_capacity must be positive")
+        if store_generation is not None and (
+            not isinstance(store_generation, str) or not store_generation
+        ):
+            raise ValueError("store_generation must be a non-empty string")
 
         self._codec = codec
         self._capacity_transitions = capacity_transitions
@@ -76,6 +110,12 @@ class EpisodeStore:
         self._total_transitions = 0
         self._total_estimated_bytes = 0
         self._journal: deque[ReplayTransaction] = deque()
+        self._commit_attempts = 0
+        self._committed_episodes = 0
+        self._duplicate_commits = 0
+        self._rejected_commits = 0
+        self._conflicting_commits = 0
+        self._evicted_episodes = 0
 
     @property
     def cursor(self) -> ReplayCursor:
@@ -83,12 +123,20 @@ class EpisodeStore:
 
     def commit_episode(self, episode: EpisodeEnvelope) -> CommitAck:
         """Atomically add an episode and evict whole oldest episodes."""
-        self._codec.validate(episode)
-        transition_count = self._codec.transition_count(episode)
+        self._commit_attempts += 1
+        try:
+            self._codec.validate(episode)
+            transition_count = self._codec.transition_count(episode)
+            fingerprint = self._fingerprint(episode)
+        except Exception:
+            self._rejected_commits += 1
+            raise
+
         if (
             transition_count > self._capacity_transitions
             or episode.estimated_bytes > self._capacity_bytes
         ):
+            self._rejected_commits += 1
             raise EpisodeTooLargeError(
                 f"episode {episode.episode_id!r} requires "
                 f"{transition_count} transitions/{episode.estimated_bytes} bytes; "
@@ -96,13 +144,15 @@ class EpisodeStore:
                 f"transitions/{self._capacity_bytes} bytes"
             )
 
-        fingerprint = self._fingerprint(episode)
         existing_fingerprint = self._episode_fingerprints.get(episode.episode_id)
         if existing_fingerprint is not None:
             if existing_fingerprint != fingerprint:
+                self._rejected_commits += 1
+                self._conflicting_commits += 1
                 raise DuplicateEpisodeConflictError(
                     f"episode_id {episode.episode_id!r} already has different content"
                 )
+            self._duplicate_commits += 1
             return CommitAck(
                 cursor=self.cursor,
                 committed=False,
@@ -142,6 +192,8 @@ class EpisodeStore:
         self._journal.append(transaction)
         while len(self._journal) > self._journal_capacity:
             self._journal.popleft()
+        self._committed_episodes += 1
+        self._evicted_episodes += len(evicted_episode_ids)
 
         return CommitAck(
             cursor=self.cursor,
@@ -225,7 +277,214 @@ class EpisodeStore:
             total_transitions=self._total_transitions,
             total_estimated_bytes=self._total_estimated_bytes,
             oldest_available_mutation_seq=oldest_available,
+            journal_entries=len(self._journal),
+            deduplication_entries=len(self._episode_fingerprints),
+            commit_attempts=self._commit_attempts,
+            committed_episodes=self._committed_episodes,
+            duplicate_commits=self._duplicate_commits,
+            rejected_commits=self._rejected_commits,
+            conflicting_commits=self._conflicting_commits,
+            evicted_episodes=self._evicted_episodes,
         )
+
+    def export_state(self) -> EpisodeStoreState:
+        """Return a self-contained immutable checkpoint state."""
+        return EpisodeStoreState(
+            format_version=EPISODE_STORE_STATE_VERSION,
+            codec_id=self._codec.codec_id,
+            codec_schema_version=self._codec.schema_version,
+            capacity_transitions=self._capacity_transitions,
+            capacity_bytes=self._capacity_bytes,
+            journal_capacity=self._journal_capacity,
+            store_generation=self._store_generation,
+            mutation_seq=self._mutation_seq,
+            episodes=tuple(self._episodes.values()),
+            episode_fingerprints=tuple(sorted(self._episode_fingerprints.items())),
+            journal=tuple(self._journal),
+            commit_attempts=self._commit_attempts,
+            committed_episodes=self._committed_episodes,
+            duplicate_commits=self._duplicate_commits,
+            rejected_commits=self._rejected_commits,
+            conflicting_commits=self._conflicting_commits,
+            evicted_episodes=self._evicted_episodes,
+        )
+
+    @classmethod
+    def from_state(
+        cls,
+        codec: EpisodeCodec,
+        state: EpisodeStoreState,
+    ) -> EpisodeStore:
+        """Validate checkpoint state before constructing a replacement store."""
+        if not isinstance(state, EpisodeStoreState):
+            raise InvalidEpisodeStoreStateError(
+                "checkpoint payload is not an EpisodeStoreState"
+            )
+        if state.format_version != EPISODE_STORE_STATE_VERSION:
+            raise InvalidEpisodeStoreStateError(
+                f"unsupported store state version {state.format_version}"
+            )
+        if (
+            state.codec_id != codec.codec_id
+            or state.codec_schema_version != codec.schema_version
+        ):
+            raise InvalidEpisodeStoreStateError(
+                "checkpoint codec does not match the actor codec"
+            )
+
+        try:
+            store = cls(
+                codec,
+                capacity_transitions=state.capacity_transitions,
+                capacity_bytes=state.capacity_bytes,
+                journal_capacity=state.journal_capacity,
+                store_generation=state.store_generation,
+            )
+        except (TypeError, ValueError) as error:
+            raise InvalidEpisodeStoreStateError(
+                "checkpoint retention configuration is invalid"
+            ) from error
+
+        if not _is_non_negative_integer(state.mutation_seq):
+            raise InvalidEpisodeStoreStateError("mutation_seq must be non-negative")
+
+        episodes: OrderedDict[str, EpisodeEnvelope] = OrderedDict()
+        transition_counts: dict[str, int] = {}
+        total_transitions = 0
+        total_estimated_bytes = 0
+        for episode in state.episodes:
+            try:
+                codec.validate(episode)
+                transition_count = codec.transition_count(episode)
+            except Exception as error:
+                raise InvalidEpisodeStoreStateError(
+                    f"checkpoint episode {getattr(episode, 'episode_id', None)!r} "
+                    "is invalid"
+                ) from error
+            if episode.episode_id in episodes:
+                raise InvalidEpisodeStoreStateError(
+                    f"duplicate live episode_id {episode.episode_id!r}"
+                )
+            episodes[episode.episode_id] = episode
+            transition_counts[episode.episode_id] = transition_count
+            total_transitions += transition_count
+            total_estimated_bytes += episode.estimated_bytes
+
+        if (
+            total_transitions > state.capacity_transitions
+            or total_estimated_bytes > state.capacity_bytes
+        ):
+            raise InvalidEpisodeStoreStateError(
+                "checkpoint manifest exceeds its retention capacity"
+            )
+
+        fingerprints: dict[str, bytes] = {}
+        for episode_id, fingerprint in state.episode_fingerprints:
+            if (
+                not isinstance(episode_id, str)
+                or not episode_id
+                or type(fingerprint) is not bytes
+                or len(fingerprint) != hashlib.sha256().digest_size
+            ):
+                raise InvalidEpisodeStoreStateError(
+                    "checkpoint contains an invalid episode fingerprint"
+                )
+            if episode_id in fingerprints:
+                raise InvalidEpisodeStoreStateError(
+                    f"duplicate fingerprint for episode_id {episode_id!r}"
+                )
+            fingerprints[episode_id] = fingerprint
+
+        for episode in episodes.values():
+            if fingerprints.get(episode.episode_id) != cls._fingerprint(episode):
+                raise InvalidEpisodeStoreStateError(
+                    f"live episode {episode.episode_id!r} has no matching fingerprint"
+                )
+
+        journal = tuple(state.journal)
+        expected_journal_length = min(state.mutation_seq, state.journal_capacity)
+        if len(journal) != expected_journal_length:
+            raise InvalidEpisodeStoreStateError(
+                "checkpoint journal length is inconsistent"
+            )
+        expected_sequences = range(
+            state.mutation_seq - len(journal) + 1,
+            state.mutation_seq + 1,
+        )
+        for transaction, expected_sequence in zip(
+            journal,
+            expected_sequences,
+            strict=True,
+        ):
+            if transaction.mutation_seq != expected_sequence:
+                raise InvalidEpisodeStoreStateError(
+                    "checkpoint journal is not a contiguous mutation suffix"
+                )
+            try:
+                codec.validate(transaction.added)
+            except Exception as error:
+                raise InvalidEpisodeStoreStateError(
+                    f"journal episode {transaction.added.episode_id!r} is invalid"
+                ) from error
+            if fingerprints.get(transaction.added.episode_id) != cls._fingerprint(
+                transaction.added
+            ):
+                raise InvalidEpisodeStoreStateError(
+                    f"journal episode {transaction.added.episode_id!r} "
+                    "has no matching fingerprint"
+                )
+
+        metric_names = (
+            "commit_attempts",
+            "committed_episodes",
+            "duplicate_commits",
+            "rejected_commits",
+            "conflicting_commits",
+            "evicted_episodes",
+        )
+        if any(
+            not _is_non_negative_integer(getattr(state, name)) for name in metric_names
+        ):
+            raise InvalidEpisodeStoreStateError(
+                "checkpoint commit metrics must be non-negative integers"
+            )
+        if state.committed_episodes != state.mutation_seq:
+            raise InvalidEpisodeStoreStateError(
+                "committed episode count does not match mutation_seq"
+            )
+        if state.commit_attempts != (
+            state.committed_episodes + state.duplicate_commits + state.rejected_commits
+        ):
+            raise InvalidEpisodeStoreStateError(
+                "commit attempt metrics are inconsistent"
+            )
+        if state.conflicting_commits > state.rejected_commits:
+            raise InvalidEpisodeStoreStateError(
+                "conflicting commit count exceeds rejected commits"
+            )
+        if state.evicted_episodes != state.committed_episodes - len(episodes):
+            raise InvalidEpisodeStoreStateError(
+                "eviction count does not match the retained manifest"
+            )
+        if len(fingerprints) != state.committed_episodes:
+            raise InvalidEpisodeStoreStateError(
+                "deduplication state does not cover every committed episode"
+            )
+
+        store._episodes = episodes
+        store._transition_counts = transition_counts
+        store._episode_fingerprints = fingerprints
+        store._total_transitions = total_transitions
+        store._total_estimated_bytes = total_estimated_bytes
+        store._mutation_seq = state.mutation_seq
+        store._journal = deque(journal)
+        store._commit_attempts = state.commit_attempts
+        store._committed_episodes = state.committed_episodes
+        store._duplicate_commits = state.duplicate_commits
+        store._rejected_commits = state.rejected_commits
+        store._conflicting_commits = state.conflicting_commits
+        store._evicted_episodes = state.evicted_episodes
+        return store
 
     def _requires_full_resync(self, cursor: ReplayCursor) -> bool:
         if cursor.store_generation != self._store_generation:
@@ -236,6 +495,14 @@ class EpisodeStore:
             return cursor.mutation_seq != self._mutation_seq
         oldest_replayable_cursor = self._journal[0].mutation_seq - 1
         return cursor.mutation_seq < oldest_replayable_cursor
+
+
+def _is_non_negative_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_positive_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
 class ReferenceFastReplay:
