@@ -5,12 +5,12 @@ Experimental Ray-native asynchronous off-policy runtime built on RLlib.
 > Experimental project built on Ray/RLlib; not an official Ray project.
 
 The project has completed its bootstrap, authoritative replay, and
-correctness-first learner-local replay phases. It currently contains the RLlib
-compatibility gates, deterministic replay reference model, a serialized Ray
-`ReplayActor`, atomic trusted-local replay checkpoints, and a synchronously
-materialized learner-local `FastReplay`. It does **not** yet implement
-background index rebuild, the bounded batch pipeline, asynchronous execution
-loop, hierarchy, or graph encoders.
+learner-local replay phases. It currently contains the RLlib compatibility
+gates, deterministic replay reference model, a serialized Ray `ReplayActor`,
+atomic trusted-local replay checkpoints, reader-safe background `FastReplay`
+index publication, and a bounded local batch pipeline. It does **not** yet
+implement the SAC learner adapter, rollout execution loop, hierarchy, or graph
+encoders.
 
 ## Development contract
 
@@ -109,7 +109,7 @@ but this metadata is intentionally monotonic and exposed through
 `deduplication_entries`. A production-scale retry-horizon or generation-rotation
 policy remains required before claiming fully bounded process memory.
 
-## Phase 3A correctness-first learner-local replay
+## Phase 3 learner-local replay
 
 Phase 3A provides:
 
@@ -120,9 +120,24 @@ Phase 3A provides:
 - uniform transition sampling with no per-sample Ray RPC;
 - randomized behavioral equivalence against `ReferenceFastReplay`.
 
-The synchronous rebuild copies the manifest and sampling index, not immutable
-episode payloads. Background index construction, bounded batch queues,
-`FlatBatchCollator`, and freshness/data-wait metrics remain Phase 3B work.
+Phase 3B adds:
+
+- a logical target replay state separated from the immutable active sampling
+  view;
+- coalesced background index rebuilding with stale-build rejection;
+- atomic publication and reader leases that retain evicted payloads for
+  in-flight samples;
+- explicit delta-lag, rebuild-time, and rebuild-failure metrics;
+- `FlatBatchCollator` for contiguous numeric/boolean NumPy columns;
+- a bounded `BatchProducer` with backpressure, data-wait metrics, and explicit
+  `start/pause/resume/drain/stop` lifecycle.
+
+The accepted synchronization cursor may briefly lead `active_cursor` while a
+new index is built. Sampling that already captured an old view may finish on
+that view; after publication, new calls use only the new view.
+
+The pipeline still returns generic CPU NumPy batches. Pinned tensors and the
+exact RLlib SAC learner input are Phase 4 concerns.
 
 ## Architecture
 

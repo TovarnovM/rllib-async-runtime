@@ -21,6 +21,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
+    "numpy==2.4.6",
     "ray[rllib]==2.56.1",
 ]
 

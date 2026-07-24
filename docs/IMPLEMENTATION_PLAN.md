@@ -1,7 +1,7 @@
 # `rllib-async-runtime`: подробный план реализации
 
-**Статус:** Phase 0–2 и Phase 3A реализованы; следующий этап — асинхронный
-hot path `FastReplay` в Phase 3B
+**Статус:** Phase 0–3 реализованы; следующий этап — RLlib SAC learner adapter
+в Phase 4
 
 **Дата фиксации:** 24 июля 2026
 
@@ -853,20 +853,19 @@ adapter.
 
 ## Phase 3. Learner-local `FastReplay`
 
-Phase 3 разделён на две поставки. Phase 3A реализует correctness-first
-материализацию, синхронную перестройку sampling index и equivalence gates.
-Phase 3B добавляет фоновую перестройку и batch hot path.
+Phase 3 разделён на correctness-first Phase 3A и асинхронный hot path Phase 3B.
+Обе части реализованы.
 
 ### Задачи
 
 1. [x] Реализовать snapshot bootstrap.
 2. [x] Реализовать delta sync.
 3. [x] Реализовать active sampling index.
-4. [ ] Реализовать background index rebuild.
-5. [ ] Реализовать atomic index swap и deferred payload reclamation для
+4. [x] Реализовать background index rebuild.
+5. [x] Реализовать atomic index swap и deferred payload reclamation для
    concurrent readers.
-6. [ ] Реализовать bounded batch queue.
-7. [ ] Реализовать `FlatBatchCollator`.
+6. [x] Реализовать bounded batch queue.
+7. [x] Реализовать `FlatBatchCollator`.
 
 ### Критерии готовности
 
@@ -1335,7 +1334,7 @@ Success criterion первого PR:
 - [x] Phase 1 contracts/reference replay.
 - [x] Phase 2 Ray ReplayActor.
 - [x] Phase 3A correctness-first FastReplay.
-- [ ] Phase 3B asynchronous FastReplay hot path.
+- [x] Phase 3B asynchronous FastReplay hot path.
 - [ ] Phase 4 SAC adapter.
 - [ ] Phase 5 rollout/version sync.
 - [ ] Phase 6 single-member AsyncSAC.

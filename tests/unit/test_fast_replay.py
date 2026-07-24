@@ -99,6 +99,7 @@ def sync_once_or_resync(
     else:
         actual.apply_delta(delta)
         reference.apply_delta(delta)
+        actual.wait_for_idle(timeout=2)
 
 
 def test_snapshot_bootstrap_materializes_index_without_copying_payloads() -> None:
@@ -154,6 +155,7 @@ def test_delta_swap_is_atomic_and_sampler_excludes_evicted_transitions() -> None
     assert replay.cursor is not None
     delta = store.get_delta(replay.cursor, max_bytes=10_000)
     replay.apply_delta(delta)
+    replay.wait_for_idle(timeout=2)
 
     assert replay.get_snapshot() == store.get_snapshot()
     assert replay.episode_ids == (retained.episode_id,)

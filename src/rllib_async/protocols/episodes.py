@@ -168,7 +168,12 @@ class EpisodeEnvelope:
 
 @runtime_checkable
 class EpisodeCodec(Protocol):
-    """Storage-independent access to an episode payload."""
+    """Storage-independent access to an episode payload.
+
+    Phase 3B may call ``get_transition`` concurrently from multiple reader
+    threads. Codec reads must therefore be side-effect free and thread-safe for
+    immutable validated envelopes.
+    """
 
     codec_id: str
     schema_version: int

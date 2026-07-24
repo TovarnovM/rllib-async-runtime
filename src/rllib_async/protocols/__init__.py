@@ -1,5 +1,6 @@
 """Serializable contracts shared across runtime process boundaries."""
 
+from rllib_async.protocols.batches import BatchCollator
 from rllib_async.protocols.episodes import (
     EpisodeCodec,
     EpisodeEnvelope,
@@ -20,6 +21,7 @@ from rllib_async.protocols.replay import (
 )
 
 __all__ = [
+    "BatchCollator",
     "CommitAck",
     "EpisodeCodec",
     "EpisodeEnvelope",
