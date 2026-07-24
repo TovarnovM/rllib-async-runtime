@@ -1,6 +1,6 @@
 # `rllib-async-runtime`: подробный план реализации
 
-**Статус:** архитектура согласована; репозиторий создан; выполняется Phase 0
+**Статус:** Phase 0 и Phase 1 реализованы; следующий этап — Ray `ReplayActor`
 
 **Дата фиксации:** 24 июля 2026
 
@@ -1319,8 +1319,8 @@ Success criterion первого PR:
 - [x] Имя репозитория выбрано.
 - [x] План реализации сформирован.
 - [x] Репозиторий создан пользователем.
-- [ ] Phase 0 bootstrap PR.
-- [ ] Phase 1 contracts/reference replay.
+- [x] Phase 0 bootstrap PR.
+- [x] Phase 1 contracts/reference replay.
 - [ ] Phase 2 Ray ReplayActor.
 - [ ] Phase 3 FastReplay.
 - [ ] Phase 4 SAC adapter.

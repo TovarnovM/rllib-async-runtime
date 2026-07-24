@@ -4,9 +4,10 @@ Experimental Ray-native asynchronous off-policy runtime built on RLlib.
 
 > Experimental project built on Ray/RLlib; not an official Ray project.
 
-The project is in Phase 0. This repository currently contains packaging,
-development-environment setup, and compatibility gates only. It does **not**
-yet implement `ReplayActor`, the asynchronous execution loop, hierarchy, or
+The project has completed its bootstrap and in-process replay-contract phases.
+It currently contains the RLlib compatibility gates plus a deterministic
+authoritative episode store and materialized reference replay. It does **not**
+yet implement the Ray `ReplayActor`, asynchronous execution loop, hierarchy, or
 graph encoders.
 
 ## Development contract
@@ -63,6 +64,23 @@ RLlib 2.56.1 does not include the current SAC `log_alpha` value in its stock
 learner state. The compatibility harness contains a minimal test-only
 state adapter, and [ADR 0001](docs/adr/0001-runtime-boundary.md) records the
 required production boundary.
+
+## Phase 1 replay contract
+
+Phase 1 provides:
+
+- immutable, schema-versioned whole-episode envelopes;
+- idempotent commit with explicit duplicate conflicts;
+- FIFO retention by transition and approximate-byte capacities;
+- atomic snapshot/delta synchronization with stale-cursor resync;
+- a deterministic learner-local reference view;
+- uniform sampling over transitions rather than episodes.
+
+`FlatEpisodeCodec` uses immutable pickle bytes as a correctness-first reference
+format. It accepts trusted internal data only and is not the planned
+high-performance learner representation. Future Ray and optimized replay
+implementations must remain behaviorally equivalent to this reference under
+the randomized model tests.
 
 ## Architecture
 
