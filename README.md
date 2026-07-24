@@ -91,7 +91,8 @@ Phase 2 provides:
 - serialized commit, snapshot, delta, stats, save, and restore operations;
 - commit, duplicate, rejection, conflict, eviction, journal, and dedup metrics;
 - versioned replay state containing retention configuration, cursor, journal,
-  retained payloads, and deduplication fingerprints;
+  the journal base manifest, retained payloads, and commit-ordered
+  deduplication fingerprints;
 - checksummed atomic checkpoint replacement and validate-before-swap restore;
 - a 16-producer concurrency gate and a sustained FIFO-retention stress test.
 

@@ -24,8 +24,8 @@ The versioned authoritative state contains:
 - transition, approximate-byte, and journal capacities;
 - store generation and mutation sequence;
 - retained episodes in FIFO order;
-- the retained mutation-journal suffix;
-- fingerprints for every successfully committed episode ID in the generation;
+- the retained mutation-journal suffix and its lightweight base manifest;
+- fingerprints for every successfully committed episode ID in commit order;
 - commit, duplicate, rejection, conflict, and eviction counters.
 
 Checkpoint save serializes that immutable state with trusted-local pickle,
@@ -36,8 +36,11 @@ it is not a signature and does not make pickle safe for untrusted input.
 
 Checkpoint load authenticates the byte checksum, deserializes a candidate
 state, validates its codec, capacities, manifest, fingerprints, contiguous
-journal suffix, and metric invariants, and constructs a separate
-`EpisodeStore`. The actor swaps its live store only after every check succeeds.
+journal suffix, and metric invariants. It replays the journal from its saved
+base manifest, verifies each exact FIFO eviction against transition and byte
+capacity, and requires the result to equal the retained manifest before
+constructing a separate `EpisodeStore`. The actor swaps its live store only
+after every check succeeds.
 
 ## Consequences
 

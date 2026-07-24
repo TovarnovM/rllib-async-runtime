@@ -28,10 +28,11 @@ Phase 2 adds the authoritative process boundary:
 
 - one synchronous Ray actor serializes every store operation;
 - actor methods remain finite and perform no batch sampling;
-- replay checkpoints preserve retention configuration, cursor, journal,
-  payload manifest, exact deduplication state, and metrics;
+- replay checkpoints preserve retention configuration, cursor, journal and its
+  base manifest, payload manifest, exact deduplication state, and metrics;
 - save uses checksummed atomic replacement on a POSIX filesystem;
-- restore validates a candidate store completely before replacing live state.
+- restore replays and validates exact FIFO evictions before replacing live
+  state.
 
 Retained episode payload and the mutation journal are bounded. Exact
 full-generation conflict detection keeps one ID and fingerprint per committed

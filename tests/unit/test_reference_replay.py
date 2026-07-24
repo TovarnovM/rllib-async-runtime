@@ -341,3 +341,7 @@ def test_sustained_ingest_bounds_payload_and_journal_but_counts_dedup_growth() -
     assert stats.deduplication_entries == 10_000
     assert stats.committed_episodes == 10_000
     assert stats.evicted_episodes == 10_000 - 64
+
+    restored = EpisodeStore.from_state(codec, store.export_state())
+    assert restored.get_snapshot() == store.get_snapshot()
+    assert restored.get_stats() == stats

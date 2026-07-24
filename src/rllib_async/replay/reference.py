@@ -66,6 +66,7 @@ class EpisodeStoreState:
     mutation_seq: int
     episodes: tuple[EpisodeEnvelope, ...]
     episode_fingerprints: tuple[tuple[str, bytes], ...]
+    journal_base_manifest: tuple[tuple[str, int, int], ...]
     journal: tuple[ReplayTransaction, ...]
     commit_attempts: int
     committed_episodes: int
@@ -109,6 +110,7 @@ class EpisodeStore:
         self._episode_fingerprints: dict[str, bytes] = {}
         self._total_transitions = 0
         self._total_estimated_bytes = 0
+        self._journal_base_manifest: OrderedDict[str, tuple[int, int]] = OrderedDict()
         self._journal: deque[ReplayTransaction] = deque()
         self._commit_attempts = 0
         self._committed_episodes = 0
@@ -182,6 +184,21 @@ class EpisodeStore:
             added=episode,
             evicted_episode_ids=tuple(evicted_episode_ids),
         )
+        journal_base_manifest = self._journal_base_manifest.copy()
+        journal = deque(self._journal)
+        if not journal:
+            journal_base_manifest = _retention_manifest(
+                self._episodes,
+                self._transition_counts,
+            )
+        journal.append(transaction)
+        while len(journal) > self._journal_capacity:
+            compacted = journal.popleft()
+            _advance_retention_manifest(
+                journal_base_manifest,
+                compacted,
+                codec=self._codec,
+            )
 
         self._episodes = episodes
         self._transition_counts = transition_counts
@@ -189,9 +206,8 @@ class EpisodeStore:
         self._total_estimated_bytes = total_estimated_bytes
         self._mutation_seq = mutation_seq
         self._episode_fingerprints[episode.episode_id] = fingerprint
-        self._journal.append(transaction)
-        while len(self._journal) > self._journal_capacity:
-            self._journal.popleft()
+        self._journal_base_manifest = journal_base_manifest
+        self._journal = journal
         self._committed_episodes += 1
         self._evicted_episodes += len(evicted_episode_ids)
 
@@ -299,7 +315,14 @@ class EpisodeStore:
             store_generation=self._store_generation,
             mutation_seq=self._mutation_seq,
             episodes=tuple(self._episodes.values()),
-            episode_fingerprints=tuple(sorted(self._episode_fingerprints.items())),
+            episode_fingerprints=tuple(self._episode_fingerprints.items()),
+            journal_base_manifest=tuple(
+                (episode_id, transition_count, estimated_bytes)
+                for episode_id, (
+                    transition_count,
+                    estimated_bytes,
+                ) in self._journal_base_manifest.items()
+            ),
             journal=tuple(self._journal),
             commit_attempts=self._commit_attempts,
             committed_episodes=self._committed_episodes,
@@ -379,16 +402,23 @@ class EpisodeStore:
             )
 
         fingerprints: dict[str, bytes] = {}
-        for episode_id, fingerprint in state.episode_fingerprints:
+        if type(state.episode_fingerprints) is not tuple:
+            raise InvalidEpisodeStoreStateError(
+                "checkpoint episode fingerprints must be a tuple"
+            )
+        for entry in state.episode_fingerprints:
             if (
-                not isinstance(episode_id, str)
-                or not episode_id
-                or type(fingerprint) is not bytes
-                or len(fingerprint) != hashlib.sha256().digest_size
+                type(entry) is not tuple
+                or len(entry) != 2
+                or not isinstance(entry[0], str)
+                or not entry[0]
+                or type(entry[1]) is not bytes
+                or len(entry[1]) != hashlib.sha256().digest_size
             ):
                 raise InvalidEpisodeStoreStateError(
                     "checkpoint contains an invalid episode fingerprint"
                 )
+            episode_id, fingerprint = entry
             if episode_id in fingerprints:
                 raise InvalidEpisodeStoreStateError(
                     f"duplicate fingerprint for episode_id {episode_id!r}"
@@ -401,21 +431,80 @@ class EpisodeStore:
                     f"live episode {episode.episode_id!r} has no matching fingerprint"
                 )
 
-        journal = tuple(state.journal)
+        if type(state.journal) is not tuple:
+            raise InvalidEpisodeStoreStateError("checkpoint journal must be a tuple")
+        journal = state.journal
         expected_journal_length = min(state.mutation_seq, state.journal_capacity)
         if len(journal) != expected_journal_length:
             raise InvalidEpisodeStoreStateError(
                 "checkpoint journal length is inconsistent"
             )
+        journal_base_mutation_seq = state.mutation_seq - len(journal)
+        journal_base_manifest: OrderedDict[str, tuple[int, int]] = OrderedDict()
+        if type(state.journal_base_manifest) is not tuple:
+            raise InvalidEpisodeStoreStateError(
+                "checkpoint journal base manifest must be a tuple"
+            )
+        for entry in state.journal_base_manifest:
+            if (
+                type(entry) is not tuple
+                or len(entry) != 3
+                or not isinstance(entry[0], str)
+                or not entry[0]
+                or not _is_positive_integer(entry[1])
+                or not _is_positive_integer(entry[2])
+            ):
+                raise InvalidEpisodeStoreStateError(
+                    "checkpoint journal base manifest contains an invalid entry"
+                )
+            episode_id, transition_count, estimated_bytes = entry
+            if episode_id in journal_base_manifest:
+                raise InvalidEpisodeStoreStateError(
+                    f"duplicate journal base episode_id {episode_id!r}"
+                )
+            if episode_id not in fingerprints:
+                raise InvalidEpisodeStoreStateError(
+                    f"journal base episode {episode_id!r} has no fingerprint"
+                )
+            journal_base_manifest[episode_id] = (
+                transition_count,
+                estimated_bytes,
+            )
+        if len(journal_base_manifest) > journal_base_mutation_seq:
+            raise InvalidEpisodeStoreStateError(
+                "checkpoint journal base manifest exceeds its mutation history"
+            )
+        if (
+            sum(item[0] for item in journal_base_manifest.values())
+            > state.capacity_transitions
+            or sum(item[1] for item in journal_base_manifest.values())
+            > state.capacity_bytes
+        ):
+            raise InvalidEpisodeStoreStateError(
+                "checkpoint journal base manifest exceeds its retention capacity"
+            )
+
         expected_sequences = range(
             state.mutation_seq - len(journal) + 1,
             state.mutation_seq + 1,
         )
+        fingerprint_ids = tuple(fingerprints)
+        expected_journal_episode_ids = fingerprint_ids[journal_base_mutation_seq:]
+        actual_journal_episode_ids: list[str] = []
+        reconstructed_manifest = journal_base_manifest.copy()
+        reconstructed_transitions = sum(
+            item[0] for item in reconstructed_manifest.values()
+        )
+        reconstructed_bytes = sum(item[1] for item in reconstructed_manifest.values())
         for transaction, expected_sequence in zip(
             journal,
             expected_sequences,
             strict=True,
         ):
+            if not isinstance(transaction, ReplayTransaction):
+                raise InvalidEpisodeStoreStateError(
+                    "checkpoint journal contains an invalid transaction"
+                )
             if transaction.mutation_seq != expected_sequence:
                 raise InvalidEpisodeStoreStateError(
                     "checkpoint journal is not a contiguous mutation suffix"
@@ -433,6 +522,46 @@ class EpisodeStore:
                     f"journal episode {transaction.added.episode_id!r} "
                     "has no matching fingerprint"
                 )
+            if type(transaction.evicted_episode_ids) is not tuple or any(
+                not isinstance(episode_id, str) or not episode_id
+                for episode_id in transaction.evicted_episode_ids
+            ):
+                raise InvalidEpisodeStoreStateError(
+                    "checkpoint journal contains invalid eviction IDs"
+                )
+            actual_journal_episode_ids.append(transaction.added.episode_id)
+            try:
+                reconstructed_transitions, reconstructed_bytes = (
+                    _apply_retention_transaction(
+                        reconstructed_manifest,
+                        transaction,
+                        codec=codec,
+                        capacity_transitions=state.capacity_transitions,
+                        capacity_bytes=state.capacity_bytes,
+                        total_transitions=reconstructed_transitions,
+                        total_estimated_bytes=reconstructed_bytes,
+                    )
+                )
+            except ReplayError as error:
+                raise InvalidEpisodeStoreStateError(
+                    "checkpoint journal eviction semantics are inconsistent"
+                ) from error
+
+        if tuple(actual_journal_episode_ids) != expected_journal_episode_ids:
+            raise InvalidEpisodeStoreStateError(
+                "checkpoint journal additions do not match commit order"
+            )
+        expected_live_manifest = OrderedDict(
+            (
+                episode_id,
+                (transition_counts[episode_id], episode.estimated_bytes),
+            )
+            for episode_id, episode in episodes.items()
+        )
+        if reconstructed_manifest != expected_live_manifest:
+            raise InvalidEpisodeStoreStateError(
+                "checkpoint journal suffix does not reconstruct the retained manifest"
+            )
 
         metric_names = (
             "commit_attempts",
@@ -477,6 +606,7 @@ class EpisodeStore:
         store._total_transitions = total_transitions
         store._total_estimated_bytes = total_estimated_bytes
         store._mutation_seq = state.mutation_seq
+        store._journal_base_manifest = journal_base_manifest
         store._journal = deque(journal)
         store._commit_attempts = state.commit_attempts
         store._committed_episodes = state.committed_episodes
@@ -503,6 +633,78 @@ def _is_non_negative_integer(value: object) -> bool:
 
 def _is_positive_integer(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _retention_manifest(
+    episodes: OrderedDict[str, EpisodeEnvelope],
+    transition_counts: dict[str, int],
+) -> OrderedDict[str, tuple[int, int]]:
+    return OrderedDict(
+        (
+            episode_id,
+            (transition_counts[episode_id], episode.estimated_bytes),
+        )
+        for episode_id, episode in episodes.items()
+    )
+
+
+def _apply_retention_transaction(
+    manifest: OrderedDict[str, tuple[int, int]],
+    transaction: ReplayTransaction,
+    *,
+    codec: EpisodeCodec,
+    capacity_transitions: int,
+    capacity_bytes: int,
+    total_transitions: int,
+    total_estimated_bytes: int,
+) -> tuple[int, int]:
+    episode_id = transaction.added.episode_id
+    if episode_id in manifest:
+        raise ReplayError(f"journal adds existing episode_id {episode_id!r}")
+
+    transition_count = codec.transition_count(transaction.added)
+    estimated_bytes = transaction.added.estimated_bytes
+    manifest[episode_id] = (transition_count, estimated_bytes)
+    total_transitions += transition_count
+    total_estimated_bytes += estimated_bytes
+    expected_evictions: list[str] = []
+    while (
+        total_transitions > capacity_transitions
+        or total_estimated_bytes > capacity_bytes
+    ):
+        evicted_id, (transition_count, estimated_bytes) = manifest.popitem(last=False)
+        expected_evictions.append(evicted_id)
+        total_transitions -= transition_count
+        total_estimated_bytes -= estimated_bytes
+
+    if transaction.evicted_episode_ids != tuple(expected_evictions):
+        raise ReplayError(
+            f"journal transaction {transaction.mutation_seq} evicts "
+            f"{transaction.evicted_episode_ids!r}; expected "
+            f"{tuple(expected_evictions)!r}"
+        )
+    return total_transitions, total_estimated_bytes
+
+
+def _advance_retention_manifest(
+    manifest: OrderedDict[str, tuple[int, int]],
+    transaction: ReplayTransaction,
+    *,
+    codec: EpisodeCodec,
+) -> None:
+    episode_id = transaction.added.episode_id
+    if episode_id in manifest:
+        raise ReplayError(f"journal adds existing episode_id {episode_id!r}")
+    manifest[episode_id] = (
+        codec.transition_count(transaction.added),
+        transaction.added.estimated_bytes,
+    )
+    for evicted_id in transaction.evicted_episode_ids:
+        if not manifest or next(iter(manifest)) != evicted_id:
+            raise ReplayError(
+                f"journal transaction {transaction.mutation_seq} does not evict FIFO"
+            )
+        del manifest[evicted_id]
 
 
 class ReferenceFastReplay:
