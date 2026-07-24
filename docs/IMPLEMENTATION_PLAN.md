@@ -1,6 +1,7 @@
 # `rllib-async-runtime`: подробный план реализации
 
-**Статус:** Phase 0–2 реализованы; следующий этап — learner-local `FastReplay`
+**Статус:** Phase 0–2 и Phase 3A реализованы; следующий этап — асинхронный
+hot path `FastReplay` в Phase 3B
 
 **Дата фиксации:** 24 июля 2026
 
@@ -624,7 +625,8 @@ rllib-async-runtime/
 │       ├── 0001-runtime-boundary.md
 │       ├── 0002-episode-replay-quantum.md
 │       ├── 0003-authoritative-and-reference-replay.md
-│       └── 0004-replay-actor-checkpoint.md
+│       ├── 0004-replay-actor-checkpoint.md
+│       └── 0005-fast-replay-materialized-view.md
 ├── examples/
 │   ├── async_sac_pendulum.py
 │   ├── population_two_members.py
@@ -851,15 +853,20 @@ adapter.
 
 ## Phase 3. Learner-local `FastReplay`
 
+Phase 3 разделён на две поставки. Phase 3A реализует correctness-first
+материализацию, синхронную перестройку sampling index и equivalence gates.
+Phase 3B добавляет фоновую перестройку и batch hot path.
+
 ### Задачи
 
-1. Реализовать snapshot bootstrap.
-2. Реализовать delta sync.
-3. Реализовать active sampling index.
-4. Реализовать background index rebuild.
-5. Реализовать atomic swap.
-6. Реализовать bounded batch queue.
-7. Реализовать `FlatBatchCollator`.
+1. [x] Реализовать snapshot bootstrap.
+2. [x] Реализовать delta sync.
+3. [x] Реализовать active sampling index.
+4. [ ] Реализовать background index rebuild.
+5. [ ] Реализовать atomic index swap и deferred payload reclamation для
+   concurrent readers.
+6. [ ] Реализовать bounded batch queue.
+7. [ ] Реализовать `FlatBatchCollator`.
 
 ### Критерии готовности
 
@@ -1327,7 +1334,8 @@ Success criterion первого PR:
 - [x] Phase 0 bootstrap PR.
 - [x] Phase 1 contracts/reference replay.
 - [x] Phase 2 Ray ReplayActor.
-- [ ] Phase 3 FastReplay.
+- [x] Phase 3A correctness-first FastReplay.
+- [ ] Phase 3B asynchronous FastReplay hot path.
 - [ ] Phase 4 SAC adapter.
 - [ ] Phase 5 rollout/version sync.
 - [ ] Phase 6 single-member AsyncSAC.

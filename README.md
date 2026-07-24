@@ -4,12 +4,13 @@ Experimental Ray-native asynchronous off-policy runtime built on RLlib.
 
 > Experimental project built on Ray/RLlib; not an official Ray project.
 
-The project has completed its bootstrap, in-process replay-contract, and
-authoritative Ray actor phases. It currently contains the RLlib compatibility
-gates, deterministic replay reference model, a serialized Ray `ReplayActor`,
-and atomic trusted-local replay checkpoints. It does **not** yet implement the
-learner-local optimized replay, asynchronous execution loop, hierarchy, or
-graph encoders.
+The project has completed its bootstrap, authoritative replay, and
+correctness-first learner-local replay phases. It currently contains the RLlib
+compatibility gates, deterministic replay reference model, a serialized Ray
+`ReplayActor`, atomic trusted-local replay checkpoints, and a synchronously
+materialized learner-local `FastReplay`. It does **not** yet implement
+background index rebuild, the bounded batch pipeline, asynchronous execution
+loop, hierarchy, or graph encoders.
 
 ## Development contract
 
@@ -107,6 +108,21 @@ store generation. Retained training payload and the delta journal are bounded,
 but this metadata is intentionally monotonic and exposed through
 `deduplication_entries`. A production-scale retry-horizon or generation-rotation
 policy remains required before claiming fully bounded process memory.
+
+## Phase 3A correctness-first learner-local replay
+
+Phase 3A provides:
+
+- snapshot bootstrap and explicit snapshot resync after a stale cursor;
+- atomic application of validated delta transactions;
+- one immutable materialized view containing payload references, cursor, and
+  cumulative transition index;
+- uniform transition sampling with no per-sample Ray RPC;
+- randomized behavioral equivalence against `ReferenceFastReplay`.
+
+The synchronous rebuild copies the manifest and sampling index, not immutable
+episode payloads. Background index construction, bounded batch queues,
+`FlatBatchCollator`, and freshness/data-wait metrics remain Phase 3B work.
 
 ## Architecture
 
