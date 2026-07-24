@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import pickle
 import random
 import uuid
 from bisect import bisect_right
@@ -70,6 +72,7 @@ class EpisodeStore:
         self._mutation_seq = 0
         self._episodes: OrderedDict[str, EpisodeEnvelope] = OrderedDict()
         self._transition_counts: dict[str, int] = {}
+        self._episode_fingerprints: dict[str, bytes] = {}
         self._total_transitions = 0
         self._total_estimated_bytes = 0
         self._journal: deque[ReplayTransaction] = deque()
@@ -93,9 +96,10 @@ class EpisodeStore:
                 f"transitions/{self._capacity_bytes} bytes"
             )
 
-        existing = self._episodes.get(episode.episode_id)
-        if existing is not None:
-            if existing != episode:
+        fingerprint = self._fingerprint(episode)
+        existing_fingerprint = self._episode_fingerprints.get(episode.episode_id)
+        if existing_fingerprint is not None:
+            if existing_fingerprint != fingerprint:
                 raise DuplicateEpisodeConflictError(
                     f"episode_id {episode.episode_id!r} already has different content"
                 )
@@ -134,6 +138,7 @@ class EpisodeStore:
         self._total_transitions = total_transitions
         self._total_estimated_bytes = total_estimated_bytes
         self._mutation_seq = mutation_seq
+        self._episode_fingerprints[episode.episode_id] = fingerprint
         self._journal.append(transaction)
         while len(self._journal) > self._journal_capacity:
             self._journal.popleft()
@@ -144,6 +149,11 @@ class EpisodeStore:
             duplicate=False,
             evicted_episode_ids=tuple(evicted_episode_ids),
         )
+
+    @staticmethod
+    def _fingerprint(episode: EpisodeEnvelope) -> bytes:
+        encoded = pickle.dumps(episode, protocol=pickle.HIGHEST_PROTOCOL)
+        return hashlib.sha256(encoded).digest()
 
     def get_snapshot(self, max_bytes: int | None = None) -> ReplaySnapshot:
         if max_bytes is not None:

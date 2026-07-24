@@ -70,7 +70,7 @@ required production boundary.
 Phase 1 provides:
 
 - immutable, schema-versioned whole-episode envelopes;
-- idempotent commit with explicit duplicate conflicts;
+- idempotent commit that survives FIFO eviction, with explicit duplicate conflicts;
 - FIFO retention by transition and approximate-byte capacities;
 - atomic snapshot/delta synchronization with stale-cursor resync;
 - a deterministic learner-local reference view;

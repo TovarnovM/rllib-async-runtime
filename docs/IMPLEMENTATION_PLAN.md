@@ -814,6 +814,7 @@ adapter.
 
 - property tests для произвольных add/evict;
 - duplicate commit не меняет store;
+- delayed duplicate commit остаётся no-op после FIFO eviction;
 - oversize episode отклоняется;
 - snapshot + все последующие delta дают точное состояние store;
 - stale cursor требует full resync;

@@ -36,11 +36,15 @@ member_id/runner_id/runner_generation/local_episode_seq
 ```
 
 Reusing an ID for identical content is an idempotent no-op. Reusing it for
-different content is an explicit conflict.
+different content is an explicit conflict. The authoritative store retains a
+compact content fingerprint independently of the live FIFO manifest, so both
+guarantees continue to hold after the episode payload is evicted.
 
 ## Consequences
 
 - Retried commits cannot duplicate training data.
+- Deduplication metadata lives for the complete store generation and must be
+  included in authoritative replay checkpoints.
 - One episode has unambiguous behavior-weight provenance.
 - Learners never observe a partial episode or a half-applied eviction set.
 - Retention may exceed an exact transition target by less than one episode only

@@ -22,7 +22,8 @@ learner.
 
 The authoritative side owns:
 
-- idempotent commit;
+- idempotent commit backed by content fingerprints independent of FIFO
+  payload retention;
 - FIFO retention by transitions and approximate bytes;
 - generation plus monotonic mutation cursor;
 - bounded mutation journal;

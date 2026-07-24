@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pickle
 import random
 from collections import Counter, OrderedDict
 from dataclasses import replace
@@ -88,6 +89,35 @@ def test_duplicate_commit_is_idempotent_and_conflict_is_explicit() -> None:
     with pytest.raises(DuplicateEpisodeConflictError):
         store.commit_episode(replace(episode, runner_id="different-runner"))
     assert store.get_snapshot() == before
+
+
+def test_duplicate_commit_remains_idempotent_after_episode_eviction() -> None:
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(
+        codec,
+        capacity_transitions=1,
+        capacity_bytes=10_000,
+        store_generation="evicted-dedup",
+    )
+    evicted = make_episode(codec, 0, [0])
+    retained = make_episode(codec, 1, [1])
+
+    store.commit_episode(evicted)
+    store.commit_episode(retained)
+    before_retry = store.get_snapshot()
+
+    delayed_retry = pickle.loads(pickle.dumps(evicted))
+    duplicate = store.commit_episode(delayed_retry)
+
+    assert not duplicate.committed and duplicate.duplicate
+    assert duplicate.cursor == before_retry.cursor
+    assert duplicate.evicted_episode_ids == ()
+    assert store.get_snapshot() == before_retry
+
+    conflicting_retry = make_episode(codec, 0, ["different-content"])
+    with pytest.raises(DuplicateEpisodeConflictError):
+        store.commit_episode(conflicting_retry)
+    assert store.get_snapshot() == before_retry
 
 
 def test_oversize_and_schema_mismatch_leave_store_unchanged() -> None:
