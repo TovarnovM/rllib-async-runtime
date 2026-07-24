@@ -85,6 +85,8 @@ class FastReplay:
         """Validate one complete delta before atomically publishing it."""
         if delta.full_resync_required:
             raise FullResyncRequiredError("authoritative replay requires a snapshot")
+        if self._view is None:
+            raise CursorMismatchError("load a snapshot before applying deltas")
         view = self._require_view()
         if delta.base_cursor != view.cursor:
             raise CursorMismatchError(

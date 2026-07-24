@@ -286,6 +286,28 @@ def test_stale_cursor_requires_explicit_snapshot_resync() -> None:
     assert replay.get_snapshot() == store.get_snapshot()
 
 
+def test_delta_before_snapshot_requires_bootstrap() -> None:
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(
+        codec,
+        capacity_transitions=10,
+        capacity_bytes=10_000,
+        store_generation="missing-bootstrap",
+    )
+    initial_cursor = store.cursor
+    store.commit_episode(make_episode(codec, 0, [0]))
+    delta = store.get_delta(initial_cursor, max_bytes=10_000)
+
+    for replay in (FastReplay(codec), ReferenceFastReplay(codec)):
+        with pytest.raises(
+            CursorMismatchError,
+            match="load a snapshot before applying deltas",
+        ):
+            replay.apply_delta(delta)
+        assert replay.cursor is None
+        assert replay.episode_ids == ()
+
+
 def test_cursor_mismatch_is_rejected_without_mutation() -> None:
     codec = FlatEpisodeCodec()
     replay = FastReplay(codec)
