@@ -18,6 +18,7 @@ from rllib_async.protocols import (
     CommitAck,
     EpisodeEnvelope,
     FlatEpisodeCodec,
+    FrozenVersions,
     WeightsDescriptor,
 )
 from rllib_async.rollout.episode_runner import (
@@ -221,6 +222,7 @@ class AsyncRolloutGroup:
         self._explore = explore
         self._state = RolloutGroupState.CREATED
         self._runners: dict[str, Any] = {}
+        self._runner_weight_versions: dict[str, FrozenVersions] = {}
         self._runner_generations = {
             f"runner-{index}": 0 for index in range(runner_count)
         }
@@ -413,7 +415,7 @@ class AsyncRolloutGroup:
         self.stop()
 
     def _new_actor(self, runner_id: str) -> Any:
-        return EpisodeRolloutActor.options(
+        actor = EpisodeRolloutActor.options(
             num_cpus=self._num_cpus_per_runner,
         ).remote(
             self._config,
@@ -425,6 +427,10 @@ class AsyncRolloutGroup:
             initial_weights=self._latest_weights,
             worker_index=self._worker_indices[runner_id],
         )
+        self._runner_weight_versions[runner_id] = FrozenVersions(
+            self._latest_weights.module_versions
+        )
+        return actor
 
     def _schedule_available(self) -> None:
         if (
@@ -435,10 +441,20 @@ class AsyncRolloutGroup:
         while self._idle_runners and self._outstanding < self._high_watermark:
             runner_id = self._idle_runners.popleft()
             actor = self._runners[runner_id]
+            weights = (
+                self._latest_weights
+                if self._runner_weight_versions[runner_id]
+                != self._latest_weights.module_versions
+                else None
+            )
             ref = actor.collect_episode.remote(
-                self._latest_weights,
+                weights,
                 explore=self._explore,
             )
+            if weights is not None:
+                self._runner_weight_versions[runner_id] = FrozenVersions(
+                    weights.module_versions
+                )
             self._pending_samples[ref] = runner_id
             self._sample_calls_started += 1
             self._outstanding_high_watermark = max(

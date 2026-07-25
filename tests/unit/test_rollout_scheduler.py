@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 from ray.rllib.core import DEFAULT_MODULE_ID
 from ray.rllib.core.columns import Columns
@@ -42,20 +43,26 @@ class FakeRolloutActor:
         member_id: str,
         runner_id: str,
         runner_generation: int,
+        initial_weights: WeightsDescriptor,
     ) -> None:
         self._codec = codec
         self._member_id = member_id
         self._runner_id = runner_id
         self._runner_generation = runner_generation
         self._sequence = 0
+        self._weights = initial_weights
+        self.weight_arguments: list[WeightsDescriptor | None] = []
         self.collect_episode = FakeRemoteMethod(self._collect_episode)
 
     def _collect_episode(
         self,
-        weights: WeightsDescriptor,
+        weights: WeightsDescriptor | None,
         *,
         explore: bool,
     ) -> EpisodeRolloutResult:
+        self.weight_arguments.append(weights)
+        if weights is not None:
+            self._weights = weights
         transition = {
             Columns.OBS: 0.0,
             Columns.NEXT_OBS: 1.0,
@@ -77,7 +84,7 @@ class FakeRolloutActor:
             runner_id=self._runner_id,
             runner_generation=self._runner_generation,
             local_episode_seq=sequence,
-            behavior_versions=FrozenVersions(weights.module_versions),
+            behavior_versions=FrozenVersions(self._weights.module_versions),
             env_steps=1,
             agent_steps=1,
             terminated=True,
@@ -97,6 +104,8 @@ class FakeRolloutActor:
 
 
 class FakeRolloutActorClass:
+    created: ClassVar[dict[str, FakeRolloutActor]] = {}
+
     @classmethod
     def options(cls, **options):
         return cls
@@ -114,12 +123,15 @@ class FakeRolloutActorClass:
         initial_weights,
         worker_index,
     ) -> FakeRolloutActor:
-        return FakeRolloutActor(
+        actor = FakeRolloutActor(
             codec,
             member_id=member_id,
             runner_id=runner_id,
             runner_generation=runner_generation,
+            initial_weights=initial_weights,
         )
+        cls.created[runner_id] = actor
+        return actor
 
 
 class FakeReplayActor:
@@ -133,6 +145,7 @@ class FakeReplayActor:
 
 
 def install_fake_ray(monkeypatch) -> None:
+    FakeRolloutActorClass.created.clear()
     monkeypatch.setattr(group_module.ray, "is_initialized", lambda: True)
     monkeypatch.setattr(
         group_module.ray,
@@ -247,11 +260,36 @@ def test_new_weights_apply_to_next_episode_and_lag_is_measured(monkeypatch) -> N
         group.stop()
 
 
+def test_weights_are_sent_only_when_the_runner_version_changes(monkeypatch) -> None:
+    group = make_group(monkeypatch, high=100, low=50)
+    try:
+        group.start()
+        actors = tuple(FakeRolloutActorClass.created.values())
+        assert all(actor.weight_arguments == [None] for actor in actors)
+
+        assert group.poll(max_events=4) == []
+        assert all(actor.weight_arguments == [None, None] for actor in actors)
+
+        assert group.update_weights(make_weights(1))
+        assert group.poll(max_events=4) == []
+        for actor in actors:
+            assert actor.weight_arguments[:2] == [None, None]
+            publication = actor.weight_arguments[2]
+            assert publication is not None
+            assert publication.module_versions[DEFAULT_MODULE_ID] == 1
+
+        assert group.poll(max_events=4) == []
+        assert all(actor.weight_arguments[3] is None for actor in actors)
+    finally:
+        group.stop()
+
+
 def test_runner_restart_advances_generation_and_resets_sequence(monkeypatch) -> None:
     group = make_group(monkeypatch, high=8, low=3)
     try:
         group.start()
         assert group.restart_runner("runner-0") == 1
+        assert FakeRolloutActorClass.created["runner-0"].weight_arguments == [None]
 
         restarted = []
         for _ in range(8):
