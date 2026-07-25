@@ -4,12 +4,14 @@ Experimental Ray-native asynchronous off-policy runtime built on RLlib.
 
 > Experimental project built on Ray/RLlib; not an official Ray project.
 
-The project has completed its bootstrap, replay, and SAC learner-adapter phases.
-It currently contains the RLlib compatibility gates, deterministic replay
-reference model, a serialized Ray `ReplayActor`, atomic trusted-local replay
-checkpoints, reader-safe background `FastReplay` index publication, a bounded
-local batch pipeline, and a checkpoint-complete local SAC adapter. It does
-**not** yet implement the rollout execution loop, hierarchy, or graph encoders.
+The project has completed its bootstrap, replay, SAC learner-adapter, and
+episode-rollout phases. It currently contains the RLlib compatibility gates,
+deterministic replay reference model, a serialized Ray `ReplayActor`, atomic
+trusted-local replay checkpoints, reader-safe background `FastReplay` index
+publication, a bounded local batch pipeline, a checkpoint-complete local SAC
+adapter, and a version-aware asynchronous rollout group. It does **not** yet
+connect these components into the single-member training loop or implement
+hierarchy and graph encoders.
 
 ## Development contract
 
@@ -38,14 +40,18 @@ uv sync --locked --extra cu118 --group dev
 All remaining commands in this README run inside the devcontainer:
 
 ```bash
-uv run ruff check .
-uv run ruff format --check .
-uv run pytest -m "not gpu and not cluster and not stress"
-uv run pytest -m gpu tests/gpu
+uv run --locked --extra cu118 --group dev ruff check .
+uv run --locked --extra cu118 --group dev ruff format --check .
+uv run --locked --extra cu118 --group dev \
+  pytest -m "not gpu and not cluster and not stress"
+uv run --locked --extra cu118 --group dev pytest -m gpu tests/gpu
 ```
 
 The CPU-only GitHub Actions job uses the same lock file with the mutually
-exclusive `cpu` PyTorch extra.
+exclusive `cpu` PyTorch extra. Keep the selected extra on the `uv run` command,
+not only on the preceding `uv sync`: Ray 2.56 propagates the original `uv run`
+arguments to worker processes, and omitting the extra would create workers
+without PyTorch.
 
 ## Phase 0 compatibility gate
 
@@ -155,6 +161,25 @@ Phase 4 provides:
 The adapter contains no SAC loss implementation. Explicit pinned-memory and
 CUDA prefetch behavior remains part of the future one-GPU `LearnerHost`
 integration.
+
+## Phase 5 episode rollout and version sync
+
+Phase 5 provides:
+
+- one RLlib environment per rollout actor and one complete episode per call;
+- explicit `max_episode_steps` time-limit truncation;
+- weight installation only between episodes, with per-transition RLlib
+  sequence validation;
+- immutable flat replay envelopes carrying the behavior version actually used;
+- generation- and sequence-based idempotent episode IDs;
+- an asynchronous 4–16 actor group with no global episode barrier;
+- strict high/low commit-slot watermarks and boundary-only backpressure;
+- bounded policy-lag and episode-duration metrics;
+- explicit actor replacement that advances `runner_generation`.
+
+The group exposes finite polling and weight-publication operations. The Phase 6
+member controller will connect them to learner updates and replay
+synchronization.
 
 ## Architecture
 
