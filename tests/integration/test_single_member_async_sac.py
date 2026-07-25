@@ -3,8 +3,9 @@ from __future__ import annotations
 import time
 
 import pytest
+import ray
+from ray.exceptions import RayActorError
 from ray.rllib.algorithms.sac import SACConfig
-from ray.util.state import list_actors
 
 from rllib_async.examples import SyntheticThroughputEnv
 from rllib_async.runtime import (
@@ -77,6 +78,16 @@ def test_end_to_end_runtime_reports_all_layers_and_stops_actors(
     ray_runtime: None,
 ) -> None:
     runtime = make_runtime()
+    assert runtime._replay_actor is not None
+    assert runtime._learner_actor is not None
+    assert runtime._rollout_group is not None
+    assert runtime._evaluation_group is not None
+    actor_probes = [
+        (runtime._replay_actor, "get_stats"),
+        (runtime._learner_actor, "get_stats"),
+        *((actor, "close") for actor in runtime._rollout_group._runners.values()),
+        *((actor, "close") for actor in runtime._evaluation_group._actors.values()),
+    ]
     report = None
     try:
         runtime.start()
@@ -110,23 +121,16 @@ def test_end_to_end_runtime_reports_all_layers_and_stops_actors(
         runtime.stop(timeout_s=15)
     assert runtime.state is RuntimeState.STOPPED
 
-    runtime_actor_classes = {
-        "EpisodeRolloutActor",
-        "LearnerHostActor",
-        "ReplayActor",
-    }
-    deadline = time.monotonic() + 5
-    alive_runtime_actors: list[str] = []
-    while time.monotonic() < deadline:
-        alive_runtime_actors = [
-            actor.class_name
-            for actor in list_actors(
-                filters=[("state", "=", "ALIVE")],
-                detail=True,
-            )
-            if actor.class_name in runtime_actor_classes
-        ]
-        if not alive_runtime_actors:
-            break
-        time.sleep(0.05)
-    assert alive_runtime_actors == []
+    for actor, method_name in actor_probes:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                ray.get(getattr(actor, method_name).remote(), timeout=1)
+            except RayActorError:
+                break
+            except Exception:
+                if time.monotonic() >= deadline:
+                    raise
+            if time.monotonic() >= deadline:
+                pytest.fail(f"{method_name} actor remained alive after stop")
+            time.sleep(0.05)
