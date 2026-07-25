@@ -306,3 +306,26 @@ def test_runner_restart_advances_generation_and_resets_sequence(monkeypatch) -> 
         assert restarted[0].episode.episode_id == "member-0/runner-0/1/0"
     finally:
         group.stop()
+
+
+def test_pause_drains_pending_work_without_starting_new_episodes(monkeypatch) -> None:
+    group = make_group(monkeypatch, high=8, low=3)
+    try:
+        group.start()
+        group.pause()
+        assert group.get_stats().state.value == "paused"
+
+        completions = group.drain(timeout_s=1)
+        paused = group.get_stats()
+        assert len(completions) == 4
+        assert paused.pending_sample_calls == 0
+        assert paused.pending_episode_commits == 0
+        assert paused.sample_calls_started == 4
+
+        group.resume()
+        resumed = group.get_stats()
+        assert resumed.state.value == "running"
+        assert resumed.pending_sample_calls == 4
+        assert resumed.sample_calls_started == 8
+    finally:
+        group.stop()
