@@ -38,6 +38,17 @@ already-local batches. Therefore several SAC updates can follow one replay RPC.
 Snapshot resync remains explicit when the journal no longer covers the local
 cursor.
 
+The controller also gives learner ticks a cumulative update budget derived from
+newly sampled `env_steps` or `agent_steps`, according to `count_steps_by`.
+Explicit `SACConfig.training_intensity` uses RLlib's round-robin interpretation:
+the requested replayed-steps-to-sampled-steps ratio determines how many fresh
+steps unlock each update group. `None` and zero retain SAC's natural rate of one
+learner update per newly eligible sampled step. Warm-up steps do not create a
+catch-up backlog: the first update group is unlocked only by the sampling round
+that reaches `num_steps_sampled_before_learning_starts`. The runtime
+`learner_updates_per_tick` setting limits one actor call, not the cumulative
+update-to-data ratio.
+
 The controller maintains at most one pending learner tick. The Phase 5 rollout
 group retains its strict bound:
 

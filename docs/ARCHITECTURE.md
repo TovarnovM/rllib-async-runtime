@@ -109,6 +109,8 @@ Phase 6 adds the first complete single-member control plane:
   and one local RLlib SAC `LearnerGroup`;
 - each learner tick requests at most one bounded replay delta and can consume
   several already-local batches;
+- cumulative sampled-step progress and `SACConfig.training_intensity` bound the
+  total learner updates, while `learner_updates_per_tick` only caps one RPC;
 - the controller keeps at most one learner tick pending while rollout and
   evaluation actors progress independently;
 - evaluation actors receive one frozen publication for a complete round and

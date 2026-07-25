@@ -59,6 +59,10 @@ class SingleMemberAsyncSAC:
 
         self._sac_config = sac_config.copy(copy_frozen=False)
         self._config = runtime_config
+        self._target_training_intensity = self._resolve_training_intensity(
+            self._sac_config.training_intensity,
+            batch_size=self._config.batch_size,
+        )
         self._codec = FlatEpisodeCodec()
         self._state = RuntimeState.CREATED
         self._replay_actor: Any | None = None
@@ -71,6 +75,7 @@ class SingleMemberAsyncSAC:
         self._pump_iterations = 0
         self._reports = 0
         self._pending_rpc_high_watermark = 0
+        self._learner_updates_completed = 0
         self._last_report_env_steps = 0
         self._last_report_episodes = 0
         self._next_evaluation_env_steps = 0
@@ -244,6 +249,19 @@ class SingleMemberAsyncSAC:
         fast_replay = learner_values.pop("fast_replay")
         batching = learner_values.pop("batch_producer")
         learner_values["last_learner_metrics"] = dict(learner.last_learner_metrics)
+        sampled_steps = self._sampled_steps(rollout)
+        learner_values["update_to_data_ratio"] = (
+            learner.learner_updates / sampled_steps if sampled_steps else 0.0
+        )
+        learner_values["training_intensity"] = (
+            learner.learner_updates * self._config.batch_size / sampled_steps
+            if sampled_steps
+            else 0.0
+        )
+        learner_values["target_training_intensity"] = self._target_training_intensity
+        learner_values["effective_training_intensity"] = (
+            self._effective_training_intensity()
+        )
         result: dict[str, Any] = {
             "timesteps_this_iter": env_steps_this_iter,
             "episodes_this_iter": episodes_this_iter,
@@ -378,10 +396,16 @@ class SingleMemberAsyncSAC:
         assert self._learner_actor is not None
         assert self._rollout_group is not None
         rollout = self._rollout_group.get_stats()
+        remaining_updates = self._remaining_learner_update_budget(rollout)
+        if remaining_updates == 0:
+            return
         self._pending_learner_tick = self._learner_actor.tick.remote(
             sampled_env_steps=rollout.env_steps,
             sampled_agent_steps=rollout.agent_steps,
-            max_updates=self._config.learner_updates_per_tick,
+            max_updates=min(
+                self._config.learner_updates_per_tick,
+                remaining_updates,
+            ),
         )
 
     def _poll_learner_tick(self) -> None:
@@ -406,6 +430,13 @@ class SingleMemberAsyncSAC:
     def _accept_learner_tick(self, tick: object) -> None:
         if not isinstance(tick, LearnerHostTick):
             raise RuntimeError("learner actor returned an invalid tick result")
+        if (
+            not isinstance(tick.updates_performed, int)
+            or isinstance(tick.updates_performed, bool)
+            or tick.updates_performed < 0
+        ):
+            raise RuntimeError("learner actor returned an invalid update count")
+        self._learner_updates_completed += tick.updates_performed
         if tick.published_weights is None:
             return
         assert self._rollout_group is not None
@@ -463,6 +494,7 @@ class SingleMemberAsyncSAC:
             + self._config.evaluation_num_episodes
             + 1
         )
+        learner_update_budget = self._learner_update_budget(rollout)
         return {
             "state": self._state.value,
             "pump_iterations": self._pump_iterations,
@@ -471,6 +503,14 @@ class SingleMemberAsyncSAC:
             "pending_rpc_bound": bound,
             "pending_rpc_high_watermark": self._pending_rpc_high_watermark,
             "learner_rpc_pending": int(self._pending_learner_tick is not None),
+            "learner_updates_completed": self._learner_updates_completed,
+            "learner_update_budget": learner_update_budget,
+            "learner_update_budget_remaining": max(
+                learner_update_budget - self._learner_updates_completed,
+                0,
+            ),
+            "target_training_intensity": self._target_training_intensity,
+            "effective_training_intensity": (self._effective_training_intensity()),
             "uptime_s": (
                 time.monotonic() - self._started_at
                 if self._started_at is not None
@@ -497,6 +537,74 @@ class SingleMemberAsyncSAC:
     def _require_not_stopped(self) -> None:
         if self._state is RuntimeState.STOPPED:
             raise RuntimeError("runtime is stopped")
+
+    def _remaining_learner_update_budget(self, rollout: object) -> int:
+        return max(
+            self._learner_update_budget(rollout) - self._learner_updates_completed,
+            0,
+        )
+
+    def _learner_update_budget(self, rollout: object) -> int:
+        sampled_steps = self._sampled_steps(rollout)
+        learning_starts = int(self._sac_config.num_steps_sampled_before_learning_starts)
+        if sampled_steps < learning_starts:
+            return 0
+
+        store_steps, updates_per_round = self._training_round_robin_weights()
+        completed_store_rounds = sampled_steps // store_steps
+        if learning_starts == 0:
+            eligible_store_rounds = completed_store_rounds
+        else:
+            first_training_round = math.ceil(learning_starts / store_steps)
+            eligible_store_rounds = max(
+                completed_store_rounds - first_training_round + 1,
+                0,
+            )
+        return eligible_store_rounds * updates_per_round
+
+    def _sampled_steps(self, rollout: object) -> int:
+        count_steps_by = self._sac_config.count_steps_by
+        if count_steps_by == "env_steps":
+            sampled_steps = rollout.env_steps
+        elif count_steps_by == "agent_steps":
+            sampled_steps = rollout.agent_steps
+        else:
+            raise RuntimeError(f"unsupported count_steps_by {count_steps_by!r}")
+        return sampled_steps
+
+    def _training_round_robin_weights(self) -> tuple[int, int]:
+        update_ratio = self._target_training_intensity / self._config.batch_size
+        if update_ratio < 1.0:
+            return max(round(1.0 / update_ratio), 1), 1
+        return 1, max(round(update_ratio), 1)
+
+    def _effective_training_intensity(self) -> float:
+        store_steps, updates_per_round = self._training_round_robin_weights()
+        return updates_per_round * self._config.batch_size / store_steps
+
+    @staticmethod
+    def _resolve_training_intensity(
+        value: object,
+        *,
+        batch_size: int,
+    ) -> float:
+        # RLlib treats None and zero as its natural round-robin intensity. This
+        # step-scheduled runtime's natural equivalent is one learner update per
+        # newly eligible sampled step.
+        if value is None:
+            return float(batch_size)
+        if (
+            not isinstance(value, int | float)
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(
+                "SAC training_intensity must be finite and non-negative or None"
+            )
+        if value == 0:
+            return float(batch_size)
+        return float(value)
 
     @staticmethod
     def _resolve_spaces(

@@ -189,6 +189,9 @@ Phase 6 provides:
   production, and the stock RLlib SAC learner adapter;
 - chunked replay synchronization followed by multiple learner-local updates,
   so the hot path does not perform an authoritative replay RPC per batch;
+- cumulative learner-update budgeting from newly sampled steps, including
+  `SACConfig.training_intensity`, without warm-up catch-up or stalled-rollout
+  over-training;
 - a Tune `Trainable` event pump with at most one pending learner call and
   explicit bounds for rollout, commit, and evaluation calls;
 - separate frozen-weight evaluation actors that never receive a replay handle;
