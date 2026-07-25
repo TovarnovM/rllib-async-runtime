@@ -4,14 +4,14 @@ Experimental Ray-native asynchronous off-policy runtime built on RLlib.
 
 > Experimental project built on Ray/RLlib; not an official Ray project.
 
-The project has completed its bootstrap, replay, SAC learner-adapter, and
-episode-rollout phases. It currently contains the RLlib compatibility gates,
-deterministic replay reference model, a serialized Ray `ReplayActor`, atomic
-trusted-local replay checkpoints, reader-safe background `FastReplay` index
-publication, a bounded local batch pipeline, a checkpoint-complete local SAC
-adapter, and a version-aware asynchronous rollout group. It does **not** yet
-connect these components into the single-member training loop or implement
-hierarchy and graph encoders.
+The project has completed its bootstrap through single-member Async SAC phases.
+It contains the RLlib compatibility gates, deterministic replay reference
+model, a serialized Ray `ReplayActor`, atomic trusted-local replay checkpoints,
+reader-safe background `FastReplay` index publication, a bounded local batch
+pipeline, a checkpoint-complete local SAC adapter, version-aware asynchronous
+rollout, replay-isolated evaluation, and a Tune-compatible end-to-end event
+pump. It does **not** yet restore a complete running member after failure,
+launch a population, or implement hierarchy and graph encoders.
 
 ## Development contract
 
@@ -158,9 +158,9 @@ Phase 4 provides:
   published weights, plus CPU/CUDA RNG state and config/space compatibility;
 - fixed-batch parity and post-restore next-update tests against stock RLlib SAC.
 
-The adapter contains no SAC loss implementation. Explicit pinned-memory and
-CUDA prefetch behavior remains part of the future one-GPU `LearnerHost`
-integration.
+The adapter contains no SAC loss implementation. The Phase 6 `LearnerHost`
+still uses bounded CPU NumPy batches; explicit pinned-memory and CUDA prefetch
+remain performance work rather than part of the correctness path.
 
 ## Phase 5 episode rollout and version sync
 
@@ -177,9 +177,48 @@ Phase 5 provides:
 - bounded policy-lag and episode-duration metrics;
 - explicit actor replacement that advances `runner_generation`.
 
-The group exposes finite polling and weight-publication operations. The Phase 6
-member controller will connect them to learner updates and replay
-synchronization.
+The group exposes finite polling, pause/resume/drain, and weight-publication
+operations. Phase 6 composes these operations without changing the Phase 5
+episode and version contracts.
+
+## Phase 6 single-member Async SAC
+
+Phase 6 provides:
+
+- one finite-call `LearnerHost` actor owning `FastReplay`, bounded batch
+  production, and the stock RLlib SAC learner adapter;
+- chunked replay synchronization followed by multiple learner-local updates,
+  so the hot path does not perform an authoritative replay RPC per batch;
+- cumulative learner-update budgeting from newly sampled steps, including
+  `SACConfig.training_intensity`, without warm-up catch-up or stalled-rollout
+  over-training;
+- a Tune `Trainable` event pump with at most one pending learner call and
+  explicit bounds for rollout, commit, and evaluation calls;
+- separate frozen-weight evaluation actors that never receive a replay handle;
+- graceful rollout-boundary pause, drain, resume, and actor shutdown;
+- Tune results containing controller, rollout, authoritative replay,
+  learner-local replay, batching, learner, and evaluation metrics;
+- runnable Pendulum correctness and synthetic throughput examples.
+
+Run the correctness example with:
+
+```bash
+uv run --locked --extra cu118 --group dev \
+  python examples/async_sac_pendulum.py --num-gpus 1
+```
+
+Use `--require-improvement` to make the command fail unless the recorded
+evaluation history improves by the requested margin. For a cheap orchestration
+measurement:
+
+```bash
+uv run --locked --extra cu118 --group dev \
+  python examples/async_sac_throughput.py --runner-count 8
+```
+
+Full running-member checkpoint/recovery remains Phase 7. The Phase 4 learner
+adapter and Phase 2 replay actor can each serialize their own state, but Phase 6
+does not yet coordinate them into one recoverable runtime checkpoint.
 
 ## Architecture
 

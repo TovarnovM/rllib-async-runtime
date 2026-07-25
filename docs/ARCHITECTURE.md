@@ -103,9 +103,26 @@ Phase 5 adds the rollout boundary:
 - policy-version lag is measured against the latest publication when an episode
   completes.
 
-This finite rollout coordinator is not the complete training event pump. Phase
-6 will connect rollout, authoritative replay, learner-local replay, batches,
-learner updates, and reporting.
+Phase 6 adds the first complete single-member control plane:
+
+- a finite-call learner actor owns one `FastReplay`, one bounded batch producer,
+  and one local RLlib SAC `LearnerGroup`;
+- each learner tick requests at most one bounded replay delta and can consume
+  several already-local batches;
+- cumulative sampled-step progress and `SACConfig.training_intensity` bound the
+  total learner updates, while `learner_updates_per_tick` only caps one RPC;
+- the controller keeps at most one learner tick pending while rollout and
+  evaluation actors progress independently;
+- evaluation actors receive one frozen publication for a complete round and
+  have no authoritative replay handle;
+- pause prevents new episodes at boundaries, drain completes existing
+  sample/commit calls and queued learner work, and stop kills every owned actor;
+- Tune reporting exposes controller, rollout, authoritative replay,
+  learner-local replay, batching, learner, and evaluation state.
+
+This boundary intentionally does not coordinate a recoverable member
+checkpoint. Rebuilding the learner-local view and recreating actors after
+restore remain Phase 7.
 
 See [ADR 0001](adr/0001-runtime-boundary.md) for the orchestration decision and
 [ADR 0002](adr/0002-episode-replay-quantum.md) and
@@ -119,4 +136,6 @@ batch schema, publication, and checkpoint boundary.
 [ADR 0008](adr/0008-episode-rollout-and-version-sync.md) records whole-episode
 collection, version installation, restart identity, and bounded asynchronous
 coordination.
+[ADR 0009](adr/0009-single-member-async-sac.md) records learner-host ownership,
+the event pump, frozen evaluation, reporting, and graceful lifecycle.
 See [the implementation plan](IMPLEMENTATION_PLAN.md) for phase gates.

@@ -37,6 +37,7 @@ class RolloutGroupError(RuntimeError):
 class RolloutGroupState(str, Enum):
     CREATED = "created"
     RUNNING = "running"
+    PAUSED = "paused"
     STOPPED = "stopped"
 
 
@@ -260,11 +261,68 @@ class AsyncRolloutGroup:
     def start(self) -> None:
         if self._state is RolloutGroupState.RUNNING:
             return
+        if self._state is RolloutGroupState.PAUSED:
+            self.resume()
+            return
         if self._state is RolloutGroupState.STOPPED:
             raise RolloutGroupError("cannot start a stopped rollout group")
         self._state = RolloutGroupState.RUNNING
         self._started_at = time.monotonic()
         self._schedule_available()
+
+    def pause(self) -> None:
+        """Stop scheduling at episode boundaries while preserving pending work."""
+
+        if self._state is RolloutGroupState.PAUSED:
+            return
+        self._require_running()
+        self._leave_backpressure()
+        self._state = RolloutGroupState.PAUSED
+
+    def resume(self) -> None:
+        if self._state is RolloutGroupState.RUNNING:
+            return
+        if self._state is not RolloutGroupState.PAUSED:
+            raise RolloutGroupError(
+                f"cannot resume rollout group in state {self._state.value!r}"
+            )
+        self._state = RolloutGroupState.RUNNING
+        self._schedule_available()
+
+    def drain(self, *, timeout_s: float | None = None) -> list[RolloutCompletion]:
+        """Finish active episodes and commits without starting new episodes."""
+
+        if self._state is RolloutGroupState.RUNNING:
+            self.pause()
+        elif self._state is not RolloutGroupState.PAUSED:
+            raise RolloutGroupError(
+                f"cannot drain rollout group in state {self._state.value!r}"
+            )
+        if timeout_s is not None and (
+            not isinstance(timeout_s, int | float)
+            or isinstance(timeout_s, bool)
+            or not math.isfinite(timeout_s)
+            or timeout_s < 0
+        ):
+            raise ValueError("timeout_s must be finite and non-negative or None")
+        deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+        completions: list[RolloutCompletion] = []
+        while self._pending_samples or self._pending_commits:
+            remaining = (
+                None if deadline is None else max(deadline - time.monotonic(), 0.0)
+            )
+            if remaining == 0:
+                raise TimeoutError("timed out draining rollout group")
+            completions.extend(
+                self.poll(
+                    timeout_s=(min(remaining, 0.05) if remaining is not None else 0.05),
+                    max_events=max(
+                        len(self._pending_samples) + len(self._pending_commits),
+                        1,
+                    ),
+                )
+            )
+        return completions
 
     def update_weights(self, weights: WeightsDescriptor) -> bool:
         """Publish weights for installation by each actor's next episode call."""
@@ -287,7 +345,7 @@ class AsyncRolloutGroup:
     ) -> list[RolloutCompletion]:
         """Advance ready sample/commit RPCs without waiting for an episode barrier."""
 
-        self._require_running()
+        self._require_pollable()
         if timeout_s is not None and (
             not isinstance(timeout_s, int | float)
             or isinstance(timeout_s, bool)
@@ -398,7 +456,7 @@ class AsyncRolloutGroup:
         if self._state is RolloutGroupState.STOPPED:
             return
         self._leave_backpressure()
-        for ref in tuple(self._pending_samples):
+        for ref in (*self._pending_samples, *self._pending_commits):
             ray.cancel(ref)
         for actor in self._runners.values():
             ray.kill(actor, no_restart=True)
@@ -564,6 +622,13 @@ class AsyncRolloutGroup:
     def _require_running(self) -> None:
         if self._state is not RolloutGroupState.RUNNING:
             raise RolloutGroupError("rollout group is not running")
+
+    def _require_pollable(self) -> None:
+        if self._state not in {
+            RolloutGroupState.RUNNING,
+            RolloutGroupState.PAUSED,
+        }:
+            raise RolloutGroupError("rollout group is not active")
 
     def _require_not_stopped(self) -> None:
         if self._state is RolloutGroupState.STOPPED:

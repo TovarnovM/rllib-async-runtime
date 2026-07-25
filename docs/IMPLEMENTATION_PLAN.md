@@ -1,7 +1,7 @@
 # `rllib-async-runtime`: подробный план реализации
 
-**Статус:** Phase 0–5 реализованы; следующий этап — single-member Async SAC
-в Phase 6
+**Статус:** Phase 0–6 реализованы; следующий этап — checkpoint/recovery
+в Phase 7
 
 **Дата фиксации:** 24 июля 2026
 
@@ -629,9 +629,11 @@ rllib-async-runtime/
 │       ├── 0005-fast-replay-materialized-view.md
 │       ├── 0006-reader-safe-rebuild-and-batch-pipeline.md
 │       ├── 0007-rllib-sac-learner-adapter.md
-│       └── 0008-episode-rollout-and-version-sync.md
+│       ├── 0008-episode-rollout-and-version-sync.md
+│       └── 0009-single-member-async-sac.md
 ├── examples/
 │   ├── async_sac_pendulum.py
+│   ├── async_sac_throughput.py
 │   ├── population_two_members.py
 │   ├── hierarchy_three_policies.py
 │   └── shared_gnn_multiagent.py
@@ -932,13 +934,13 @@ Phase 3 разделён на correctness-first Phase 3A и асинхронны
 
 ### Задачи
 
-1. Соединить controller, runners, replay и learner.
-2. Реализовать event pump.
-3. Реализовать Tune reporting interval.
-4. Реализовать graceful pause/drain/stop.
-5. Добавить correctness example на `Pendulum-v1`.
-6. Добавить synthetic throughput environment.
-7. Добавить evaluation runners, не пишущие в training replay.
+1. [x] Соединить controller, runners, replay и learner.
+2. [x] Реализовать event pump.
+3. [x] Реализовать Tune reporting interval.
+4. [x] Реализовать graceful pause/drain/stop.
+5. [x] Добавить correctness example на `Pendulum-v1`.
+6. [x] Добавить synthetic throughput environment.
+7. [x] Добавить evaluation runners, не пишущие в training replay.
 
 ### Критерии готовности
 
@@ -1340,7 +1342,7 @@ Success criterion первого PR:
 - [x] Phase 3B asynchronous FastReplay hot path.
 - [x] Phase 4 SAC adapter.
 - [x] Phase 5 rollout/version sync.
-- [ ] Phase 6 single-member AsyncSAC.
+- [x] Phase 6 single-member AsyncSAC.
 - [ ] Phase 7 checkpoint/recovery.
 - [ ] Phase 8 two-member population.
 - [ ] Phase 9 hierarchy example.
