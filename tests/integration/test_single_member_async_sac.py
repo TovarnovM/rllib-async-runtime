@@ -216,7 +216,10 @@ def test_controlled_crash_restores_every_runtime_layer(
         continued = None
         while time.monotonic() < deadline:
             continued = restored.run_for(0.2)
-            if continued["learner"]["learner_updates"] > previous_updates:
+            if (
+                continued["learner"]["learner_updates"] > previous_updates
+                and continued["rollout"]["env_steps"] > saved.rollout["env_steps"]
+            ):
                 break
         assert continued is not None
         assert continued["learner"]["learner_updates"] > previous_updates
