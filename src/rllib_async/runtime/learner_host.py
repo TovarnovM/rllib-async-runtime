@@ -103,6 +103,10 @@ class LearnerHost:
             or replay_sync_max_bytes < 1
         ):
             raise ValueError("replay_sync_max_bytes must be positive")
+        if config.n_step != 1:
+            raise ValueError(
+                "LearnerHost requires n_step=1 until n-step targets are constructed"
+            )
 
         self._replay_actor = replay_actor
         self._codec = codec

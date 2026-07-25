@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 import numpy as np
+import pytest
 from ray.rllib.core import DEFAULT_MODULE_ID
 from ray.rllib.core.columns import Columns
 from ray.rllib.env.single_agent_env_runner import SingleAgentEnvRunner
@@ -26,6 +27,25 @@ class ImmediateReplayActor:
     def __init__(self, store: EpisodeStore) -> None:
         self.get_snapshot = ImmediateRemoteMethod(store.get_snapshot)
         self.get_delta = ImmediateRemoteMethod(store.get_delta)
+
+
+def test_learner_host_rejects_unconstructed_n_step_targets() -> None:
+    config = make_sac_config()
+    config.training(n_step=3)
+
+    with pytest.raises(ValueError, match="n_step=1"):
+        LearnerHost(
+            config,
+            {},
+            object(),
+            FlatEpisodeCodec(),
+            member_id="member-0",
+            publication_interval_updates=1,
+            batch_size=8,
+            batch_queue_capacity=1,
+            batch_seed=7,
+            replay_sync_max_bytes=1_000_000,
+        )
 
 
 def make_episode(codec: FlatEpisodeCodec, size: int = 64) -> EpisodeEnvelope:

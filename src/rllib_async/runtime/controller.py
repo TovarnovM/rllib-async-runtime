@@ -272,13 +272,17 @@ class SingleMemberAsyncSAC:
         deadline = time.monotonic() + timeout_s
         assert self._rollout_group is not None
         assert self._learner_actor is not None
-        self._rollout_group.pause()
-        self._finish_learner_tick(timeout_s=self._remaining(deadline))
-        ray.get(
-            self._learner_actor.pause.remote(timeout_s=self._remaining(deadline)),
-            timeout=self._remaining(deadline),
-        )
-        self._state = RuntimeState.PAUSED
+        try:
+            self._rollout_group.pause()
+            self._finish_learner_tick(timeout_s=self._remaining(deadline))
+            ray.get(
+                self._learner_actor.pause.remote(timeout_s=self._remaining(deadline)),
+                timeout=self._remaining(deadline),
+            )
+            self._state = RuntimeState.PAUSED
+        except Exception:
+            self._state = RuntimeState.FAILED
+            raise
 
     def resume(self) -> None:
         if self._state is RuntimeState.RUNNING:
