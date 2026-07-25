@@ -120,9 +120,24 @@ Phase 6 adds the first complete single-member control plane:
 - Tune reporting exposes controller, rollout, authoritative replay,
   learner-local replay, batching, learner, and evaluation state.
 
-This boundary intentionally does not coordinate a recoverable member
-checkpoint. Rebuilding the learner-local view and recreating actors after
-restore remain Phase 7.
+Phase 7 adds the recovery boundary:
+
+- checkpoint drain finishes complete episode commits, evaluation, replay sync,
+  and only the learner updates admitted by the cumulative intensity budget;
+- authoritative replay and member state are separate checksummed files, with
+  the member file published last and tied to the replay cursor;
+- the controller persists replay state returned through Ray, avoiding an
+  actor-local filesystem dependency;
+- learner, controller, rollout, evaluation, publication, and RNG state are
+  restored, while `FastReplay`, its index, and its batch queue are rebuilt;
+- each recreated rollout actor increments its saved generation before sequence
+  zero, preventing post-crash episode ID collisions;
+- Tune directory checkpoints remain relocatable and reject partial or
+  mismatched member/replay state.
+
+Recovery preserves everything represented by the last successful checkpoint.
+Episodes and learner work performed after it may be lost, so the loss bound is
+the checkpoint interval. Cluster-wide exactly-once execution is not claimed.
 
 See [ADR 0001](adr/0001-runtime-boundary.md) for the orchestration decision and
 [ADR 0002](adr/0002-episode-replay-quantum.md) and
@@ -138,4 +153,7 @@ collection, version installation, restart identity, and bounded asynchronous
 coordination.
 [ADR 0009](adr/0009-single-member-async-sac.md) records learner-host ownership,
 the event pump, frozen evaluation, reporting, and graceful lifecycle.
+[ADR 0010](adr/0010-coordinated-member-recovery.md) records coordinated
+checkpoint ordering, replay reconstruction, runner recreation, Tune hooks, and
+the explicit loss boundary.
 See [the implementation plan](IMPLEMENTATION_PLAN.md) for phase gates.

@@ -1,7 +1,7 @@
 # `rllib-async-runtime`: подробный план реализации
 
-**Статус:** Phase 0–6 реализованы; следующий этап — checkpoint/recovery
-в Phase 7
+**Статус:** Phase 0–7 реализованы; следующий этап — две особи и общий replay
+в Phase 8
 
 **Дата фиксации:** 24 июля 2026
 
@@ -500,9 +500,10 @@ Checkpoint делится на три уровня.
 2. затем догоняется delta;
 3. learner начинает GPU updates только после `learning_starts` threshold.
 
-Ограничение `v0.1`: replay checkpoint предполагает локальную или общую
-POSIX-compatible файловую систему, доступную actor’у. S3/GCS и произвольный
-distributed storage откладываются.
+В Phase 7 replay state передаётся от actor через Ray и записывается controller
+в relocatable Tune checkpoint directory. Прямой object-storage-native
+snapshot, incremental replay checkpoint и отдельная population cadence
+откладываются.
 
 Recovery semantics:
 
@@ -630,7 +631,8 @@ rllib-async-runtime/
 │       ├── 0006-reader-safe-rebuild-and-batch-pipeline.md
 │       ├── 0007-rllib-sac-learner-adapter.md
 │       ├── 0008-episode-rollout-and-version-sync.md
-│       └── 0009-single-member-async-sac.md
+│       ├── 0009-single-member-async-sac.md
+│       └── 0010-coordinated-member-recovery.md
 ├── examples/
 │   ├── async_sac_pendulum.py
 │   ├── async_sac_throughput.py
@@ -961,11 +963,11 @@ Phase 3 разделён на correctness-first Phase 3A и асинхронны
 
 ### Задачи
 
-1. Member checkpoint.
-2. Replay snapshot.
-3. Restore `FastReplay` из authoritative state.
-4. Runner recreation.
-5. Controlled crash tests.
+1. [x] Member checkpoint.
+2. [x] Replay snapshot.
+3. [x] Restore `FastReplay` из authoritative state.
+4. [x] Runner recreation.
+5. [x] Controlled crash tests.
 
 ### Критерии готовности
 
@@ -1343,7 +1345,7 @@ Success criterion первого PR:
 - [x] Phase 4 SAC adapter.
 - [x] Phase 5 rollout/version sync.
 - [x] Phase 6 single-member AsyncSAC.
-- [ ] Phase 7 checkpoint/recovery.
+- [x] Phase 7 checkpoint/recovery.
 - [ ] Phase 8 two-member population.
 - [ ] Phase 9 hierarchy example.
 - [ ] Phase 10 shared-GNN example.

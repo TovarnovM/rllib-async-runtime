@@ -156,3 +156,94 @@ def test_one_sync_can_feed_multiple_local_sac_updates(monkeypatch) -> None:
     finally:
         host.stop(timeout_s=2)
         runner.stop()
+
+
+def test_checkpoint_restores_learner_but_rebuilds_fast_replay(monkeypatch) -> None:
+    monkeypatch.setattr(learner_host_module.ray, "get", lambda value: value)
+    config = make_sac_config()
+    config.training(
+        train_batch_size_per_learner=8,
+        num_steps_sampled_before_learning_starts=0,
+    )
+    runner = SingleAgentEnvRunner(config=config, worker_index=0)
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(
+        codec,
+        capacity_transitions=1_000,
+        capacity_bytes=10_000_000,
+        store_generation="learner-restore",
+    )
+    store.commit_episode(make_episode(codec))
+    source = LearnerHost(
+        config,
+        runner.get_spaces(),
+        ImmediateReplayActor(store),
+        codec,
+        member_id="member-0",
+        publication_interval_updates=1,
+        batch_size=8,
+        batch_queue_capacity=2,
+        batch_seed=17,
+        replay_sync_max_bytes=1_000_000,
+    )
+    restored = None
+    try:
+        source.start()
+        deadline = time.monotonic() + 5
+        while (
+            source.get_stats().batch_producer.queue_size < 1
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        tick = source.tick(
+            sampled_env_steps=64,
+            sampled_agent_steps=64,
+            max_updates=1,
+        )
+        assert tick.updates_performed == 1
+        source.drain(
+            sampled_env_steps=64,
+            sampled_agent_steps=64,
+            max_updates=0,
+            timeout_s=2,
+        )
+        checkpoint = source.get_checkpoint_state()
+        checkpoint_payload = learner_host_module.encode_learner_host_checkpoint(
+            checkpoint
+        )
+        source_stats = source.get_stats()
+        assert "fast_replay" not in checkpoint
+        assert "batch_producer" not in checkpoint
+
+        restored = LearnerHost(
+            config,
+            runner.get_spaces(),
+            ImmediateReplayActor(store),
+            codec,
+            member_id="member-0",
+            publication_interval_updates=1,
+            batch_size=8,
+            batch_queue_capacity=2,
+            batch_seed=999,
+            replay_sync_max_bytes=1_000_000,
+            checkpoint_state=checkpoint_payload,
+        )
+        recovered = restored.get_stats()
+        assert recovered.state is LearnerHostState.CREATED
+        assert recovered.learner_updates == source_stats.learner_updates
+        assert recovered.latest_module_version == source_stats.latest_module_version
+        assert recovered.fast_replay.cursor == source_stats.fast_replay.cursor
+        assert recovered.fast_replay.active_cursor == source_stats.fast_replay.cursor
+        assert recovered.fast_replay.total_transitions == 64
+        assert recovered.snapshot_loads == source_stats.snapshot_loads + 1
+        assert (
+            restored.get_published_weights().module_versions
+            == source.get_published_weights().module_versions
+        )
+        restored.start()
+        assert restored.get_stats().updates_per_s == 0.0
+    finally:
+        source.stop(timeout_s=2)
+        if restored is not None:
+            restored.stop(timeout_s=2)
+        runner.stop()

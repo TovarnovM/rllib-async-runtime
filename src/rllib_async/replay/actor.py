@@ -17,7 +17,7 @@ from rllib_async.replay.checkpoint import (
     read_replay_checkpoint,
     write_replay_checkpoint,
 )
-from rllib_async.replay.reference import EpisodeStore
+from rllib_async.replay.reference import EpisodeStore, EpisodeStoreState
 
 
 @ray.remote(max_concurrency=1)
@@ -57,8 +57,18 @@ class ReplayActor:
     def save_snapshot(self, path: str) -> ReplayCheckpoint:
         return write_replay_checkpoint(path, self._store.export_state())
 
-    def load_snapshot(self, path: str) -> ReplayStats:
-        state = read_replay_checkpoint(path)
+    def get_checkpoint_state(self) -> EpisodeStoreState:
+        """Return authoritative state for persistence by the controller node."""
+
+        return self._store.export_state()
+
+    def load_checkpoint_state(self, state: EpisodeStoreState) -> ReplayStats:
+        """Validate complete state before atomically replacing the live store."""
+
         restored = EpisodeStore.from_state(self._codec, state)
         self._store = restored
         return self._store.get_stats()
+
+    def load_snapshot(self, path: str) -> ReplayStats:
+        state = read_replay_checkpoint(path)
+        return self.load_checkpoint_state(state)

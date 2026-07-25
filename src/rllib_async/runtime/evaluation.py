@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import math
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +20,8 @@ from rllib_async.protocols import (
 )
 from rllib_async.rollout import EpisodeRolloutActor, EpisodeRolloutResult
 from rllib_async.rollout.episode_runner import _accept_weight_publication
+
+EVALUATION_GROUP_CHECKPOINT_VERSION = 1
 
 
 class EvaluationGroupError(RuntimeError):
@@ -82,6 +85,7 @@ class AsyncEvaluationGroup:
         episode_count: int,
         max_episode_steps: int,
         num_cpus_per_runner: float = 1.0,
+        checkpoint_state: Mapping[str, Any] | None = None,
     ) -> None:
         if not ray.is_initialized():
             raise RuntimeError("Ray must be initialized before AsyncEvaluationGroup")
@@ -134,6 +138,8 @@ class AsyncEvaluationGroup:
         self._pending_high_watermark = 0
         self._latest_result: EvaluationResult | None = None
         self._stopped = False
+        if checkpoint_state is not None:
+            self._restore_checkpoint_state(checkpoint_state)
 
         try:
             for index in range(episode_count):
@@ -312,6 +318,24 @@ class AsyncEvaluationGroup:
             latest_env_steps=latest.env_steps if latest is not None else 0,
         )
 
+    def get_checkpoint_state(self) -> dict[str, Any]:
+        if self._pending or self._active_weights is not None:
+            raise EvaluationGroupError(
+                "evaluation group must be drained before checkpoint"
+            )
+        return {
+            "state_version": EVALUATION_GROUP_CHECKPOINT_VERSION,
+            "member_id": self._member_id,
+            "episode_count": self._episode_count,
+            "known_module_versions": dict(self._latest_weights.module_versions),
+            "rounds_started": self._rounds_started,
+            "rounds_completed": self._rounds_completed,
+            "episodes_completed": self._episodes_completed,
+            "failures": self._failures,
+            "pending_high_watermark": self._pending_high_watermark,
+            "latest_result": copy.deepcopy(self._latest_result),
+        }
+
     def stop(self) -> None:
         if self._stopped:
             return
@@ -343,6 +367,73 @@ class AsyncEvaluationGroup:
         self._active_returns.append(result.metrics.episode_return)
         self._active_env_steps += result.metrics.env_steps
         self._episodes_completed += 1
+
+    def _restore_checkpoint_state(self, state: Mapping[str, Any]) -> None:
+        if not isinstance(state, Mapping):
+            raise ValueError("evaluation checkpoint state must be a mapping")
+        if state.get("state_version") != EVALUATION_GROUP_CHECKPOINT_VERSION:
+            raise ValueError("unsupported evaluation checkpoint state version")
+        if state.get("member_id") != self._member_id:
+            raise ValueError("evaluation checkpoint member_id does not match")
+        if state.get("episode_count") != self._episode_count:
+            raise ValueError("evaluation checkpoint episode_count does not match")
+
+        known_versions = state.get("known_module_versions")
+        current_versions = self._latest_weights.module_versions
+        if (
+            not isinstance(known_versions, Mapping)
+            or set(known_versions) != set(current_versions)
+            or any(
+                not isinstance(version, int)
+                or isinstance(version, bool)
+                or version < 0
+                or version > current_versions[module_id]
+                for module_id, version in known_versions.items()
+            )
+        ):
+            raise ValueError("evaluation checkpoint weights are invalid")
+
+        self._rounds_started = self._checkpoint_counter(state, "rounds_started")
+        self._rounds_completed = self._checkpoint_counter(
+            state,
+            "rounds_completed",
+        )
+        self._episodes_completed = self._checkpoint_counter(
+            state,
+            "episodes_completed",
+        )
+        self._failures = self._checkpoint_counter(state, "failures")
+        self._pending_high_watermark = self._checkpoint_counter(
+            state,
+            "pending_high_watermark",
+        )
+        if self._rounds_completed > self._rounds_started:
+            raise ValueError("evaluation checkpoint round counters are inconsistent")
+        if self._episodes_completed < (self._rounds_completed * self._episode_count):
+            raise ValueError("evaluation checkpoint episode count is inconsistent")
+
+        latest_result = state.get("latest_result")
+        if latest_result is not None and not isinstance(
+            latest_result,
+            EvaluationResult,
+        ):
+            raise ValueError("evaluation checkpoint latest_result is invalid")
+        if latest_result is not None and (
+            latest_result.round_id >= self._rounds_completed
+            or any(
+                latest_result.module_versions[module_id] > current_versions[module_id]
+                for module_id in current_versions
+            )
+        ):
+            raise ValueError("evaluation checkpoint latest_result is inconsistent")
+        self._latest_result = copy.deepcopy(latest_result)
+
+    @staticmethod
+    def _checkpoint_counter(state: Mapping[str, Any], name: str) -> int:
+        value = state.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"evaluation checkpoint {name} is invalid")
+        return value
 
     def _require_open(self) -> None:
         if self._stopped:

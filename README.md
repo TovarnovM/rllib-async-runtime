@@ -4,14 +4,14 @@ Experimental Ray-native asynchronous off-policy runtime built on RLlib.
 
 > Experimental project built on Ray/RLlib; not an official Ray project.
 
-The project has completed its bootstrap through single-member Async SAC phases.
+The project has completed its bootstrap through single-member recovery.
 It contains the RLlib compatibility gates, deterministic replay reference
 model, a serialized Ray `ReplayActor`, atomic trusted-local replay checkpoints,
 reader-safe background `FastReplay` index publication, a bounded local batch
 pipeline, a checkpoint-complete local SAC adapter, version-aware asynchronous
 rollout, replay-isolated evaluation, and a Tune-compatible end-to-end event
-pump. It does **not** yet restore a complete running member after failure,
-launch a population, or implement hierarchy and graph encoders.
+pump, and coordinated Tune checkpoint/recovery. It does **not** yet launch a
+population or implement hierarchy and graph encoders.
 
 ## Development contract
 
@@ -216,9 +216,53 @@ uv run --locked --extra cu118 --group dev \
   python examples/async_sac_throughput.py --runner-count 8
 ```
 
-Full running-member checkpoint/recovery remains Phase 7. The Phase 4 learner
-adapter and Phase 2 replay actor can each serialize their own state, but Phase 6
-does not yet coordinate them into one recoverable runtime checkpoint.
+## Phase 7 checkpoint and recovery
+
+Phase 7 provides:
+
+- a relocatable, checksummed checkpoint directory containing separate
+  authoritative replay and member files;
+- episode-boundary drain before persistence, with cumulative
+  training-intensity preserved;
+- complete learner, controller, rollout, evaluation, publication, and RNG
+  state;
+- reconstruction of `FastReplay` from authoritative replay rather than
+  serialization of its payload/index/thread state;
+- recreation of every rollout actor at `saved_generation + 1`;
+- safe duplicate episode re-delivery using restored replay deduplication state;
+- standard directory-based Tune `save_checkpoint()` and `load_checkpoint()`
+  hooks;
+- controlled-crash and Tune-continuation integration gates.
+
+The replay snapshot is transferred from its actor through Ray and persisted by
+the controller, so the actor does not need direct access to Tune's local
+checkpoint path. Checkpoints use trusted Python pickle state and must never be
+loaded from untrusted sources.
+
+A successful checkpoint includes all episodes committed before its drain
+completed. Restoring it can lose episodes and learner work produced after that
+checkpoint; the maximum loss is therefore determined by checkpoint cadence.
+There is no loss relative to the contents of the successfully returned
+checkpoint itself.
+
+Direct runtime use:
+
+```python
+checkpoint = runtime.save_checkpoint("/path/to/new-empty-checkpoint-dir")
+restored = SingleMemberAsyncSAC.from_checkpoint(
+    sac_config,
+    runtime_config,
+    checkpoint.directory,
+)
+restored.start()
+```
+
+The destination directory must already exist but must not contain
+`member.snapshot` or `replay.snapshot`; use a new directory for every
+checkpoint publication.
+
+With `AsyncSACTrainable`, Tune calls the same coordinated save/restore protocol
+through its standard checkpoint lifecycle.
 
 ## Architecture
 

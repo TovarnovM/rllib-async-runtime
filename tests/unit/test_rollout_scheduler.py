@@ -184,6 +184,8 @@ def make_group(
     *,
     high: int,
     low: int,
+    initial_weights: WeightsDescriptor | None = None,
+    checkpoint_state: dict[str, object] | None = None,
 ) -> AsyncRolloutGroup:
     install_fake_ray(monkeypatch)
     codec = FlatEpisodeCodec()
@@ -192,12 +194,13 @@ def make_group(
         codec,
         FakeReplayActor(codec),
         member_id="member-0",
-        initial_weights=make_weights(0),
+        initial_weights=initial_weights or make_weights(0),
         runner_count=4,
         max_episode_steps=10,
         pending_commit_high_watermark=high,
         pending_commit_low_watermark=low,
         num_cpus_per_runner=0,
+        checkpoint_state=checkpoint_state,
     )
 
 
@@ -329,3 +332,57 @@ def test_pause_drains_pending_work_without_starting_new_episodes(monkeypatch) ->
         assert resumed.sample_calls_started == 8
     finally:
         group.stop()
+
+
+def test_checkpoint_recreates_every_runner_in_a_new_generation(monkeypatch) -> None:
+    group = make_group(monkeypatch, high=8, low=3)
+    restored = None
+    try:
+        group.start()
+        group.pause()
+        group.drain(timeout_s=1)
+        group.update_weights(make_weights(2))
+        assert group.restart_runner("runner-0") == 1
+        checkpoint = group.get_checkpoint_state()
+        before = group.get_stats()
+
+        restored = make_group(
+            monkeypatch,
+            high=8,
+            low=3,
+            initial_weights=make_weights(2),
+            checkpoint_state=checkpoint,
+        )
+        recovered = restored.get_stats()
+        saved_generations = dict(before.runner_generations)
+        assert dict(recovered.runner_generations) == {
+            runner_id: generation + 1
+            for runner_id, generation in saved_generations.items()
+        }
+        assert recovered.env_steps == before.env_steps
+        assert recovered.episodes_committed == before.episodes_committed
+        assert recovered.runner_restarts == before.runner_restarts + 4
+
+        restored.start()
+        recovered_after_start = restored.get_stats()
+        assert recovered_after_start.env_steps_per_s == 0.0
+        assert recovered_after_start.agent_steps_per_s == 0.0
+        assert recovered_after_start.backpressure_fraction == 0.0
+        completions = []
+        for _ in range(4):
+            completions.extend(restored.poll(max_events=8))
+            if completions:
+                break
+        assert completions
+        assert all(
+            completion.episode.runner_generation
+            == dict(recovered.runner_generations)[completion.episode.runner_id]
+            for completion in completions
+        )
+        assert all(
+            completion.episode.local_episode_seq == 0 for completion in completions
+        )
+    finally:
+        group.stop()
+        if restored is not None:
+            restored.stop()
