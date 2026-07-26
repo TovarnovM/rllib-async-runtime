@@ -14,6 +14,7 @@ from ray.air import RunConfig
 from ray.rllib.algorithms.sac import SACConfig
 from ray.tune import ResultGrid
 
+from rllib_async.learner import SACLearnerAdapter
 from rllib_async.protocols import FlatEpisodeCodec, ReplayCursor, ReplayStats
 from rllib_async.replay import ReplayActor
 from rllib_async.replay.reference import EpisodeStoreState
@@ -28,7 +29,7 @@ from rllib_async.runtime.config import (
     AsyncSACRuntimeConfig,
     SharedReplayDescriptor,
 )
-from rllib_async.runtime.controller import AsyncSACTrainable
+from rllib_async.runtime.controller import AsyncSACTrainable, SingleMemberAsyncSAC
 
 
 class PopulationError(RuntimeError):
@@ -105,6 +106,14 @@ class PopulationLauncher:
                     raise ValueError(
                         f"population members must share replay setting {name!r}"
                     )
+        space_fingerprints = {
+            SACLearnerAdapter._fingerprint_spaces(
+                SingleMemberAsyncSAC._resolve_spaces(member.sac_config)
+            )
+            for member in self._members
+        }
+        if len(space_fingerprints) != 1:
+            raise ValueError("population members must share observation/action spaces")
 
         actor_name = (
             f"rllib-async-replay-{uuid.uuid4().hex}"

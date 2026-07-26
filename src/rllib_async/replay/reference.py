@@ -110,6 +110,8 @@ class EpisodeStore:
         self._episode_records: dict[str, tuple[bytes, int, int]] = {}
         self._total_transitions = 0
         self._total_estimated_bytes = 0
+        self._producer_episode_counts: Counter[str] = Counter()
+        self._producer_transition_counts: Counter[str] = Counter()
         self._journal_base_manifest: OrderedDict[str, tuple[int, int]] = OrderedDict()
         self._journal: deque[ReplayTransaction] = deque()
         self._commit_attempts = 0
@@ -163,10 +165,14 @@ class EpisodeStore:
 
         episodes = self._episodes.copy()
         transition_counts = self._transition_counts.copy()
+        producer_episode_counts = self._producer_episode_counts.copy()
+        producer_transition_counts = self._producer_transition_counts.copy()
         total_transitions = self._total_transitions + transition_count
         total_estimated_bytes = self._total_estimated_bytes + episode.estimated_bytes
         episodes[episode.episode_id] = episode
         transition_counts[episode.episode_id] = transition_count
+        producer_episode_counts[episode.producer_member_id] += 1
+        producer_transition_counts[episode.producer_member_id] += transition_count
 
         evicted_episode_ids: list[str] = []
         while (
@@ -175,8 +181,16 @@ class EpisodeStore:
         ):
             evicted_id, evicted = episodes.popitem(last=False)
             evicted_episode_ids.append(evicted_id)
-            total_transitions -= transition_counts.pop(evicted_id)
+            evicted_transition_count = transition_counts.pop(evicted_id)
+            total_transitions -= evicted_transition_count
             total_estimated_bytes -= evicted.estimated_bytes
+            producer_id = evicted.producer_member_id
+            producer_episode_counts[producer_id] -= 1
+            producer_transition_counts[producer_id] -= evicted_transition_count
+            if not producer_episode_counts[producer_id]:
+                del producer_episode_counts[producer_id]
+            if not producer_transition_counts[producer_id]:
+                del producer_transition_counts[producer_id]
 
         mutation_seq = self._mutation_seq + 1
         transaction = ReplayTransaction(
@@ -204,6 +218,8 @@ class EpisodeStore:
         self._transition_counts = transition_counts
         self._total_transitions = total_transitions
         self._total_estimated_bytes = total_estimated_bytes
+        self._producer_episode_counts = producer_episode_counts
+        self._producer_transition_counts = producer_transition_counts
         self._mutation_seq = mutation_seq
         self._episode_records[episode.episode_id] = (
             fingerprint,
@@ -291,21 +307,16 @@ class EpisodeStore:
         oldest_available = (
             self._journal[0].mutation_seq if self._journal else self._mutation_seq + 1
         )
-        producer_episode_counts: Counter[str] = Counter()
-        producer_transition_counts: Counter[str] = Counter()
-        for episode_id, episode in self._episodes.items():
-            producer_episode_counts[episode.producer_member_id] += 1
-            producer_transition_counts[episode.producer_member_id] += (
-                self._transition_counts[episode_id]
-            )
         return ReplayStats(
             cursor=self.cursor,
             episode_count=len(self._episodes),
             total_transitions=self._total_transitions,
             total_estimated_bytes=self._total_estimated_bytes,
-            producer_episode_counts=tuple(sorted(producer_episode_counts.items())),
+            producer_episode_counts=tuple(
+                sorted(self._producer_episode_counts.items())
+            ),
             producer_transition_counts=tuple(
-                sorted(producer_transition_counts.items())
+                sorted(self._producer_transition_counts.items())
             ),
             oldest_available_mutation_seq=oldest_available,
             journal_entries=len(self._journal),
@@ -400,6 +411,8 @@ class EpisodeStore:
 
         episodes: OrderedDict[str, EpisodeEnvelope] = OrderedDict()
         transition_counts: dict[str, int] = {}
+        producer_episode_counts: Counter[str] = Counter()
+        producer_transition_counts: Counter[str] = Counter()
         total_transitions = 0
         total_estimated_bytes = 0
         for episode in state.episodes:
@@ -417,6 +430,8 @@ class EpisodeStore:
                 )
             episodes[episode.episode_id] = episode
             transition_counts[episode.episode_id] = transition_count
+            producer_episode_counts[episode.producer_member_id] += 1
+            producer_transition_counts[episode.producer_member_id] += transition_count
             total_transitions += transition_count
             total_estimated_bytes += episode.estimated_bytes
 
@@ -663,6 +678,8 @@ class EpisodeStore:
 
         store._episodes = episodes
         store._transition_counts = transition_counts
+        store._producer_episode_counts = producer_episode_counts
+        store._producer_transition_counts = producer_transition_counts
         store._episode_records = {
             episode_id: (
                 fingerprint,
