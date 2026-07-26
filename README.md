@@ -9,12 +9,14 @@ Phase 8 adds two concurrent fixed-config Tune members sharing one authoritative
 replay; its dedicated two-GPU acceptance test remains recorded in
 [`debt.md`](debt.md). Phase 9 adds a sparse hierarchy example with one
 discrete manager, two continuous workers, module-specific replay views, and a
-heterogeneous stock RLlib SAC learner. The project also contains deterministic
-replay oracles, a serialized Ray `ReplayActor`, atomic trusted-local replay
-checkpoints, reader-safe background `FastReplay` index publication, a bounded
-local batch pipeline, version-aware asynchronous rollout, replay-isolated
-evaluation, and a Tune-compatible end-to-end event pump. It does **not** yet
-implement PBT exploit/explore or graph encoders.
+heterogeneous stock RLlib SAC learner. Phase 10 adds homogeneous logical agents
+using one shared ego-GNN SAC module, variable-size graph replay, and packed
+graph batches. The project also contains deterministic replay oracles, a
+serialized Ray `ReplayActor`, atomic trusted-local replay checkpoints,
+reader-safe background `FastReplay` index publication, a bounded local batch
+pipeline, version-aware asynchronous rollout, replay-isolated evaluation, and
+a Tune-compatible end-to-end event pump. It does **not** yet implement PBT
+exploit/explore or centralized full-graph inference.
 
 ## Development contract
 
@@ -339,6 +341,38 @@ The three rollout module versions advance together because the pinned RLlib
 multi-agent runner installs one sequence number for a complete module state.
 The example proves the sparse hierarchy/replay/learner boundary; it does not
 claim a generic production hierarchy framework or a DQN manager.
+
+## Phase 10 shared ego-GNN example
+
+Phase 10 provides:
+
+- four homogeneous logical agents mapped to one `shared_graph` SAC module;
+- variable-size ego-graphs with one to four nodes and no policy per agent;
+- bounded padded arrays only at the static Gymnasium transport boundary, with
+  padding removed before replay;
+- `GraphEpisodeCodec` plus the existing module-specific authoritative and
+  `FastReplay` lifecycle;
+- `GraphBatchCollator` output containing concatenated node features, shifted
+  edge indices, `graph_ptr`, controlled-node indices, and optional graph
+  leaves;
+- a pure-PyTorch mean-aggregation encoder wired through RLlib's custom catalog
+  extension point;
+- stock RLlib SAC losses, optimizers, target networks, updates, and checkpoint
+  state;
+- coverage for empty edges, one-node and mixed-size graphs, GNN gradients,
+  delta synchronization, and learner plus replay checkpoint restore.
+
+Run the CPU example inside the devcontainer:
+
+```bash
+uv run --locked --extra cu118 --group dev \
+  python examples/shared_gnn_multiagent.py --episodes 20
+```
+
+The shared state is across logical agents. Stock SAC still owns separate actor,
+critic, twin-critic, and target encoders inside that one module. The example
+does not claim one centralized graph forward for the whole environment,
+continuous graph SAC, or masked-action semantics.
 
 ## Architecture
 

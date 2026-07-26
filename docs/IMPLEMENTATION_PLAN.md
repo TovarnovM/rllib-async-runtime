@@ -1,7 +1,8 @@
 # `rllib-async-runtime`: подробный план реализации
 
 **Статус:** Phase 0–7 реализованы; код Phase 8 слит с открытым two-GPU debt;
-Phase 9 hierarchy реализована; следующий этап — shared-GNN в Phase 10
+Phase 9 hierarchy и Phase 10 shared-GNN реализованы; следующий этап —
+performance gate/documentation в Phase 11
 
 **Дата фиксации:** 24 июля 2026
 
@@ -1060,6 +1061,11 @@ workers удобно делать continuous SAC policies. Не нужно ск�
 
 ## Phase 10. Shared-GNN multi-agent example
 
+**Статус реализации:** завершено 26 июля 2026. Зафиксированная ниже
+ego-graph трактовка реализована через один shared RLModule, graph-aware codec,
+packed collator и pure-PyTorch encoder; centralized full-graph runner не
+добавлялся.
+
 ### Зафиксированная трактовка
 
 В `v0.1` «общий GNN encoder» означает:
@@ -1360,7 +1366,7 @@ Success criterion первого PR:
 - [x] Phase 7 checkpoint/recovery.
 - [ ] Phase 8 two-member population.
 - [x] Phase 9 hierarchy example.
-- [ ] Phase 10 shared-GNN example.
+- [x] Phase 10 shared-GNN example.
 - [ ] Phase 11 performance gate/documentation.
 
 ---

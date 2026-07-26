@@ -177,6 +177,24 @@ Phase 9 adds the sparse hierarchy boundary:
 - the example does not add DQN, generic hierarchy orchestration, or graph
   encoders.
 
+Phase 10 adds the shared ego-graph boundary:
+
+- all homogeneous logical agents map to one `shared_graph` RLModule and one
+  synchronized module version;
+- the Gymnasium boundary uses bounded padded graph arrays plus live
+  node/edge counts, while `GraphEpisodeCodec` removes padding before replay;
+- `GraphEpisodePayload` reuses the existing multi-module authoritative,
+  retention, snapshot/delta, checkpoint, and module-index lifecycle;
+- `GraphBatchCollator` concatenates variable node sets, shifts edge indices,
+  builds `graph_ptr`, and aligns controlled nodes and optional graph leaves;
+- `SharedGraphSACCatalog` replaces only RLlib's observation encoders;
+  stock SAC still owns actor/critic networks, losses, optimizers, target
+  updates, and state;
+- the pure-PyTorch encoder performs batched ego-graph message passing with
+  `index_add_`; PyTorch Geometric is not required;
+- the example does not add a centralized environment-wide graph pass,
+  continuous graph SAC, or masked-action semantics.
+
 See [ADR 0001](adr/0001-runtime-boundary.md) for the orchestration decision and
 [ADR 0002](adr/0002-episode-replay-quantum.md) and
 [ADR 0003](adr/0003-authoritative-and-reference-replay.md) for replay semantics.
@@ -200,4 +218,7 @@ and single-copy population checkpoints.
 [ADR 0012](adr/0012-sparse-hierarchy-and-module-replay.md) records sparse
 manager/worker turns, heterogeneous SAC compatibility, module-specific replay
 indexes, synchronized publications, and checkpoint derivation.
+[ADR 0013](adr/0013-shared-ego-graph-policy.md) records padded rollout
+transport, variable-size replay collation, the shared module boundary, and the
+pure-PyTorch graph encoder.
 See [the implementation plan](IMPLEMENTATION_PLAN.md) for phase gates.
