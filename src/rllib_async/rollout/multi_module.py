@@ -187,13 +187,15 @@ class MultiModuleEpisodeRunner:
         total_return = 0.0
         for agent_id, agent_episode in source.agent_episodes.items():
             if not isinstance(agent_id, str) or not agent_id:
-                raise EpisodeRunnerError("Phase 9 requires non-empty string agent IDs")
+                raise EpisodeRunnerError(
+                    "multi-module rollouts require non-empty string agent IDs"
+                )
             module_id = source.module_for(agent_id)
             if module_id not in self._module_id_set:
                 raise EpisodeRunnerError(
                     f"episode used unexpected module_id {module_id!r}"
                 )
-            observations = np.asarray(agent_episode.get_observations())
+            observations = agent_episode.get_observations()
             actions = np.asarray(agent_episode.get_actions())
             rewards = np.asarray(agent_episode.get_rewards())
             count = len(agent_episode)
@@ -201,7 +203,7 @@ class MultiModuleEpisodeRunner:
                 raise EpisodeRunnerError(
                     f"agent {agent_id!r} did not produce a transition"
                 )
-            if observations.shape[0] != count + 1:
+            if _batched_tree_length(observations) != count + 1:
                 raise EpisodeRunnerError(
                     f"agent {agent_id!r} observations are not transition-aligned"
                 )
@@ -263,7 +265,6 @@ class MultiModuleEpisodeRunner:
                 observations = data["observations"]
                 actions = data["actions"]
                 rewards = data["rewards"]
-                assert isinstance(observations, np.ndarray)
                 assert isinstance(actions, np.ndarray)
                 assert isinstance(rewards, np.ndarray)
                 is_last = agent_t == count - 1
@@ -276,13 +277,13 @@ class MultiModuleEpisodeRunner:
                         agent_id=agent_id,
                         module_id=module_id,
                         data={
-                            Columns.OBS: np.array(
-                                observations[agent_t],
-                                copy=True,
+                            Columns.OBS: _copy_batched_tree_item(
+                                observations,
+                                agent_t,
                             ),
-                            Columns.NEXT_OBS: np.array(
-                                observations[agent_t + 1],
-                                copy=True,
+                            Columns.NEXT_OBS: _copy_batched_tree_item(
+                                observations,
+                                agent_t + 1,
                             ),
                             Columns.ACTIONS: np.array(
                                 actions[agent_t],
@@ -354,3 +355,30 @@ class MultiModuleEpisodeRunner:
     def _require_open(self) -> None:
         if self._closed:
             raise EpisodeRunnerError("episode runner is closed")
+
+
+def _batched_tree_length(value: object) -> int:
+    if isinstance(value, Mapping):
+        if not value:
+            raise EpisodeRunnerError("observation mappings must not be empty")
+        lengths = {_batched_tree_length(child) for child in value.values()}
+        if len(lengths) != 1:
+            raise EpisodeRunnerError(
+                "nested observation leaves must share one batch dimension"
+            )
+        return lengths.pop()
+    array = np.asarray(value)
+    if array.ndim < 1:
+        raise EpisodeRunnerError("observation leaves must contain a batch dimension")
+    return len(array)
+
+
+def _copy_batched_tree_item(value: object, index: int) -> object:
+    if isinstance(value, Mapping):
+        return {
+            key: _copy_batched_tree_item(child, index) for key, child in value.items()
+        }
+    array = np.asarray(value)
+    if index < 0 or index >= len(array):
+        raise EpisodeRunnerError("observation index is outside its batch")
+    return np.array(array[index], copy=True)

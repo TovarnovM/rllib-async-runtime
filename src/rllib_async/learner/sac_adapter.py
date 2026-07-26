@@ -30,6 +30,7 @@ from ray.rllib.utils.metrics import (
     WEIGHTS_SEQ_NO,
 )
 
+from rllib_async.gnn.graph_batch import validate_packed_graph_batch
 from rllib_async.protocols.weights import WeightsDescriptor
 
 SAC_ADAPTER_STATE_VERSION = 1
@@ -185,7 +186,7 @@ class CheckpointableSACTorchLearner(SACTorchLearner):
         return validated
 
 
-def _build_sac_sample_batch(batch: Mapping[str, np.ndarray]) -> SampleBatch:
+def _build_sac_sample_batch(batch: Mapping[str, Any]) -> SampleBatch:
     if not isinstance(batch, Mapping):
         raise SACBatchError("SAC batch must be a mapping")
     missing = set(_REQUIRED_BATCH_COLUMNS) - set(batch)
@@ -195,9 +196,48 @@ def _build_sac_sample_batch(batch: Mapping[str, np.ndarray]) -> SampleBatch:
     if extra:
         raise SACBatchError(f"SAC batch has unsupported columns {sorted(extra)!r}")
 
-    arrays: dict[str, np.ndarray] = {}
-    batch_size: int | None = None
-    for name in _REQUIRED_BATCH_COLUMNS:
+    columns: dict[str, Any] = {}
+    observations = batch[Columns.OBS]
+    next_observations = batch[Columns.NEXT_OBS]
+    graph_observations = isinstance(observations, Mapping)
+    if graph_observations != isinstance(next_observations, Mapping):
+        raise SACBatchError("'obs' and 'new_obs' must use the same representation")
+    if graph_observations:
+        try:
+            packed_observations = validate_packed_graph_batch(observations)
+            packed_next_observations = validate_packed_graph_batch(next_observations)
+        except ValueError as error:
+            raise SACBatchError(str(error)) from error
+        batch_size = len(packed_observations["graph_ptr"]) - 1
+        _validate_graph_observation_pair(
+            packed_observations,
+            packed_next_observations,
+        )
+        columns[Columns.OBS] = packed_observations
+        columns[Columns.NEXT_OBS] = packed_next_observations
+    else:
+        observations_array = _required_batch_array(
+            observations,
+            name=Columns.OBS,
+        )
+        next_observations_array = _required_batch_array(
+            next_observations,
+            name=Columns.NEXT_OBS,
+        )
+        if observations_array.shape != next_observations_array.shape:
+            raise SACBatchError("'obs' and 'new_obs' must have identical shapes")
+        batch_size = len(observations_array)
+        columns[Columns.OBS] = observations_array
+        columns[Columns.NEXT_OBS] = next_observations_array
+
+    if batch_size < 1:
+        raise SACBatchError("SAC batch must contain at least one transition")
+    for name in (
+        Columns.ACTIONS,
+        Columns.REWARDS,
+        Columns.TERMINATEDS,
+        Columns.TRUNCATEDS,
+    ):
         value = np.asarray(batch[name])
         if value.ndim == 0:
             raise SACBatchError(f"column {name!r} must have a batch dimension")
@@ -205,27 +245,20 @@ def _build_sac_sample_batch(batch: Mapping[str, np.ndarray]) -> SampleBatch:
             raise SACBatchError(f"column {name!r} must be real numeric or boolean")
         if value.dtype.kind in "f" and not np.isfinite(value).all():
             raise SACBatchError(f"column {name!r} must contain finite values")
-        if batch_size is None:
-            batch_size = len(value)
-            if batch_size < 1:
-                raise SACBatchError("SAC batch must contain at least one transition")
-        elif len(value) != batch_size:
+        if len(value) != batch_size:
             raise SACBatchError("all SAC columns must have the same leading dimension")
-        arrays[name] = np.ascontiguousarray(value)
+        columns[name] = np.ascontiguousarray(value)
 
-    assert batch_size is not None
     for name in (Columns.REWARDS, Columns.TERMINATEDS, Columns.TRUNCATEDS):
-        if arrays[name].shape != (batch_size,):
+        if columns[name].shape != (batch_size,):
             raise SACBatchError(f"column {name!r} must be one-dimensional")
 
-    if arrays[Columns.TERMINATEDS].dtype.kind != "b":
+    if columns[Columns.TERMINATEDS].dtype.kind != "b":
         raise SACBatchError(f"column {Columns.TERMINATEDS!r} must be boolean")
-    if arrays[Columns.TRUNCATEDS].dtype.kind != "b":
+    if columns[Columns.TRUNCATEDS].dtype.kind != "b":
         raise SACBatchError(f"column {Columns.TRUNCATEDS!r} must be boolean")
-    if arrays[Columns.OBS].shape != arrays[Columns.NEXT_OBS].shape:
-        raise SACBatchError("'obs' and 'new_obs' must have identical shapes")
-    arrays[Columns.REWARDS] = np.ascontiguousarray(
-        arrays[Columns.REWARDS],
+    columns[Columns.REWARDS] = np.ascontiguousarray(
+        columns[Columns.REWARDS],
         dtype=np.float32,
     )
 
@@ -236,7 +269,7 @@ def _build_sac_sample_batch(batch: Mapping[str, np.ndarray]) -> SampleBatch:
         or np.any(n_step < 1)
     ):
         raise SACBatchError("column 'n_step' must contain positive integers")
-    arrays["n_step"] = np.ascontiguousarray(n_step, dtype=np.int64)
+    columns["n_step"] = np.ascontiguousarray(n_step, dtype=np.int64)
 
     weights = np.asarray(batch.get("weights", np.ones(batch_size, dtype=np.float32)))
     if (
@@ -246,13 +279,48 @@ def _build_sac_sample_batch(batch: Mapping[str, np.ndarray]) -> SampleBatch:
         or np.any(weights < 0)
     ):
         raise SACBatchError("column 'weights' must contain finite non-negative scalars")
-    arrays["weights"] = np.ascontiguousarray(weights, dtype=np.float32)
+    columns["weights"] = np.ascontiguousarray(weights, dtype=np.float32)
 
-    return SampleBatch(arrays)
+    return SampleBatch(columns)
 
 
-def build_rllib_sac_batch(batch: Mapping[str, np.ndarray]) -> MultiAgentBatch:
-    """Validate one flat NumPy batch and build RLlib's exact SAC input."""
+def _required_batch_array(value: object, *, name: str) -> np.ndarray:
+    array = np.asarray(value)
+    if array.ndim == 0:
+        raise SACBatchError(f"column {name!r} must have a batch dimension")
+    if array.dtype.kind not in "biuf":
+        raise SACBatchError(f"column {name!r} must be real numeric or boolean")
+    if array.dtype.kind in "f" and not np.isfinite(array).all():
+        raise SACBatchError(f"column {name!r} must contain finite values")
+    return np.ascontiguousarray(array)
+
+
+def _validate_graph_observation_pair(
+    observations: Mapping[str, np.ndarray],
+    next_observations: Mapping[str, np.ndarray],
+) -> None:
+    if len(observations["graph_ptr"]) != len(next_observations["graph_ptr"]):
+        raise SACBatchError("'obs' and 'new_obs' graph counts must match")
+    if (
+        observations["node_features"].shape[1]
+        != next_observations["node_features"].shape[1]
+    ):
+        raise SACBatchError("'obs' and 'new_obs' node feature dimensions must match")
+    for optional in ("edge_features", "action_mask"):
+        if (optional in observations) != (optional in next_observations):
+            raise SACBatchError(
+                f"'obs' and 'new_obs' must agree on optional {optional!r}"
+            )
+        if optional in observations and (
+            observations[optional].shape[1:] != next_observations[optional].shape[1:]
+        ):
+            raise SACBatchError(
+                f"'obs' and 'new_obs' {optional!r} feature shapes must match"
+            )
+
+
+def build_rllib_sac_batch(batch: Mapping[str, Any]) -> MultiAgentBatch:
+    """Validate one NumPy transition batch and build RLlib's exact SAC input."""
 
     sample_batch = _build_sac_sample_batch(batch)
     return MultiAgentBatch(
@@ -262,9 +330,9 @@ def build_rllib_sac_batch(batch: Mapping[str, np.ndarray]) -> MultiAgentBatch:
 
 
 def build_rllib_multi_module_sac_batch(
-    batches: Mapping[str, Mapping[str, np.ndarray]],
+    batches: Mapping[str, Mapping[str, Any]],
 ) -> MultiAgentBatch:
-    """Validate independent flat batches for one heterogeneous MultiRLModule."""
+    """Validate independent batches for one heterogeneous MultiRLModule."""
 
     if not isinstance(batches, Mapping) or not batches:
         raise SACBatchError("multi-module SAC batches must be a non-empty mapping")
@@ -409,7 +477,7 @@ class SACLearnerAdapter:
 
     def update_modules(
         self,
-        batches: Mapping[str, Mapping[str, np.ndarray]],
+        batches: Mapping[str, Mapping[str, Any]],
         *,
         sampled_env_steps: int,
         sampled_agent_steps: int,
