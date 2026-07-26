@@ -66,6 +66,8 @@ class ReplayStats:
     episode_count: int
     total_transitions: int
     total_estimated_bytes: int
+    producer_episode_counts: tuple[tuple[str, int], ...]
+    producer_transition_counts: tuple[tuple[str, int], ...]
     oldest_available_mutation_seq: int
     journal_entries: int
     deduplication_entries: int

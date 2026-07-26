@@ -7,7 +7,7 @@ import pickle
 import random
 import uuid
 from bisect import bisect_right
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -291,11 +291,22 @@ class EpisodeStore:
         oldest_available = (
             self._journal[0].mutation_seq if self._journal else self._mutation_seq + 1
         )
+        producer_episode_counts: Counter[str] = Counter()
+        producer_transition_counts: Counter[str] = Counter()
+        for episode_id, episode in self._episodes.items():
+            producer_episode_counts[episode.producer_member_id] += 1
+            producer_transition_counts[episode.producer_member_id] += (
+                self._transition_counts[episode_id]
+            )
         return ReplayStats(
             cursor=self.cursor,
             episode_count=len(self._episodes),
             total_transitions=self._total_transitions,
             total_estimated_bytes=self._total_estimated_bytes,
+            producer_episode_counts=tuple(sorted(producer_episode_counts.items())),
+            producer_transition_counts=tuple(
+                sorted(producer_transition_counts.items())
+            ),
             oldest_available_mutation_seq=oldest_available,
             journal_entries=len(self._journal),
             deduplication_entries=len(self._episode_records),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -242,6 +243,93 @@ def test_checkpoint_restores_learner_but_rebuilds_fast_replay(monkeypatch) -> No
         )
         restored.start()
         assert restored.get_stats().updates_per_s == 0.0
+    finally:
+        source.stop(timeout_s=2)
+        if restored is not None:
+            restored.stop(timeout_s=2)
+        runner.stop()
+
+
+def test_population_restore_accepts_newer_shared_replay(monkeypatch) -> None:
+    monkeypatch.setattr(learner_host_module.ray, "get", lambda value: value)
+    config = make_sac_config()
+    config.training(
+        train_batch_size_per_learner=8,
+        num_steps_sampled_before_learning_starts=0,
+    )
+    runner = SingleAgentEnvRunner(config=config, worker_index=0)
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(
+        codec,
+        capacity_transitions=1_000,
+        capacity_bytes=10_000_000,
+        store_generation="population-restore",
+    )
+    store.commit_episode(make_episode(codec, size=8))
+    source = LearnerHost(
+        config,
+        runner.get_spaces(),
+        ImmediateReplayActor(store),
+        codec,
+        member_id="member-0",
+        publication_interval_updates=1,
+        batch_size=8,
+        batch_queue_capacity=1,
+        batch_seed=17,
+        replay_sync_max_bytes=1_000_000,
+    )
+    restored = None
+    try:
+        source.start()
+        source.drain(
+            sampled_env_steps=0,
+            sampled_agent_steps=0,
+            max_updates=0,
+            timeout_s=2,
+        )
+        checkpoint = source.get_checkpoint_state()
+        second = replace(
+            make_episode(codec, size=8),
+            episode_id="member-1/runner-0/0/0",
+            producer_member_id="member-1",
+        )
+        store.commit_episode(second)
+
+        with pytest.raises(ValueError, match="does not match authoritative"):
+            LearnerHost(
+                config,
+                runner.get_spaces(),
+                ImmediateReplayActor(store),
+                codec,
+                member_id="member-0",
+                publication_interval_updates=1,
+                batch_size=8,
+                batch_queue_capacity=1,
+                batch_seed=17,
+                replay_sync_max_bytes=1_000_000,
+                checkpoint_state=checkpoint,
+            )
+
+        restored = LearnerHost(
+            config,
+            runner.get_spaces(),
+            ImmediateReplayActor(store),
+            codec,
+            member_id="member-0",
+            publication_interval_updates=1,
+            batch_size=8,
+            batch_queue_capacity=1,
+            batch_seed=17,
+            replay_sync_max_bytes=1_000_000,
+            checkpoint_state=checkpoint,
+            allow_replay_ahead_on_restore=True,
+        )
+        stats = restored.get_stats()
+        assert stats.fast_replay.cursor == store.cursor
+        assert dict(stats.fast_replay.active_producer_episode_counts) == {
+            "member-0": 1,
+            "member-1": 1,
+        }
     finally:
         source.stop(timeout_s=2)
         if restored is not None:

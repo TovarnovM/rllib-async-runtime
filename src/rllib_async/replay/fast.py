@@ -6,7 +6,7 @@ import random
 import threading
 import time
 from bisect import bisect_right
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -41,6 +41,8 @@ class FastReplayStats:
     episode_count: int
     total_transitions: int
     total_estimated_bytes: int
+    active_producer_episode_counts: tuple[tuple[str, int], ...]
+    active_producer_transition_counts: tuple[tuple[str, int], ...]
     delta_lag_mutations: int
     delta_lag_agent_steps: int
     rebuild_in_progress: bool
@@ -293,6 +295,21 @@ class FastReplay:
             target = self._target
             active = self._active_view
             lag_mutations = self._delta_lag_mutations_locked(target, active)
+            producer_episode_counts: Counter[str] = Counter()
+            producer_transition_counts: Counter[str] = Counter()
+            if active is not None:
+                previous_cumulative_length = 0
+                for episode, cumulative_length in zip(
+                    active.episodes,
+                    active.sampling_index.cumulative_lengths,
+                    strict=True,
+                ):
+                    transition_count = cumulative_length - previous_cumulative_length
+                    previous_cumulative_length = cumulative_length
+                    producer_episode_counts[episode.producer_member_id] += 1
+                    producer_transition_counts[episode.producer_member_id] += (
+                        transition_count
+                    )
             return FastReplayStats(
                 cursor=target.cursor if target is not None else None,
                 active_cursor=active.cursor if active is not None else None,
@@ -302,6 +319,12 @@ class FastReplay:
                 ),
                 total_estimated_bytes=(
                     target.total_estimated_bytes if target is not None else 0
+                ),
+                active_producer_episode_counts=tuple(
+                    sorted(producer_episode_counts.items())
+                ),
+                active_producer_transition_counts=tuple(
+                    sorted(producer_transition_counts.items())
                 ),
                 delta_lag_mutations=lag_mutations,
                 delta_lag_agent_steps=self._delta_lag_agent_steps,

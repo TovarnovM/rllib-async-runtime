@@ -139,6 +139,24 @@ Recovery preserves everything represented by the last successful checkpoint.
 Episodes and learner work performed after it may be lost, so the loss bound is
 the checkpoint interval. Cluster-wide exactly-once execution is not claimed.
 
+Phase 8 adds the population ownership boundary:
+
+- one launcher creates a uniquely named detached authoritative replay actor;
+- exactly two fixed-config Tune trials resolve that actor by name and namespace
+  without reserving or owning duplicate replay resources;
+- each member retains an independent learner actor, optimizer, weight
+  namespace, batch pipeline, RNG state, and `FastReplay`;
+- authoritative metrics expose retained composition and learner-local metrics
+  expose active sampling-view composition by `producer_member_id`;
+- member stop and failure paths never kill externally owned replay;
+- Tune member checkpoints contain only member state, while one population
+  bundle publishes replay once and ties both member cursors to it;
+- population restore permits a shared cursor newer than a member cut in the
+  same generation, rebuilds both derived views, and rejects an older or foreign
+  replay;
+- no PBT scheduler, exploit/explore, priorities, or lineage-aware mixing is
+  present.
+
 See [ADR 0001](adr/0001-runtime-boundary.md) for the orchestration decision and
 [ADR 0002](adr/0002-episode-replay-quantum.md) and
 [ADR 0003](adr/0003-authoritative-and-reference-replay.md) for replay semantics.
@@ -156,4 +174,7 @@ the event pump, frozen evaluation, reporting, and graceful lifecycle.
 [ADR 0010](adr/0010-coordinated-member-recovery.md) records coordinated
 checkpoint ordering, replay reconstruction, runner recreation, Tune hooks, and
 the explicit loss boundary.
+[ADR 0011](adr/0011-two-member-shared-replay-population.md) records external
+replay ownership, fixed two-trial Tune topology, producer composition metrics,
+and single-copy population checkpoints.
 See [the implementation plan](IMPLEMENTATION_PLAN.md) for phase gates.
