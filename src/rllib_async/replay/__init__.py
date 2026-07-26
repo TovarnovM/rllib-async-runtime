@@ -10,6 +10,8 @@ from rllib_async.replay.batching import (
     BatchQueueEmptyError,
     FlatBatch,
     FlatBatchCollator,
+    MultiModuleBatch,
+    MultiModuleBatchCollator,
 )
 from rllib_async.replay.checkpoint import (
     InvalidReplayCheckpointError,
@@ -54,6 +56,8 @@ __all__ = [
     "IndexRebuildError",
     "InvalidEpisodeStoreStateError",
     "InvalidReplayCheckpointError",
+    "MultiModuleBatch",
+    "MultiModuleBatchCollator",
     "ReferenceFastReplay",
     "ReplayActor",
     "ReplayCheckpointError",

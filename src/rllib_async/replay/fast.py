@@ -11,7 +11,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from rllib_async.protocols.episodes import EpisodeCodec, EpisodeEnvelope
+from rllib_async.protocols.episodes import (
+    EpisodeCodec,
+    EpisodeEnvelope,
+    ModuleEpisodeCodec,
+    MultiModuleTransition,
+)
 from rllib_async.protocols.replay import (
     ReplayCursor,
     ReplayDelta,
@@ -43,6 +48,7 @@ class FastReplayStats:
     total_estimated_bytes: int
     active_producer_episode_counts: tuple[tuple[str, int], ...]
     active_producer_transition_counts: tuple[tuple[str, int], ...]
+    active_module_transition_counts: tuple[tuple[str, int], ...]
     delta_lag_mutations: int
     delta_lag_agent_steps: int
     rebuild_in_progress: bool
@@ -77,10 +83,18 @@ class _SamplingIndex:
 
 
 @dataclass(frozen=True, slots=True)
+class _ModuleSamplingIndex:
+    episode_indices: tuple[int, ...]
+    cumulative_lengths: tuple[int, ...]
+    total_transitions: int
+
+
+@dataclass(frozen=True, slots=True)
 class _MaterializedView:
     cursor: ReplayCursor
     episodes: tuple[EpisodeEnvelope, ...]
     sampling_index: _SamplingIndex
+    module_sampling_indices: Mapping[str, _ModuleSamplingIndex]
     total_estimated_bytes: int
 
 
@@ -151,6 +165,30 @@ class FastReplay:
     def total_estimated_bytes(self) -> int:
         with self._condition:
             return self._target.total_estimated_bytes if self._target is not None else 0
+
+    @property
+    def module_ids(self) -> tuple[str, ...]:
+        self._module_codec()
+        with self._condition:
+            if self._active_view is None:
+                return ()
+            return tuple(self._active_view.module_sampling_indices)
+
+    @property
+    def module_transition_counts(self) -> tuple[tuple[str, int], ...]:
+        self._module_codec()
+        with self._condition:
+            if self._active_view is None:
+                return ()
+            return tuple(
+                (
+                    module_id,
+                    index.total_transitions,
+                )
+                for module_id, index in (
+                    self._active_view.module_sampling_indices.items()
+                )
+            )
 
     def load_snapshot(self, snapshot: ReplaySnapshot) -> None:
         """Validate and synchronously publish a complete bootstrap/resync."""
@@ -326,6 +364,17 @@ class FastReplay:
                 active_producer_transition_counts=tuple(
                     sorted(producer_transition_counts.items())
                 ),
+                active_module_transition_counts=(
+                    ()
+                    if active is None
+                    else tuple(
+                        (
+                            module_id,
+                            index.total_transitions,
+                        )
+                        for module_id, index in (active.module_sampling_indices.items())
+                    )
+                ),
                 delta_lag_mutations=lag_mutations,
                 delta_lag_agent_steps=self._delta_lag_agent_steps,
                 rebuild_in_progress=self._rebuild_running,
@@ -386,6 +435,39 @@ class FastReplay:
                     return False
                 self._condition.wait(remaining)
 
+    def wait_for_module_transitions(
+        self,
+        module_id: str,
+        minimum: int = 1,
+        *,
+        timeout: float | None = None,
+    ) -> bool:
+        """Wait until one module-specific active view contains enough transitions."""
+
+        self._module_codec()
+        if not isinstance(module_id, str) or not module_id:
+            raise ValueError("module_id must be a non-empty string")
+        if not isinstance(minimum, int) or isinstance(minimum, bool) or minimum < 1:
+            raise ValueError("minimum must be a positive integer")
+        deadline = self._deadline(timeout)
+        with self._condition:
+            while True:
+                if self._rebuild_error is not None and not self._rebuild_running:
+                    error = self._rebuild_error
+                    raise IndexRebuildError(
+                        f"background index rebuild failed: {error}"
+                    ) from error
+                if self._active_view is not None:
+                    index = self._active_view.module_sampling_indices.get(module_id)
+                    if index is not None and index.total_transitions >= minimum:
+                        return True
+                if self._closed:
+                    return False
+                remaining = self._remaining(deadline)
+                if remaining == 0:
+                    return False
+                self._condition.wait(remaining)
+
     def sample_coordinates(
         self,
         batch_size: int,
@@ -416,6 +498,51 @@ class FastReplay:
             )
             for episode_index, transition_index in self._sample_positions(
                 view,
+                batch_size,
+                rng=rng,
+            )
+        ]
+
+    def sample_module_coordinates(
+        self,
+        module_id: str,
+        batch_size: int,
+        *,
+        rng: random.Random,
+    ) -> list[tuple[str, int]]:
+        self._module_codec()
+        view = self._capture_active_view()
+        return [
+            (
+                view.episodes[episode_index].episode_id,
+                transition_index,
+            )
+            for episode_index, transition_index in self._sample_module_positions(
+                view,
+                module_id,
+                batch_size,
+                rng=rng,
+            )
+        ]
+
+    def sample_module(
+        self,
+        module_id: str,
+        batch_size: int,
+        *,
+        rng: random.Random,
+    ) -> list[MultiModuleTransition]:
+        codec = self._module_codec()
+        view = self._capture_active_view()
+        return [
+            codec.get_module_transition(
+                view.episodes[episode_index],
+                module_id,
+                transition_index,
+            )
+            for episode_index, transition_index in self._sample_module_positions(
+                view,
+                module_id,
                 batch_size,
                 rng=rng,
             )
@@ -502,15 +629,54 @@ class FastReplay:
         episodes: list[EpisodeEnvelope] = []
         cumulative_lengths: list[int] = []
         total_transitions = 0
+        module_episode_indices: dict[str, list[int]] = {}
+        module_cumulative_lengths: dict[str, list[int]] = {}
+        module_totals: dict[str, int] = {}
+        module_codec = (
+            self._codec if isinstance(self._codec, ModuleEpisodeCodec) else None
+        )
 
-        for record in request.records:
+        for episode_index, record in enumerate(request.records):
             episodes.append(record.episode)
             episode_ids.append(record.episode.episode_id)
             total_transitions += record.transition_count
             cumulative_lengths.append(total_transitions)
+            if module_codec is not None:
+                episode_module_total = 0
+                for module_id in module_codec.module_ids(record.episode):
+                    module_count = module_codec.module_transition_count(
+                        record.episode,
+                        module_id,
+                    )
+                    if module_count < 1:
+                        raise ReplayError(
+                            "module-specific episode views cannot be empty"
+                        )
+                    episode_module_total += module_count
+                    module_episode_indices.setdefault(module_id, []).append(
+                        episode_index
+                    )
+                    module_totals[module_id] = (
+                        module_totals.get(module_id, 0) + module_count
+                    )
+                    module_cumulative_lengths.setdefault(module_id, []).append(
+                        module_totals[module_id]
+                    )
+                if episode_module_total != record.transition_count:
+                    raise ReplayError(
+                        "module transition totals do not match the episode total"
+                    )
 
         if total_transitions != request.total_transitions:
             raise ReplayError("sampling index transition total is inconsistent")
+        module_sampling_indices = {
+            module_id: _ModuleSamplingIndex(
+                episode_indices=tuple(module_episode_indices[module_id]),
+                cumulative_lengths=tuple(module_cumulative_lengths[module_id]),
+                total_transitions=module_totals[module_id],
+            )
+            for module_id in sorted(module_totals)
+        }
         return _MaterializedView(
             cursor=request.cursor,
             episodes=tuple(episodes),
@@ -519,6 +685,7 @@ class FastReplay:
                 cumulative_lengths=tuple(cumulative_lengths),
                 total_transitions=total_transitions,
             ),
+            module_sampling_indices=MappingProxyType(module_sampling_indices),
             total_estimated_bytes=request.total_estimated_bytes,
         )
 
@@ -646,6 +813,50 @@ class FastReplay:
             )
             positions.append((episode_index, flat_index - episode_start))
         return positions
+
+    @staticmethod
+    def _sample_module_positions(
+        view: _MaterializedView,
+        module_id: str,
+        batch_size: int,
+        *,
+        rng: random.Random,
+    ) -> list[tuple[int, int]]:
+        if not isinstance(module_id, str) or not module_id:
+            raise ValueError("module_id must be a non-empty string")
+        if (
+            not isinstance(batch_size, int)
+            or isinstance(batch_size, bool)
+            or batch_size < 1
+        ):
+            raise ValueError("batch_size must be a positive integer")
+        index = view.module_sampling_indices.get(module_id)
+        if index is None:
+            raise KeyError(module_id)
+        positions: list[tuple[int, int]] = []
+        for _ in range(batch_size):
+            flat_index = rng.randrange(index.total_transitions)
+            module_episode_index = bisect_right(
+                index.cumulative_lengths,
+                flat_index,
+            )
+            episode_start = (
+                index.cumulative_lengths[module_episode_index - 1]
+                if module_episode_index
+                else 0
+            )
+            positions.append(
+                (
+                    index.episode_indices[module_episode_index],
+                    flat_index - episode_start,
+                )
+            )
+        return positions
+
+    def _module_codec(self) -> ModuleEpisodeCodec:
+        if not isinstance(self._codec, ModuleEpisodeCodec):
+            raise TypeError("the configured episode codec has no module-specific views")
+        return self._codec
 
     @staticmethod
     def _deadline(timeout: float | None) -> float | None:

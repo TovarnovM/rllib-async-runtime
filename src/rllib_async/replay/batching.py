@@ -14,6 +14,7 @@ from typing import Generic, TypeAlias, TypeVar, cast
 import numpy as np
 
 from rllib_async.protocols.batches import BatchCollator
+from rllib_async.protocols.episodes import MultiModuleTransition
 from rllib_async.replay.fast import (
     FastReplay,
     IndexRebuildError,
@@ -23,6 +24,7 @@ from rllib_async.replay.reference import ReplayError
 
 BatchT = TypeVar("BatchT")
 FlatBatch: TypeAlias = dict[str, np.ndarray]
+MultiModuleBatch: TypeAlias = dict[str, FlatBatch]
 _WAIT_SLICE_S = 0.01
 _NO_BATCH = object()
 
@@ -117,6 +119,57 @@ class FlatBatchCollator:
                 )
             batch[key] = np.ascontiguousarray(stacked)
         return batch
+
+
+class MultiModuleBatchCollator:
+    """Group sparse provenance records into independent flat module batches."""
+
+    def __init__(
+        self,
+        *,
+        expected_module_ids: Sequence[str] | None = None,
+    ) -> None:
+        if expected_module_ids is None:
+            self._expected_module_ids = None
+            return
+        module_ids = tuple(expected_module_ids)
+        if (
+            not module_ids
+            or len(module_ids) != len(set(module_ids))
+            or any(
+                not isinstance(module_id, str) or not module_id
+                for module_id in module_ids
+            )
+        ):
+            raise ValueError(
+                "expected_module_ids must contain unique non-empty strings"
+            )
+        self._expected_module_ids = module_ids
+
+    def collate(self, transitions: Sequence[object]) -> MultiModuleBatch:
+        if not transitions:
+            raise BatchCollationError("collation requires at least one transition")
+        grouped: dict[str, list[object]] = {}
+        for transition in transitions:
+            if not isinstance(transition, MultiModuleTransition):
+                raise BatchCollationError(
+                    "multi-module batches require MultiModuleTransition values"
+                )
+            grouped.setdefault(transition.module_id, []).append(transition.data)
+
+        if self._expected_module_ids is not None:
+            if set(grouped) != set(self._expected_module_ids):
+                raise BatchCollationError(
+                    "sampled module IDs do not match expected_module_ids"
+                )
+            module_ids = self._expected_module_ids
+        else:
+            module_ids = tuple(sorted(grouped))
+        flat_collator = FlatBatchCollator()
+        return {
+            module_id: flat_collator.collate(grouped[module_id])
+            for module_id in module_ids
+        }
 
 
 class BatchProducer(Generic[BatchT]):

@@ -20,11 +20,20 @@ from ray.rllib.utils.metrics import (
     NUM_ENV_STEPS_SAMPLED_LIFETIME,
 )
 
+from rllib_async.examples import (
+    HIERARCHY_MODULE_IDS,
+    MANAGER_MODULE_ID,
+    WORKER_0_MODULE_ID,
+    WORKER_1_MODULE_ID,
+    build_hierarchy_sac_config,
+    hierarchy_module_spaces,
+)
 from rllib_async.learner import (
     SAC_TARGET_UPDATE_STATE,
     SAC_TEMPERATURE_STATE,
     SACBatchError,
     SACLearnerAdapter,
+    build_rllib_multi_module_sac_batch,
     build_rllib_sac_batch,
 )
 from tests.helpers import (
@@ -107,6 +116,86 @@ def test_build_rllib_sac_batch_normalizes_exact_columns() -> None:
         np.ones(4, dtype=np.float32),
     )
     assert all(np.asarray(value).flags.c_contiguous for value in sample_batch.values())
+
+
+def test_multi_module_adapter_updates_discrete_manager_and_continuous_workers() -> None:
+    config = build_hierarchy_sac_config(
+        episode_length=8,
+        manager_period=2,
+        seed=20260726,
+    )
+    spaces = hierarchy_module_spaces()
+    rng = np.random.default_rng(20260726)
+    worker_0_batch = make_fixed_batch(8)
+    worker_0_batch[Columns.OBS] = rng.normal(size=(8, 4)).astype(np.float32)
+    worker_0_batch[Columns.NEXT_OBS] = rng.normal(size=(8, 4)).astype(np.float32)
+    worker_1_batch = make_fixed_batch(8)
+    worker_1_batch[Columns.OBS] = rng.normal(size=(8, 4)).astype(np.float32)
+    worker_1_batch[Columns.NEXT_OBS] = rng.normal(size=(8, 4)).astype(np.float32)
+    batches = {
+        MANAGER_MODULE_ID: {
+            **make_fixed_batch(8),
+            Columns.OBS: rng.normal(size=(8, 5)).astype(np.float32),
+            Columns.NEXT_OBS: rng.normal(size=(8, 5)).astype(np.float32),
+            Columns.ACTIONS: rng.integers(0, 2, size=8, dtype=np.int64),
+        },
+        WORKER_0_MODULE_ID: worker_0_batch,
+        WORKER_1_MODULE_ID: worker_1_batch,
+    }
+
+    rllib_batch = build_rllib_multi_module_sac_batch(batches)
+
+    assert tuple(rllib_batch.policy_batches) == HIERARCHY_MODULE_IDS
+    assert rllib_batch.env_steps() == 8
+    assert rllib_batch.agent_steps() == 24
+
+    adapter = SACLearnerAdapter(
+        config,
+        spaces=spaces,
+        member_id="hierarchy-member",
+        publication_interval_updates=1,
+    )
+    restored = None
+    try:
+        with pytest.raises(SACBatchError, match="update_modules"):
+            adapter.update(
+                worker_0_batch,
+                sampled_env_steps=8,
+                sampled_agent_steps=24,
+            )
+        result = adapter.update_modules(
+            batches,
+            sampled_env_steps=8,
+            sampled_agent_steps=24,
+        )
+        assert result.performed
+        assert result.published_weights is not None
+        assert tuple(result.published_weights.module_versions) == HIERARCHY_MODULE_IDS
+        assert set(result.learner_results[0]) >= {
+            "__all_modules__",
+            *HIERARCHY_MODULE_IDS,
+        }
+
+        state = adapter.get_state()
+        restored = SACLearnerAdapter(
+            config,
+            spaces=spaces,
+            member_id="hierarchy-member",
+            publication_interval_updates=1,
+        )
+        restored.set_state(copy.deepcopy(state))
+        assert_tree_close(
+            restored.get_state()["learner_group"],
+            state["learner_group"],
+        )
+        assert (
+            restored.get_published_weights().module_versions
+            == adapter.get_published_weights().module_versions
+        )
+    finally:
+        adapter.close()
+        if restored is not None:
+            restored.close()
 
 
 @pytest.mark.parametrize(
