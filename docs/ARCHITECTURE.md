@@ -96,8 +96,8 @@ Phase 5 adds the rollout boundary:
   sequence metadata must remain equal to the installed version;
 - whole episodes are converted to the existing flat transition codec and retain
   generation-safe, idempotent identities;
-- 4–16 actors progress independently through `ray.wait`, without an episode
-  barrier;
+- 1–16 actors progress independently through `ray.wait`, without an episode
+  barrier; one actor exists for the explicit Phase 11 baseline;
 - a commit slot is reserved before sampling and released only after replay
   acknowledgement, making the high watermark strict;
 - high/low hysteresis applies backpressure only at episode boundaries;
@@ -195,6 +195,28 @@ Phase 10 adds the shared ego-graph boundary:
 - the example does not add a centralized environment-wide graph pass,
   continuous graph SAC, or masked-action semantics.
 
+Phase 11 adds measurement without changing algorithm ownership:
+
+- `batch_queue_capacity=0` keeps the same replay sampler and checkpointed RNG
+  state but constructs a batch synchronously on the learner call path;
+- positive queue capacity retains the existing single bounded producer thread,
+  making direct and queued modes an explicit A/B boundary;
+- cumulative data-wait, batch-build, and learner-update timing is reported by
+  the components that own those operations;
+- end-to-end gates compare pending RPC and queue high-water marks with their
+  configured bounds and compare both replay views with transition/byte
+  capacity;
+- stock RLlib SAC is a baseline only for the equivalent one-member topology;
+  no artificial stock two-member shared-replay result is manufactured;
+- benchmark JSON records parameters, environment, Git state, invariant gates,
+  and optional profiles, while noisy throughput remains an observation rather
+  than a CI threshold.
+
+The learner timing wraps RLlib's update call but deliberately adds no CUDA
+synchronization to the hot path. Target-accelerator attribution and the Phase 8
+two-GPU gate therefore remain explicit hardware evidence in `debt.md`, not an
+architectural claim inferred from CPU CI.
+
 See [ADR 0001](adr/0001-runtime-boundary.md) for the orchestration decision and
 [ADR 0002](adr/0002-episode-replay-quantum.md) and
 [ADR 0003](adr/0003-authoritative-and-reference-replay.md) for replay semantics.
@@ -221,4 +243,5 @@ indexes, synchronized publications, and checkpoint derivation.
 [ADR 0013](adr/0013-shared-ego-graph-policy.md) records padded rollout
 transport, variable-size replay collation, the shared module boundary, and the
 pure-PyTorch graph encoder.
-See [the implementation plan](IMPLEMENTATION_PLAN.md) for phase gates.
+See [the performance gate](PERFORMANCE.md) for measurement semantics and
+[the implementation plan](IMPLEMENTATION_PLAN.md) for phase gates.

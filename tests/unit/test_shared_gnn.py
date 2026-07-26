@@ -14,6 +14,7 @@ from rllib_async.examples import (
     GRAPH_NODE_FEATURE_DIM,
     SHARED_GNN_MODULE_ID,
     EgoGraphCoordinationEnv,
+    build_shared_gnn_sac_config,
     shared_gnn_policy_mapping_fn,
 )
 from rllib_async.gnn import (
@@ -121,6 +122,18 @@ def test_graph_env_uses_variable_ego_sizes_and_one_policy_mapping() -> None:
 
     with pytest.raises(ValueError, match="every logical graph agent"):
         env.step({"agent_0": 1})
+
+
+def test_shared_gnn_config_exposes_target_gpu_without_changing_default() -> None:
+    assert build_shared_gnn_sac_config().num_gpus_per_learner == 0
+    assert (
+        build_shared_gnn_sac_config(
+            num_gpus_per_learner=1,
+        ).num_gpus_per_learner
+        == 1
+    )
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        build_shared_gnn_sac_config(num_gpus_per_learner=2)
 
 
 def test_graph_codec_strips_padding_and_reuses_module_replay_views() -> None:

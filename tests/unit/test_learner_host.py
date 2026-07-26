@@ -159,6 +159,84 @@ def test_one_sync_can_feed_multiple_local_sac_updates(monkeypatch) -> None:
         runner.stop()
 
 
+def test_direct_batching_updates_and_restores_without_queue_state(monkeypatch) -> None:
+    monkeypatch.setattr(learner_host_module.ray, "get", lambda value: value)
+    config = make_sac_config()
+    config.training(
+        train_batch_size_per_learner=8,
+        num_steps_sampled_before_learning_starts=0,
+    )
+    runner = SingleAgentEnvRunner(config=config, worker_index=0)
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(
+        codec,
+        capacity_transitions=1_000,
+        capacity_bytes=10_000_000,
+        store_generation="direct-learner-restore",
+    )
+    store.commit_episode(make_episode(codec))
+    source = LearnerHost(
+        config,
+        runner.get_spaces(),
+        ImmediateReplayActor(store),
+        codec,
+        member_id="member-0",
+        publication_interval_updates=1,
+        batch_size=8,
+        batch_queue_capacity=0,
+        batch_seed=13,
+        replay_sync_max_bytes=1_000_000,
+    )
+    restored = None
+    try:
+        source.start()
+        tick = source.tick(
+            sampled_env_steps=64,
+            sampled_agent_steps=64,
+            max_updates=1,
+        )
+        assert tick.updates_performed == 1
+        running = source.get_stats()
+        assert not running.batch_producer.prefetch_enabled
+        assert running.batch_producer.queue_capacity == 0
+        assert running.batch_producer.queue_high_watermark == 0
+        assert running.batch_producer.batch_builds == 1
+        assert running.update_time_ms_p50 > 0
+        assert running.samples_per_s > 0
+
+        drained = source.drain(
+            sampled_env_steps=64,
+            sampled_agent_steps=64,
+            max_updates=1,
+            timeout_s=2,
+        )
+        assert drained.updates_performed == 0
+        assert source.get_stats().learner_updates == running.learner_updates
+        checkpoint = source.get_checkpoint_state()
+        restored = LearnerHost(
+            config,
+            runner.get_spaces(),
+            ImmediateReplayActor(store),
+            codec,
+            member_id="member-0",
+            publication_interval_updates=1,
+            batch_size=8,
+            batch_queue_capacity=0,
+            batch_seed=999,
+            replay_sync_max_bytes=1_000_000,
+            checkpoint_state=checkpoint,
+        )
+        recovered = restored.get_stats()
+        assert recovered.learner_updates == running.learner_updates
+        assert recovered.fast_replay.active_cursor == store.cursor
+        assert not recovered.batch_producer.prefetch_enabled
+    finally:
+        source.stop(timeout_s=2)
+        if restored is not None:
+            restored.stop(timeout_s=2)
+        runner.stop()
+
+
 def test_checkpoint_restores_learner_but_rebuilds_fast_replay(monkeypatch) -> None:
     monkeypatch.setattr(learner_host_module.ray, "get", lambda value: value)
     config = make_sac_config()

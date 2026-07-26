@@ -38,11 +38,23 @@ def test_runtime_config_rejects_unbounded_or_ambiguous_settings() -> None:
             evaluation_interval_env_steps=0,
             evaluation_num_episodes=1,
         )
-    with pytest.raises(ValueError, match="between 4 and 16"):
+    with pytest.raises(ValueError, match="between 1 and 16"):
         AsyncSACRuntimeConfig(runner_count=17)
+    with pytest.raises(ValueError, match="between 1 and 16"):
+        AsyncSACRuntimeConfig(runner_count=0)
     for member_id in (".", "..", "parent/child", r"parent\child"):
         with pytest.raises(ValueError, match="path segment"):
             AsyncSACRuntimeConfig(member_id=member_id)
+
+
+def test_runtime_config_accepts_phase_11_direct_single_runner_baseline() -> None:
+    config = AsyncSACRuntimeConfig(
+        runner_count=1,
+        batch_queue_capacity=0,
+    )
+
+    assert config.runner_count == 1
+    assert config.batch_queue_capacity == 0
 
 
 def test_trainable_resource_request_covers_every_nonzero_child_actor() -> None:

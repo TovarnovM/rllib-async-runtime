@@ -11,7 +11,10 @@ replay; its dedicated two-GPU acceptance test remains recorded in
 discrete manager, two continuous workers, module-specific replay views, and a
 heterogeneous stock RLlib SAC learner. Phase 10 adds homogeneous logical agents
 using one shared ego-GNN SAC module, variable-size graph replay, and packed
-graph batches. The project also contains deterministic replay oracles, a
+graph batches. Phase 11 adds deterministic component and end-to-end performance
+harnesses, a true no-prefetch comparison mode, boundedness gates, and measured
+batch/learner timing. Its target-GPU evidence remains open in
+[`debt.md`](debt.md). The project also contains deterministic replay oracles, a
 serialized Ray `ReplayActor`, atomic trusted-local replay checkpoints,
 reader-safe background `FastReplay` index publication, a bounded local batch
 pipeline, version-aware asynchronous rollout, replay-isolated evaluation, and
@@ -49,7 +52,6 @@ uv run --locked --extra cu118 --group dev ruff check .
 uv run --locked --extra cu118 --group dev ruff format --check .
 uv run --locked --extra cu118 --group dev \
   pytest -m "not gpu and not cluster and not stress"
-uv run --locked --extra cu118 --group dev pytest -m gpu tests/gpu
 ```
 
 The CPU-only GitHub Actions job uses the same lock file with the mutually
@@ -57,6 +59,10 @@ exclusive `cpu` PyTorch extra. Keep the selected extra on the `uv run` command,
 not only on the preceding `uv sync`: Ray 2.56 propagates the original `uv run`
 arguments to worker processes, and omitting the extra would create workers
 without PyTorch.
+
+Target-hardware GPU validation is deliberately separate from the normal
+development loop. Its exact prerequisites, commands, artifact layout, and
+acceptance criteria are maintained in [`debt.md`](debt.md).
 
 ## Phase 0 compatibility gate
 
@@ -177,7 +183,8 @@ Phase 5 provides:
   sequence validation;
 - immutable flat replay envelopes carrying the behavior version actually used;
 - generation- and sequence-based idempotent episode IDs;
-- an asynchronous 4–16 actor group with no global episode barrier;
+- an asynchronous 1–16 actor group with no global episode barrier, where one
+  actor is the explicit Phase 11 baseline rather than the production default;
 - strict high/low commit-slot watermarks and boundary-only backpressure;
 - bounded policy-lag and episode-duration metrics;
 - explicit actor replacement that advances `runner_generation`.
@@ -209,7 +216,7 @@ Run the correctness example with:
 
 ```bash
 uv run --locked --extra cu118 --group dev \
-  python examples/async_sac_pendulum.py --num-gpus 1
+  python examples/async_sac_pendulum.py --num-gpus 0
 ```
 
 Use `--require-improvement` to make the command fail unless the recorded
@@ -293,25 +300,21 @@ Phase 8 provides:
 - CPU integration coverage and a real two-GPU gate for the target two-RTX-3090
   workstation.
 
-Run the two-GPU topology example inside the devcontainer:
+Run a short CPU topology smoke inside the devcontainer:
 
 ```bash
 uv run --locked --extra cu118 --group dev \
   python examples/population_two_members.py \
-  --num-gpus-per-member 1
-```
-
-Run only the two-GPU population gate with:
-
-```bash
-uv run --locked --extra cu118 --group dev \
-  pytest -m gpu tests/gpu/test_two_gpu_population.py
+  --stop-timesteps 2000 \
+  --num-gpus-per-member 0
 ```
 
 Each Tune trial writes only `member.snapshot`. After both trials terminate,
 `PopulationLauncher.save_checkpoint()` publishes the shared replay once.
 Periodic checkpoints while both trials remain live require a future
 cross-trial coordination protocol and are not claimed by Phase 8.
+The corresponding target-hardware example, still-open validation command, and
+required evidence are in [`debt.md`](debt.md).
 
 ## Phase 9 sparse hierarchy example
 
@@ -373,6 +376,39 @@ The shared state is across logical agents. Stock SAC still owns separate actor,
 critic, twin-critic, and target encoders inside that one module. The example
 does not claim one centralized graph forward for the whole environment,
 continuous graph SAC, or masked-action semantics.
+
+## Phase 11 performance gate
+
+Phase 11 provides:
+
+- deterministic flat and variable-size ego-GNN replay workloads;
+- authoritative ingest and learner-local sampling/collation benchmarks;
+- direct batch construction with `batch_queue_capacity=0`, providing a real
+  no-background-batching baseline;
+- an end-to-end matrix for stock RLlib SAC, direct runtime, and queued runtime,
+  including 1/4/8/16 runners, short/long episodes, multiple batch sizes and
+  update-to-data ratios, and one/two runtime members;
+- JSON reports with environment and Git revision metadata plus optional
+  `cProfile` artifacts;
+- deterministic gates for pending RPCs, queue capacity, replay transition/byte
+  capacity, failures, and the presence of measured data-wait, batch-build, and
+  learner-update timings.
+
+Run the cheap CPU component smoke tests with:
+
+```bash
+uv run --locked --extra cu118 --group dev \
+  python -m benchmarks.replay_ingest --episodes 1000
+uv run --locked --extra cu118 --group dev \
+  python -m benchmarks.fast_replay_sampling --batches 200
+```
+
+These commands validate instrumentation and invariants; their throughput is not
+a portable performance claim. The full CPU matrix, report schema, profiling
+guidance, and known limitations are in
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). Phase 11 remains acceptance-open
+until the prepared target-GPU matrix in [`debt.md`](debt.md) is executed and
+its evidence is reviewed.
 
 ## Architecture
 

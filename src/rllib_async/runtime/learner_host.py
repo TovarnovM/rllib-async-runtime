@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import pickle
 import time
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -110,6 +111,11 @@ class LearnerHostStats:
     updates_skipped_learning_start: int
     weight_publications: int
     updates_per_s: float
+    samples_per_s: float
+    data_wait_fraction: float
+    batch_queue_empty_fraction: float
+    update_time_ms_p50: float
+    update_time_ms_p95: float
     latest_module_version: int
     last_learner_metrics: tuple[tuple[str, float], ...]
     fast_replay: FastReplayStats
@@ -158,6 +164,7 @@ class LearnerHost:
         self._codec = codec
         self._member_id = member_id
         self._sync_max_bytes = replay_sync_max_bytes
+        self._batch_size = batch_size
         self._allow_replay_ahead_on_restore = allow_replay_ahead_on_restore
         self._fast_replay = FastReplay(codec)
         snapshot = ray.get(self._replay_actor.get_snapshot.remote())
@@ -198,6 +205,7 @@ class LearnerHost:
         self._updates_skipped_learning_start = 0
         self._weight_publications = 0
         self._last_learner_metrics: tuple[tuple[str, float], ...] = ()
+        self._update_times_ms: deque[float] = deque(maxlen=1_024)
         initial_weights = self._adapter.get_published_weights()
         self._latest_module_version = max(
             initial_weights.module_versions.values(),
@@ -357,6 +365,7 @@ class LearnerHost:
             if self._started_at is not None
             else 0.0
         )
+        producer = self._producer.get_stats()
         return LearnerHostStats(
             state=self._state,
             sync_requests=self._sync_requests,
@@ -372,10 +381,25 @@ class LearnerHost:
                 if elapsed
                 else 0.0
             ),
+            samples_per_s=(
+                producer.batches_consumed * self._batch_size / elapsed
+                if elapsed
+                else 0.0
+            ),
+            data_wait_fraction=(
+                min(producer.data_wait_s / elapsed, 1.0) if elapsed else 0.0
+            ),
+            batch_queue_empty_fraction=(
+                producer.data_wait_timeouts / producer.data_wait_calls
+                if producer.data_wait_calls
+                else 0.0
+            ),
+            update_time_ms_p50=self._percentile(self._update_times_ms, 50),
+            update_time_ms_p95=self._percentile(self._update_times_ms, 95),
             latest_module_version=self._latest_module_version,
             last_learner_metrics=self._last_learner_metrics,
             fast_replay=self._fast_replay.get_stats(),
-            batch_producer=self._producer.get_stats(),
+            batch_producer=producer,
         )
 
     def get_checkpoint_state(self) -> dict[str, Any]:
@@ -497,12 +521,16 @@ class LearnerHost:
         publication: WeightsDescriptor | None = None
         last_metrics = self._last_learner_metrics
         for batch in batches:
+            update_started = time.monotonic()
             update = self._adapter.update(
                 batch,
                 sampled_env_steps=sampled_env_steps,
                 sampled_agent_steps=sampled_agent_steps,
             )
             if update.performed:
+                self._update_times_ms.append(
+                    (time.monotonic() - update_started) * 1_000
+                )
                 updates_performed += 1
                 last_metrics = self._extract_numeric_metrics(update.learner_results)
             else:
@@ -531,6 +559,8 @@ class LearnerHost:
         max_batches: int | None = None,
     ) -> list[FlatBatch]:
         assert self._producer is not None
+        if not self._producer.get_stats().prefetch_enabled:
+            return []
         batches: list[FlatBatch] = []
         while max_batches is None or len(batches) < max_batches:
             try:
@@ -649,6 +679,12 @@ class LearnerHost:
 
         visit(value, ())
         return tuple(sorted(metrics.items()))
+
+    @staticmethod
+    def _percentile(values: tuple[float, ...] | deque[float], percentile: int) -> float:
+        if not values:
+            return 0.0
+        return float(np.percentile(tuple(values), percentile))
 
     def _require_state(self, expected: LearnerHostState) -> None:
         if self._state is not expected:
