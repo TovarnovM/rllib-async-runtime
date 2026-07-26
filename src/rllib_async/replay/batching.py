@@ -327,6 +327,34 @@ class BatchProducer(Generic[BatchT]):
                 last_data_wait_ms=self._last_data_wait_ms,
             )
 
+    def get_rng_state(self) -> object:
+        """Return sampler RNG state only at a producer safe point."""
+
+        with self._condition:
+            if self._state not in {
+                BatchProducerState.CREATED,
+                BatchProducerState.PAUSED,
+            }:
+                raise BatchProducerError(
+                    "sampler RNG state requires a created or paused producer"
+                )
+            return self._rng.getstate()
+
+    def set_rng_state(self, state: object) -> None:
+        """Restore sampler RNG state before the producer thread starts."""
+
+        with self._condition:
+            if self._state is not BatchProducerState.CREATED:
+                raise BatchProducerError(
+                    "sampler RNG state can only be restored before start"
+                )
+            probe = random.Random()
+            try:
+                probe.setstate(state)
+            except (TypeError, ValueError) as error:
+                raise ValueError("invalid sampler RNG state") from error
+            self._rng.setstate(state)
+
     def __enter__(self) -> BatchProducer[BatchT]:
         self.start()
         return self

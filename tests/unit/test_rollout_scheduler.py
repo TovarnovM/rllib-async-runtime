@@ -44,6 +44,7 @@ class FakeRolloutActor:
         runner_id: str,
         runner_generation: int,
         initial_weights: WeightsDescriptor,
+        effective_seed: int | None,
     ) -> None:
         self._codec = codec
         self._member_id = member_id
@@ -51,6 +52,7 @@ class FakeRolloutActor:
         self._runner_generation = runner_generation
         self._sequence = 0
         self._weights = initial_weights
+        self.effective_seed = effective_seed
         self.weight_arguments: list[WeightsDescriptor | None] = []
         self.collect_episode = FakeRemoteMethod(self._collect_episode)
 
@@ -123,12 +125,16 @@ class FakeRolloutActorClass:
         initial_weights,
         worker_index,
     ) -> FakeRolloutActor:
+        effective_seed = (
+            None if config.seed is None else int(config.seed + worker_index)
+        )
         actor = FakeRolloutActor(
             codec,
             member_id=member_id,
             runner_id=runner_id,
             runner_generation=runner_generation,
             initial_weights=initial_weights,
+            effective_seed=effective_seed,
         )
         cls.created[runner_id] = actor
         return actor
@@ -184,20 +190,27 @@ def make_group(
     *,
     high: int,
     low: int,
+    initial_weights: WeightsDescriptor | None = None,
+    checkpoint_state: dict[str, object] | None = None,
+    seed: int | None = None,
 ) -> AsyncRolloutGroup:
     install_fake_ray(monkeypatch)
     codec = FlatEpisodeCodec()
+    config = make_sac_config()
+    if seed is not None:
+        config.debugging(seed=seed)
     return AsyncRolloutGroup(
-        make_sac_config(),
+        config,
         codec,
         FakeReplayActor(codec),
         member_id="member-0",
-        initial_weights=make_weights(0),
+        initial_weights=initial_weights or make_weights(0),
         runner_count=4,
         max_episode_steps=10,
         pending_commit_high_watermark=high,
         pending_commit_low_watermark=low,
         num_cpus_per_runner=0,
+        checkpoint_state=checkpoint_state,
     )
 
 
@@ -329,3 +342,101 @@ def test_pause_drains_pending_work_without_starting_new_episodes(monkeypatch) ->
         assert resumed.sample_calls_started == 8
     finally:
         group.stop()
+
+
+def test_checkpoint_recreates_every_runner_in_a_new_generation(monkeypatch) -> None:
+    group = make_group(monkeypatch, high=8, low=3)
+    restored = None
+    try:
+        group.start()
+        group.pause()
+        group.drain(timeout_s=1)
+        group.update_weights(make_weights(2))
+        assert group.restart_runner("runner-0") == 1
+        checkpoint = group.get_checkpoint_state()
+        before = group.get_stats()
+
+        restored = make_group(
+            monkeypatch,
+            high=8,
+            low=3,
+            initial_weights=make_weights(2),
+            checkpoint_state=checkpoint,
+        )
+        recovered = restored.get_stats()
+        saved_generations = dict(before.runner_generations)
+        assert dict(recovered.runner_generations) == {
+            runner_id: generation + 1
+            for runner_id, generation in saved_generations.items()
+        }
+        assert recovered.env_steps == before.env_steps
+        assert recovered.episodes_committed == before.episodes_committed
+        assert recovered.runner_restarts == before.runner_restarts + 4
+
+        restored.start()
+        recovered_after_start = restored.get_stats()
+        assert recovered_after_start.env_steps_per_s == 0.0
+        assert recovered_after_start.agent_steps_per_s == 0.0
+        assert recovered_after_start.backpressure_fraction == 0.0
+        completions = []
+        for _ in range(4):
+            completions.extend(restored.poll(max_events=8))
+            if completions:
+                break
+        assert completions
+        assert all(
+            completion.episode.runner_generation
+            == dict(recovered.runner_generations)[completion.episode.runner_id]
+            for completion in completions
+        )
+        assert all(
+            completion.episode.local_episode_seq == 0 for completion in completions
+        )
+    finally:
+        group.stop()
+        if restored is not None:
+            restored.stop()
+
+
+def test_checkpoint_recreates_runners_with_a_new_seed_range(monkeypatch) -> None:
+    group = make_group(monkeypatch, high=8, low=3, seed=100)
+    restored = None
+    try:
+        initial_seeds = {
+            runner_id: actor.effective_seed
+            for runner_id, actor in FakeRolloutActorClass.created.items()
+        }
+        assert initial_seeds == {
+            "runner-0": 101,
+            "runner-1": 102,
+            "runner-2": 103,
+            "runner-3": 104,
+        }
+
+        group.start()
+        group.pause()
+        group.drain(timeout_s=1)
+        checkpoint = group.get_checkpoint_state()
+
+        restored = make_group(
+            monkeypatch,
+            high=8,
+            low=3,
+            checkpoint_state=checkpoint,
+            seed=100,
+        )
+        restored_seeds = {
+            runner_id: actor.effective_seed
+            for runner_id, actor in FakeRolloutActorClass.created.items()
+        }
+        assert restored_seeds == {
+            "runner-0": 105,
+            "runner-1": 106,
+            "runner-2": 107,
+            "runner-3": 108,
+        }
+        assert set(initial_seeds.values()).isdisjoint(restored_seeds.values())
+    finally:
+        group.stop()
+        if restored is not None:
+            restored.stop()

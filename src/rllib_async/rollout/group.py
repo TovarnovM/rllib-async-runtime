@@ -6,6 +6,7 @@ import copy
 import math
 import time
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -28,6 +29,8 @@ from rllib_async.rollout.episode_runner import (
     _accept_weight_publication,
     make_episode_id,
 )
+
+ROLLOUT_GROUP_CHECKPOINT_VERSION = 1
 
 
 class RolloutGroupError(RuntimeError):
@@ -153,6 +156,7 @@ class AsyncRolloutGroup:
         metrics_window: int = 2_048,
         num_cpus_per_runner: float = 1.0,
         explore: bool = True,
+        checkpoint_state: Mapping[str, Any] | None = None,
     ) -> None:
         if not ray.is_initialized():
             raise RuntimeError("Ray must be initialized before AsyncRolloutGroup")
@@ -247,8 +251,13 @@ class AsyncRolloutGroup:
         self._backpressure_s = 0.0
         self._backpressure_started: float | None = None
         self._started_at: float | None = None
+        self._rate_base_env_steps = 0
+        self._rate_base_agent_steps = 0
+        self._rate_base_backpressure_s = 0.0
         self._episode_times_ms: deque[float] = deque(maxlen=metrics_window)
         self._policy_lags: deque[int] = deque(maxlen=metrics_window)
+        if checkpoint_state is not None:
+            self._restore_checkpoint_state(checkpoint_state)
 
         try:
             for runner_id in self._runner_generations:
@@ -430,8 +439,16 @@ class AsyncRolloutGroup:
             duplicate_commits=self._duplicate_commits,
             env_steps=self._env_steps,
             agent_steps=self._agent_steps,
-            env_steps_per_s=self._env_steps / elapsed if elapsed else 0.0,
-            agent_steps_per_s=self._agent_steps / elapsed if elapsed else 0.0,
+            env_steps_per_s=(
+                (self._env_steps - self._rate_base_env_steps) / elapsed
+                if elapsed
+                else 0.0
+            ),
+            agent_steps_per_s=(
+                (self._agent_steps - self._rate_base_agent_steps) / elapsed
+                if elapsed
+                else 0.0
+            ),
             sample_calls_started=self._sample_calls_started,
             sample_failures=self._sample_failures,
             commit_failures=self._commit_failures,
@@ -444,13 +461,51 @@ class AsyncRolloutGroup:
             backpressured=self._backpressure_started is not None,
             backpressure_events=self._backpressure_events,
             backpressure_fraction=(
-                min(backpressure_s / elapsed, 1.0) if elapsed else 0.0
+                min(
+                    (backpressure_s - self._rate_base_backpressure_s) / elapsed,
+                    1.0,
+                )
+                if elapsed
+                else 0.0
             ),
             episode_time_ms_p50=self._percentile(self._episode_times_ms, 50),
             episode_time_ms_p95=self._percentile(self._episode_times_ms, 95),
             policy_version_lag_p50=self._percentile(self._policy_lags, 50),
             policy_version_lag_p95=self._percentile(self._policy_lags, 95),
         )
+
+    def get_checkpoint_state(self) -> dict[str, Any]:
+        """Capture drained rollout state for collision-free actor recreation."""
+
+        if self._state is not RolloutGroupState.PAUSED:
+            raise RolloutGroupError("rollout group must be paused before checkpoint")
+        if self._pending_samples or self._pending_commits:
+            raise RolloutGroupError("rollout group must be drained before checkpoint")
+        if set(self._idle_runners) != set(self._runners):
+            raise RolloutGroupError(
+                "all rollout runners must be idle before checkpoint"
+            )
+        return {
+            "state_version": ROLLOUT_GROUP_CHECKPOINT_VERSION,
+            "member_id": self._member_id,
+            "runner_count": self._runner_count,
+            "latest_module_versions": dict(self._latest_weights.module_versions),
+            "runner_generations": dict(self._runner_generations),
+            "episodes_collected": self._episodes_collected,
+            "episodes_committed": self._episodes_committed,
+            "duplicate_commits": self._duplicate_commits,
+            "env_steps": self._env_steps,
+            "agent_steps": self._agent_steps,
+            "sample_calls_started": self._sample_calls_started,
+            "sample_failures": self._sample_failures,
+            "commit_failures": self._commit_failures,
+            "runner_restarts": self._runner_restarts,
+            "outstanding_high_watermark": self._outstanding_high_watermark,
+            "backpressure_events": self._backpressure_events,
+            "backpressure_s": self._backpressure_s,
+            "episode_times_ms": tuple(self._episode_times_ms),
+            "policy_lags": tuple(self._policy_lags),
+        }
 
     def stop(self) -> None:
         if self._state is RolloutGroupState.STOPPED:
@@ -473,14 +528,20 @@ class AsyncRolloutGroup:
         self.stop()
 
     def _new_actor(self, runner_id: str) -> Any:
+        runner_generation = self._runner_generations[runner_id]
+        runner_config = self._config.copy(copy_frozen=False)
+        if runner_config.seed is not None:
+            runner_config.seed = int(runner_config.seed) + (
+                runner_generation * self._runner_count
+            )
         actor = EpisodeRolloutActor.options(
             num_cpus=self._num_cpus_per_runner,
         ).remote(
-            self._config,
+            runner_config,
             self._codec,
             member_id=self._member_id,
             runner_id=runner_id,
-            runner_generation=self._runner_generations[runner_id],
+            runner_generation=runner_generation,
             max_episode_steps=self._max_episode_steps,
             initial_weights=self._latest_weights,
             worker_index=self._worker_indices[runner_id],
@@ -489,6 +550,133 @@ class AsyncRolloutGroup:
             self._latest_weights.module_versions
         )
         return actor
+
+    def _restore_checkpoint_state(self, state: Mapping[str, Any]) -> None:
+        if not isinstance(state, Mapping):
+            raise ValueError("rollout checkpoint state must be a mapping")
+        if state.get("state_version") != ROLLOUT_GROUP_CHECKPOINT_VERSION:
+            raise ValueError("unsupported rollout checkpoint state version")
+        if state.get("member_id") != self._member_id:
+            raise ValueError("rollout checkpoint member_id does not match")
+        if state.get("runner_count") != self._runner_count:
+            raise ValueError("rollout checkpoint runner_count does not match")
+        if state.get("latest_module_versions") != dict(
+            self._latest_weights.module_versions
+        ):
+            raise ValueError("rollout checkpoint weights do not match learner")
+
+        generations = state.get("runner_generations")
+        if not isinstance(generations, Mapping) or set(generations) != set(
+            self._runner_generations
+        ):
+            raise ValueError("rollout checkpoint runner generations are invalid")
+        restored_generations: dict[str, int] = {}
+        for runner_id, generation in generations.items():
+            if (
+                not isinstance(runner_id, str)
+                or not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation < 0
+            ):
+                raise ValueError("rollout checkpoint runner generations are invalid")
+            restored_generations[runner_id] = generation + 1
+
+        self._episodes_collected = self._checkpoint_counter(
+            state,
+            "episodes_collected",
+        )
+        self._episodes_committed = self._checkpoint_counter(
+            state,
+            "episodes_committed",
+        )
+        self._duplicate_commits = self._checkpoint_counter(
+            state,
+            "duplicate_commits",
+        )
+        self._env_steps = self._checkpoint_counter(state, "env_steps")
+        self._agent_steps = self._checkpoint_counter(state, "agent_steps")
+        self._sample_calls_started = self._checkpoint_counter(
+            state,
+            "sample_calls_started",
+        )
+        self._sample_failures = self._checkpoint_counter(
+            state,
+            "sample_failures",
+        )
+        self._commit_failures = self._checkpoint_counter(
+            state,
+            "commit_failures",
+        )
+        self._runner_restarts = (
+            self._checkpoint_counter(state, "runner_restarts") + self._runner_count
+        )
+        self._outstanding_high_watermark = self._checkpoint_counter(
+            state,
+            "outstanding_high_watermark",
+        )
+        self._backpressure_events = self._checkpoint_counter(
+            state,
+            "backpressure_events",
+        )
+        backpressure_s = state.get("backpressure_s")
+        if (
+            not isinstance(backpressure_s, int | float)
+            or isinstance(backpressure_s, bool)
+            or not math.isfinite(backpressure_s)
+            or backpressure_s < 0
+        ):
+            raise ValueError("rollout checkpoint backpressure_s is invalid")
+        self._backpressure_s = float(backpressure_s)
+        self._rate_base_env_steps = self._env_steps
+        self._rate_base_agent_steps = self._agent_steps
+        self._rate_base_backpressure_s = self._backpressure_s
+
+        episode_times = self._checkpoint_window(
+            state,
+            "episode_times_ms",
+            integer=False,
+        )
+        policy_lags = self._checkpoint_window(
+            state,
+            "policy_lags",
+            integer=True,
+        )
+        if self._episodes_committed > self._episodes_collected:
+            raise ValueError("rollout checkpoint commits exceed collected episodes")
+        if self._sample_calls_started < self._episodes_collected:
+            raise ValueError("rollout checkpoint sample count is inconsistent")
+
+        self._runner_generations = restored_generations
+        self._idle_runners = deque(restored_generations)
+        self._episode_times_ms = deque(episode_times, maxlen=self._metrics_window)
+        self._policy_lags = deque(policy_lags, maxlen=self._metrics_window)
+
+    @staticmethod
+    def _checkpoint_counter(state: Mapping[str, Any], name: str) -> int:
+        value = state.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"rollout checkpoint {name} is invalid")
+        return value
+
+    def _checkpoint_window(
+        self,
+        state: Mapping[str, Any],
+        name: str,
+        *,
+        integer: bool,
+    ) -> tuple[float | int, ...]:
+        values = state.get(name)
+        if not isinstance(values, tuple) or len(values) > self._metrics_window:
+            raise ValueError(f"rollout checkpoint {name} is invalid")
+        for value in values:
+            if (
+                not isinstance(value, int if integer else int | float)
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(f"rollout checkpoint {name} is invalid")
+        return values
 
     def _schedule_available(self) -> None:
         if (

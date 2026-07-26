@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import pickle
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from ray.rllib.algorithms.sac import SACConfig
 from rllib_async.learner import SACLearnerAdapter
 from rllib_async.protocols import (
     FlatEpisodeCodec,
+    ReplayCursor,
     ReplayDelta,
     ReplaySnapshot,
     WeightsDescriptor,
@@ -31,6 +33,30 @@ from rllib_async.replay import (
     FlatBatch,
     FlatBatchCollator,
 )
+
+LEARNER_HOST_CHECKPOINT_VERSION = 1
+
+
+def encode_learner_host_checkpoint(state: Mapping[str, Any]) -> bytes:
+    """Serialize learner-owned tensors inside the learner process."""
+
+    if not isinstance(state, Mapping):
+        raise TypeError("learner host checkpoint state must be a mapping")
+    return pickle.dumps(dict(state), protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def decode_learner_host_checkpoint(payload: bytes) -> dict[str, Any]:
+    """Deserialize trusted learner state on the learner's assigned device."""
+
+    if not isinstance(payload, bytes) or not payload:
+        raise ValueError("learner host checkpoint payload must be non-empty bytes")
+    try:
+        state = pickle.loads(payload)
+    except Exception as error:
+        raise ValueError("learner host checkpoint payload is unreadable") from error
+    if not isinstance(state, Mapping):
+        raise ValueError("learner host checkpoint payload is not a mapping")
+    return dict(state)
 
 
 class LearnerHostError(RuntimeError):
@@ -55,6 +81,20 @@ class LearnerHostTick:
     updates_skipped_learning_start: int
     published_weights: WeightsDescriptor | None
     learner_metrics: tuple[tuple[str, float], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LearnerHostCheckpoint:
+    """Opaque learner-owned state plus its authoritative replay cursor."""
+
+    replay_cursor: ReplayCursor
+    payload: bytes
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.replay_cursor, ReplayCursor):
+            raise TypeError("learner checkpoint replay_cursor is invalid")
+        if not isinstance(self.payload, bytes) or not self.payload:
+            raise ValueError("learner checkpoint payload must be non-empty bytes")
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +132,7 @@ class LearnerHost:
         batch_queue_capacity: int,
         batch_seed: int,
         replay_sync_max_bytes: int,
+        checkpoint_state: Mapping[str, Any] | bytes | None = None,
     ) -> None:
         if not isinstance(config, SACConfig):
             raise TypeError("config must be an SACConfig")
@@ -110,6 +151,7 @@ class LearnerHost:
 
         self._replay_actor = replay_actor
         self._codec = codec
+        self._member_id = member_id
         self._sync_max_bytes = replay_sync_max_bytes
         self._fast_replay = FastReplay(codec)
         snapshot = ray.get(self._replay_actor.get_snapshot.remote())
@@ -142,6 +184,7 @@ class LearnerHost:
 
         self._state = LearnerHostState.CREATED
         self._started_at: float | None = None
+        self._rate_base_learner_updates = 0
         self._sync_requests = 0
         self._snapshot_loads = 1
         self._delta_transactions = 0
@@ -154,6 +197,18 @@ class LearnerHost:
             initial_weights.module_versions.values(),
             default=0,
         )
+        if checkpoint_state is not None:
+            try:
+                if isinstance(checkpoint_state, bytes):
+                    checkpoint_state = decode_learner_host_checkpoint(checkpoint_state)
+                self._restore_checkpoint_state(checkpoint_state)
+            except Exception:
+                assert self._producer is not None
+                assert self._adapter is not None
+                self._producer.stop()
+                self._adapter.close()
+                self._fast_replay.close()
+                raise
 
     def start(self) -> None:
         if self._state is LearnerHostState.RUNNING:
@@ -220,6 +275,7 @@ class LearnerHost:
         *,
         sampled_env_steps: int,
         sampled_agent_steps: int,
+        max_updates: int | None = None,
         timeout_s: float | None = None,
     ) -> LearnerHostTick:
         """Reach current replay, pause production, and consume queued batches."""
@@ -231,6 +287,12 @@ class LearnerHost:
             raise LearnerHostError(
                 f"cannot drain learner host in state {self._state.value!r}"
             )
+        if max_updates is not None and (
+            not isinstance(max_updates, int)
+            or isinstance(max_updates, bool)
+            or max_updates < 0
+        ):
+            raise ValueError("max_updates must be non-negative or None")
         deadline = self._deadline(timeout_s)
         synced_transactions = 0
         has_more = True
@@ -246,7 +308,7 @@ class LearnerHost:
             if self._state is LearnerHostState.RUNNING:
                 self._producer.pause(timeout=self._remaining(deadline))
                 self._state = LearnerHostState.PAUSED
-            queued = self._drain_queued_batches()
+            queued = self._drain_queued_batches(max_batches=max_updates)
             tick = self._consume_batches(
                 queued,
                 sampled_env_steps=sampled_env_steps,
@@ -298,12 +360,47 @@ class LearnerHost:
             learner_updates=self._adapter.learner_updates,
             updates_skipped_learning_start=(self._updates_skipped_learning_start),
             weight_publications=self._weight_publications,
-            updates_per_s=(self._adapter.learner_updates / elapsed if elapsed else 0.0),
+            updates_per_s=(
+                (self._adapter.learner_updates - self._rate_base_learner_updates)
+                / elapsed
+                if elapsed
+                else 0.0
+            ),
             latest_module_version=self._latest_module_version,
             last_learner_metrics=self._last_learner_metrics,
             fast_replay=self._fast_replay.get_stats(),
             batch_producer=self._producer.get_stats(),
         )
+
+    def get_checkpoint_state(self) -> dict[str, Any]:
+        """Return learner state without serializing the derived replay view."""
+
+        self._require_state(LearnerHostState.PAUSED)
+        assert self._adapter is not None
+        assert self._producer is not None
+        replay = self._fast_replay.get_stats()
+        if (
+            replay.cursor is None
+            or replay.active_cursor != replay.cursor
+            or replay.rebuild_in_progress
+        ):
+            raise LearnerHostError(
+                "learner-local replay must be fully materialized before checkpoint"
+            )
+        return {
+            "state_version": LEARNER_HOST_CHECKPOINT_VERSION,
+            "member_id": self._member_id,
+            "replay_cursor": replay.cursor,
+            "adapter": self._adapter.get_state(),
+            "sampler_rng_state": self._producer.get_rng_state(),
+            "sync_requests": self._sync_requests,
+            "snapshot_loads": self._snapshot_loads,
+            "delta_transactions": self._delta_transactions,
+            "full_resyncs": self._full_resyncs,
+            "updates_skipped_learning_start": (self._updates_skipped_learning_start),
+            "weight_publications": self._weight_publications,
+            "last_learner_metrics": self._last_learner_metrics,
+        }
 
     def stop(self, *, timeout_s: float | None = None) -> None:
         if self._state is LearnerHostState.STOPPED:
@@ -422,14 +519,90 @@ class LearnerHost:
             learner_metrics=last_metrics,
         )
 
-    def _drain_queued_batches(self) -> list[FlatBatch]:
+    def _drain_queued_batches(
+        self,
+        *,
+        max_batches: int | None = None,
+    ) -> list[FlatBatch]:
         assert self._producer is not None
         batches: list[FlatBatch] = []
-        while True:
+        while max_batches is None or len(batches) < max_batches:
             try:
                 batches.append(self._producer.get(timeout=0.0))
             except BatchQueueEmptyError:
-                return batches
+                break
+        self._producer.drain()
+        return batches
+
+    def _restore_checkpoint_state(self, state: Mapping[str, Any]) -> None:
+        if not isinstance(state, Mapping):
+            raise ValueError("learner host checkpoint state must be a mapping")
+        if state.get("state_version") != LEARNER_HOST_CHECKPOINT_VERSION:
+            raise ValueError("unsupported learner host checkpoint state version")
+        if state.get("member_id") != self._member_id:
+            raise ValueError("learner host checkpoint member_id does not match")
+
+        replay_cursor = state.get("replay_cursor")
+        replay = self._fast_replay.get_stats()
+        if (
+            replay_cursor is None
+            or replay.cursor != replay_cursor
+            or replay.active_cursor != replay_cursor
+        ):
+            raise ValueError(
+                "learner host checkpoint does not match authoritative replay"
+            )
+
+        adapter_state = state.get("adapter")
+        if not isinstance(adapter_state, Mapping):
+            raise ValueError("learner host checkpoint adapter state is invalid")
+        assert self._adapter is not None
+        assert self._producer is not None
+        self._adapter.set_state(adapter_state)
+        self._rate_base_learner_updates = self._adapter.learner_updates
+        self._producer.set_rng_state(state.get("sampler_rng_state"))
+
+        self._sync_requests = self._checkpoint_counter(state, "sync_requests")
+        self._snapshot_loads = self._checkpoint_counter(state, "snapshot_loads") + 1
+        self._delta_transactions = self._checkpoint_counter(
+            state,
+            "delta_transactions",
+        )
+        self._full_resyncs = self._checkpoint_counter(state, "full_resyncs")
+        self._updates_skipped_learning_start = self._checkpoint_counter(
+            state,
+            "updates_skipped_learning_start",
+        )
+        self._weight_publications = self._checkpoint_counter(
+            state,
+            "weight_publications",
+        )
+
+        metrics = state.get("last_learner_metrics")
+        if not isinstance(metrics, tuple) or any(
+            not isinstance(item, tuple)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or not isinstance(item[1], int | float)
+            or isinstance(item[1], bool)
+            or not math.isfinite(item[1])
+            for item in metrics
+        ):
+            raise ValueError("learner host checkpoint metrics are invalid")
+        self._last_learner_metrics = metrics
+
+        weights = self._adapter.get_published_weights()
+        self._latest_module_version = max(
+            weights.module_versions.values(),
+            default=0,
+        )
+
+    @staticmethod
+    def _checkpoint_counter(state: Mapping[str, Any], name: str) -> int:
+        value = state.get(name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"learner host checkpoint {name} is invalid")
+        return value
 
     @classmethod
     def _extract_numeric_metrics(
@@ -518,6 +691,13 @@ class LearnerHostActor:
 
     def get_stats(self) -> LearnerHostStats:
         return self._host.get_stats()
+
+    def get_checkpoint(self) -> LearnerHostCheckpoint:
+        state = self._host.get_checkpoint_state()
+        return LearnerHostCheckpoint(
+            replay_cursor=state["replay_cursor"],
+            payload=encode_learner_host_checkpoint(state),
+        )
 
     def stop(self, **kwargs: Any) -> None:
         self._host.stop(**kwargs)

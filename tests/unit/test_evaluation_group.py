@@ -194,3 +194,47 @@ def test_evaluation_round_is_frozen_and_has_no_replay_dependency(monkeypatch) ->
         assert stats.latest_return_mean == 2.0
     finally:
         group.stop()
+
+
+def test_evaluation_checkpoint_preserves_completed_round_metrics(monkeypatch) -> None:
+    install_fake_ray(monkeypatch)
+    group = AsyncEvaluationGroup(
+        make_sac_config(),
+        FlatEpisodeCodec(),
+        member_id="member-0",
+        initial_weights=make_weights(1),
+        episode_count=2,
+        max_episode_steps=10,
+        num_cpus_per_runner=0,
+    )
+    restored = None
+    try:
+        group.start_round(make_weights(1))
+        result = group.drain(timeout_s=1)
+        assert result is not None
+        checkpoint = group.get_checkpoint_state()
+
+        install_fake_ray(monkeypatch)
+        restored = AsyncEvaluationGroup(
+            make_sac_config(),
+            FlatEpisodeCodec(),
+            member_id="member-0",
+            initial_weights=make_weights(2),
+            episode_count=2,
+            max_episode_steps=10,
+            num_cpus_per_runner=0,
+            checkpoint_state=checkpoint,
+        )
+        recovered = restored.get_stats()
+        assert recovered.rounds_completed == 1
+        assert recovered.episodes_completed == 2
+        assert recovered.latest_module_version == 1
+        assert recovered.latest_return_mean == 1.0
+
+        assert restored.start_round(make_weights(2)) == 1
+        restored.drain(timeout_s=1)
+        assert restored.get_stats().rounds_completed == 2
+    finally:
+        group.stop()
+        if restored is not None:
+            restored.stop()
