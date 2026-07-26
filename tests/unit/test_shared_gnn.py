@@ -206,6 +206,47 @@ def test_graph_codec_strips_padding_and_reuses_module_replay_views() -> None:
         fast.close()
 
 
+@pytest.mark.parametrize("feature_name", [NODE_FEATURES, EDGE_FEATURES])
+def test_graph_codec_rejects_values_that_overflow_float32(
+    feature_name: str,
+) -> None:
+    valid_graph = {
+        NODE_FEATURES: np.zeros((1, 1), dtype=np.float64),
+        EDGE_INDEX: np.asarray([[0], [0]], dtype=np.int64),
+        EDGE_FEATURES: np.zeros((1, 1), dtype=np.float64),
+        CONTROLLED_NODE: np.int64(0),
+    }
+    invalid_graph = {
+        **valid_graph,
+        feature_name: valid_graph[feature_name].copy(),
+    }
+    invalid_graph[feature_name][0, 0] = 1e40
+    transition = MultiModuleTransition(
+        env_t=0,
+        agent_t=0,
+        agent_id="agent_0",
+        module_id=SHARED_GNN_MODULE_ID,
+        data={
+            Columns.OBS: invalid_graph,
+            Columns.NEXT_OBS: valid_graph,
+            Columns.ACTIONS: np.int64(0),
+            Columns.REWARDS: 0.0,
+            Columns.TERMINATEDS: True,
+            Columns.TRUNCATEDS: False,
+        },
+    )
+    codec = GraphEpisodeCodec(
+        node_feature_dim=1,
+        edge_feature_dim=1,
+    )
+
+    with pytest.raises(
+        EpisodeValidationError,
+        match=rf"{feature_name}.*representable as float32",
+    ):
+        codec.encode([transition])
+
+
 def test_graph_batch_collates_empty_edges_one_node_and_different_sizes() -> None:
     env = EgoGraphCoordinationEnv({"agent_count": 4, "episode_length": 4})
     observations, _ = env.reset(seed=20260726)

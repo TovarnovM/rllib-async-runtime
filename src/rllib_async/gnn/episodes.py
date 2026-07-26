@@ -133,9 +133,9 @@ def normalize_graph_observation(observation: object) -> dict[str, Any]:
     if edge_count < 0 or edge_count > edge_index.shape[1]:
         raise EpisodeValidationError("edge_count is outside edge_index padding")
 
-    node_features = np.ascontiguousarray(
+    node_features = _float32_array(
         node_features[:node_count],
-        dtype=np.float32,
+        name=NODE_FEATURES,
     )
     edge_index = np.ascontiguousarray(
         edge_index[:, :edge_count],
@@ -175,9 +175,9 @@ def normalize_graph_observation(observation: object) -> dict[str, Any]:
             raise EpisodeValidationError(
                 "edge_features must align with edge_index and have features"
             )
-        normalized[EDGE_FEATURES] = np.ascontiguousarray(
+        normalized[EDGE_FEATURES] = _float32_array(
             edge_features[:edge_count],
-            dtype=np.float32,
+            name=EDGE_FEATURES,
         )
 
     action_mask_raw = observation.get(ACTION_MASK)
@@ -332,6 +332,16 @@ def _real_array(value: object, *, name: str, ndim: int) -> np.ndarray:
     if not np.isfinite(array).all():
         raise EpisodeValidationError(f"{name} must contain finite values")
     return array
+
+
+def _float32_array(array: np.ndarray, *, name: str) -> np.ndarray:
+    with np.errstate(over="ignore", invalid="ignore"):
+        normalized = np.ascontiguousarray(array, dtype=np.float32)
+    if not np.isfinite(normalized).all():
+        raise EpisodeValidationError(
+            f"{name} must contain values representable as float32"
+        )
+    return normalized
 
 
 def _integer_scalar(value: object, *, name: str) -> int:
