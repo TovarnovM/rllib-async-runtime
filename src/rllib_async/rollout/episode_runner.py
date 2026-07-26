@@ -114,35 +114,46 @@ def make_episode_id(
     return f"{member_id}/{runner_id}/{runner_generation}/{local_episode_seq}"
 
 
-def _accept_weight_publication(
+def accept_weight_publication(
     current: WeightsDescriptor | None,
     candidate: WeightsDescriptor,
     *,
     member_id: str,
+    module_ids: set[str],
 ) -> bool:
     if not isinstance(candidate, WeightsDescriptor):
         raise TypeError("weights must be a WeightsDescriptor")
     if candidate.member_id != member_id:
         raise WeightVersionError("weights belong to a different member")
-    if set(candidate.module_versions) != {DEFAULT_MODULE_ID}:
-        raise WeightVersionError("Phase 5 supports exactly one default_policy module")
-    if not isinstance(candidate.state, Mapping) or set(candidate.state) != {
-        DEFAULT_MODULE_ID
-    }:
-        raise WeightVersionError(
-            "weight state must contain exactly the default_policy module"
-        )
+    if set(candidate.module_versions) != module_ids:
+        raise WeightVersionError("weight module versions do not match the runner")
+    if not isinstance(candidate.state, Mapping) or set(candidate.state) != module_ids:
+        raise WeightVersionError("weight state module IDs do not match the runner")
     if current is None:
         return True
 
-    current_version = current.module_versions[DEFAULT_MODULE_ID]
-    candidate_version = candidate.module_versions[DEFAULT_MODULE_ID]
-    if candidate_version < current_version:
+    current_versions = dict(current.module_versions)
+    candidate_versions = dict(candidate.module_versions)
+    older = {
+        module_id
+        for module_id in module_ids
+        if candidate_versions[module_id] < current_versions[module_id]
+    }
+    newer = {
+        module_id
+        for module_id in module_ids
+        if candidate_versions[module_id] > current_versions[module_id]
+    }
+    if older and newer:
+        raise WeightVersionError(
+            "one publication cannot mix older and newer module versions"
+        )
+    if older:
         return False
-    if candidate_version == current_version:
+    if not newer:
         if candidate.learner_updates != current.learner_updates:
             raise WeightVersionError(
-                "one module version cannot identify multiple publications"
+                "one module-version vector cannot identify multiple publications"
             )
         return False
     if candidate.learner_updates < current.learner_updates:
@@ -238,10 +249,11 @@ class EpisodeRunner:
         """Install a strictly newer publication at an episode boundary."""
 
         self._require_open()
-        if not _accept_weight_publication(
+        if not accept_weight_publication(
             self._weights,
             weights,
             member_id=self._member_id,
+            module_ids={DEFAULT_MODULE_ID},
         ):
             return False
 

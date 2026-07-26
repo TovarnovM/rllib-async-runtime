@@ -185,9 +185,7 @@ class CheckpointableSACTorchLearner(SACTorchLearner):
         return validated
 
 
-def build_rllib_sac_batch(batch: Mapping[str, np.ndarray]) -> MultiAgentBatch:
-    """Validate one flat NumPy batch and build RLlib's exact SAC input."""
-
+def _build_sac_sample_batch(batch: Mapping[str, np.ndarray]) -> SampleBatch:
     if not isinstance(batch, Mapping):
         raise SACBatchError("SAC batch must be a mapping")
     missing = set(_REQUIRED_BATCH_COLUMNS) - set(batch)
@@ -250,9 +248,35 @@ def build_rllib_sac_batch(batch: Mapping[str, np.ndarray]) -> MultiAgentBatch:
         raise SACBatchError("column 'weights' must contain finite non-negative scalars")
     arrays["weights"] = np.ascontiguousarray(weights, dtype=np.float32)
 
+    return SampleBatch(arrays)
+
+
+def build_rllib_sac_batch(batch: Mapping[str, np.ndarray]) -> MultiAgentBatch:
+    """Validate one flat NumPy batch and build RLlib's exact SAC input."""
+
+    sample_batch = _build_sac_sample_batch(batch)
     return MultiAgentBatch(
-        {DEFAULT_MODULE_ID: SampleBatch(arrays)},
-        env_steps=batch_size,
+        {DEFAULT_MODULE_ID: sample_batch},
+        env_steps=sample_batch.count,
+    )
+
+
+def build_rllib_multi_module_sac_batch(
+    batches: Mapping[str, Mapping[str, np.ndarray]],
+) -> MultiAgentBatch:
+    """Validate independent flat batches for one heterogeneous MultiRLModule."""
+
+    if not isinstance(batches, Mapping) or not batches:
+        raise SACBatchError("multi-module SAC batches must be a non-empty mapping")
+    if any(not isinstance(module_id, str) or not module_id for module_id in batches):
+        raise SACBatchError("module IDs must be non-empty strings")
+    sample_batches = {
+        module_id: _build_sac_sample_batch(batch)
+        for module_id, batch in batches.items()
+    }
+    return MultiAgentBatch(
+        sample_batches,
+        env_steps=max(batch.count for batch in sample_batches.values()),
     )
 
 
@@ -324,13 +348,13 @@ class SACLearnerAdapter:
         self._last_published_update = 0
 
         module_state = self._get_inference_module_state()
-        if set(module_state) != {DEFAULT_MODULE_ID}:
+        if not set(module_state).issubset(spaces):
             self._learner_group.shutdown()
             self._closed = True
             raise SACLearnerAdapterError(
-                "Phase 4 supports exactly one default_policy SAC module"
+                "RLlib learner module IDs are missing configured spaces"
             )
-        self._module_versions = {DEFAULT_MODULE_ID: 0}
+        self._module_versions = {module_id: 0 for module_id in sorted(module_state)}
         self._latest_weights = self._new_descriptor(
             module_state,
             module_versions=self._module_versions,
@@ -363,6 +387,64 @@ class SACLearnerAdapter:
         """Perform at most one RLlib update at absolute sampled-step counters."""
 
         self._require_open()
+        if set(self._module_versions) != {DEFAULT_MODULE_ID}:
+            raise SACBatchError(
+                "update() requires a single default module; "
+                "use update_modules() for a heterogeneous learner"
+            )
+        sampled_agent_steps, should_update = self._begin_update(
+            sampled_env_steps=sampled_env_steps,
+            sampled_agent_steps=sampled_agent_steps,
+        )
+        if not should_update:
+            return self._skipped_update_result(
+                sampled_env_steps=sampled_env_steps,
+                sampled_agent_steps=sampled_agent_steps,
+            )
+        return self._perform_update(
+            build_rllib_sac_batch(batch),
+            sampled_env_steps=sampled_env_steps,
+            sampled_agent_steps=sampled_agent_steps,
+        )
+
+    def update_modules(
+        self,
+        batches: Mapping[str, Mapping[str, np.ndarray]],
+        *,
+        sampled_env_steps: int,
+        sampled_agent_steps: int,
+    ) -> SACUpdateResult:
+        """Update every configured SAC module from its own sampled batch view."""
+
+        self._require_open()
+        if not isinstance(batches, Mapping) or not batches:
+            raise SACBatchError("multi-module SAC batches must be a non-empty mapping")
+        if set(batches) != set(self._module_versions):
+            raise SACBatchError(
+                "multi-module batch IDs must match the learner module IDs"
+            )
+        sampled_agent_steps, should_update = self._begin_update(
+            sampled_env_steps=sampled_env_steps,
+            sampled_agent_steps=sampled_agent_steps,
+        )
+        if not should_update:
+            return self._skipped_update_result(
+                sampled_env_steps=sampled_env_steps,
+                sampled_agent_steps=sampled_agent_steps,
+            )
+        return self._perform_update(
+            build_rllib_multi_module_sac_batch(batches),
+            sampled_env_steps=sampled_env_steps,
+            sampled_agent_steps=sampled_agent_steps,
+        )
+
+    def _begin_update(
+        self,
+        *,
+        sampled_env_steps: int,
+        sampled_agent_steps: int | None,
+    ) -> tuple[int, bool]:
+        self._require_open()
         sampled_agent_steps = (
             sampled_env_steps if sampled_agent_steps is None else sampled_agent_steps
         )
@@ -384,17 +466,15 @@ class SACLearnerAdapter:
             if self._config.count_steps_by == "agent_steps"
             else sampled_env_steps
         )
-        if threshold_steps < self._learning_starts:
-            return SACUpdateResult(
-                performed=False,
-                learner_updates=self._learner_updates,
-                sampled_env_steps=sampled_env_steps,
-                sampled_agent_steps=sampled_agent_steps,
-                learner_results=None,
-                published_weights=None,
-            )
+        return sampled_agent_steps, threshold_steps >= self._learning_starts
 
-        learner_batch = build_rllib_sac_batch(batch)
+    def _perform_update(
+        self,
+        learner_batch: MultiAgentBatch,
+        *,
+        sampled_env_steps: int,
+        sampled_agent_steps: int,
+    ) -> SACUpdateResult:
         learner_results = self._learner_group.update(
             batch=learner_batch,
             timesteps={
@@ -411,6 +491,21 @@ class SACLearnerAdapter:
             sampled_agent_steps=sampled_agent_steps,
             learner_results=learner_results,
             published_weights=published_weights,
+        )
+
+    def _skipped_update_result(
+        self,
+        *,
+        sampled_env_steps: int,
+        sampled_agent_steps: int,
+    ) -> SACUpdateResult:
+        return SACUpdateResult(
+            performed=False,
+            learner_updates=self._learner_updates,
+            sampled_env_steps=sampled_env_steps,
+            sampled_agent_steps=sampled_agent_steps,
+            learner_results=None,
+            published_weights=None,
         )
 
     def maybe_publish_weights(

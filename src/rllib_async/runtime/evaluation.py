@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import ray
 from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
+from ray.rllib.core import DEFAULT_MODULE_ID
 
 from rllib_async.protocols import (
     FlatEpisodeCodec,
@@ -19,7 +20,7 @@ from rllib_async.protocols import (
     WeightsDescriptor,
 )
 from rllib_async.rollout import EpisodeRolloutActor, EpisodeRolloutResult
-from rllib_async.rollout.episode_runner import _accept_weight_publication
+from rllib_async.rollout.episode_runner import accept_weight_publication
 
 EVALUATION_GROUP_CHECKPOINT_VERSION = 1
 
@@ -112,10 +113,11 @@ class AsyncEvaluationGroup:
             or num_cpus_per_runner < 0
         ):
             raise ValueError("num_cpus_per_runner must be finite and non-negative")
-        _accept_weight_publication(
+        accept_weight_publication(
             None,
             initial_weights,
             member_id=member_id,
+            module_ids={DEFAULT_MODULE_ID},
         )
 
         self._config = config.copy(copy_frozen=False)
@@ -178,10 +180,11 @@ class AsyncEvaluationGroup:
         self._require_open()
         if self._pending:
             raise EvaluationGroupError("an evaluation round is already in progress")
-        accepted = _accept_weight_publication(
+        accepted = accept_weight_publication(
             self._latest_weights,
             weights,
             member_id=self._member_id,
+            module_ids={DEFAULT_MODULE_ID},
         )
         current_versions = self._latest_weights.module_versions
         candidate_versions = weights.module_versions

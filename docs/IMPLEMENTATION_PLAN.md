@@ -1,7 +1,7 @@
 # `rllib-async-runtime`: подробный план реализации
 
-**Статус:** Phase 0–7 реализованы; следующий этап — две особи и общий replay
-в Phase 8
+**Статус:** Phase 0–7 реализованы; код Phase 8 слит с открытым two-GPU debt;
+Phase 9 hierarchy реализована; следующий этап — shared-GNN в Phase 10
 
 **Дата фиксации:** 24 июля 2026
 
@@ -239,12 +239,13 @@ class EpisodeCodec(Protocol):
     def estimate_bytes(self, episode: EpisodeEnvelope) -> int: ...
 ```
 
-На первом этапе нужны два codec:
+Реализованы:
 
 - `FlatEpisodeCodec` для обычного continuous-control env;
-- `GraphEpisodeCodec` для GNN example.
+- `MultiModuleEpisodeCodec` для sparse hierarchy.
 
-Нельзя добавлять registry/plugins до появления третьего реального codec.
+`GraphEpisodeCodec` остаётся задачей Phase 10. Registry/plugins не нужны:
+выбор codec остаётся явным на границе runtime.
 
 ## 5.3. `ReplayActor`
 
@@ -349,11 +350,12 @@ class BatchCollator(Protocol):
     def collate(self, transitions: Sequence[object]) -> LearnerBatch: ...
 ```
 
-Реализации `v0.1`:
+Реализованы:
 
 - `FlatBatchCollator`;
-- `GraphBatchCollator`;
 - `MultiModuleBatchCollator` для hierarchy example.
+
+`GraphBatchCollator` остаётся задачей Phase 10.
 
 Pinned memory применяется только к уже собранному tensor batch. Произвольный
 Python replay нельзя считать pinned или zero-copy.
@@ -632,7 +634,9 @@ rllib-async-runtime/
 │       ├── 0007-rllib-sac-learner-adapter.md
 │       ├── 0008-episode-rollout-and-version-sync.md
 │       ├── 0009-single-member-async-sac.md
-│       └── 0010-coordinated-member-recovery.md
+│       ├── 0010-coordinated-member-recovery.md
+│       ├── 0011-two-member-shared-replay-population.md
+│       └── 0012-sparse-hierarchy-and-module-replay.md
 ├── examples/
 │   ├── async_sac_pendulum.py
 │   ├── async_sac_throughput.py
@@ -1010,6 +1014,16 @@ Phase 3 разделён на correctness-first Phase 3A и асинхронны
 
 ## Phase 9. Hierarchy example
 
+### Задачи
+
+1. [x] Проверить heterogeneous `MultiRLModule`: discrete SAC manager и два
+   continuous SAC workers.
+2. [x] Реализовать finite sparse-turn environment и RLlib rollout adapter.
+3. [x] Сохранить `env_t`, `agent_t`, `agent_id`, `module_id` и версии весов.
+4. [x] Добавить module-specific uniform views в reference и `FastReplay`.
+5. [x] Добавить multi-module collator и stock RLlib learner update.
+6. [x] Проверить delta/FIFO eviction и checkpoint→restore smoke.
+
 ### Семантика
 
 - manager действует раз в `K` environment steps;
@@ -1027,13 +1041,11 @@ workers удобно делать continuous SAC policies. Не нужно ск�
 
 Порядок решения:
 
-1. На Phase 0 проверить discrete SAC и heterogeneous `MultiRLModule` в
-   зафиксированном RLlib.
-2. Если поддержка достаточна — использовать её.
-3. Если нет — для `v0.1` сделать явно помеченный continuous gate manager
-   только как pipeline demo.
-4. Настоящий `DQN manager + SAC workers` перенести в следующую версию после
-   появления AsyncDQN.
+1. Проверка в зафиксированном RLlib 2.56.1 прошла.
+2. Используется настоящий `Discrete(2)` SAC manager и continuous SAC workers.
+3. Continuous proxy manager не потребовался.
+4. `DQN manager + SAC workers` остаётся за пределами `v0.1` до появления
+   AsyncDQN.
 
 ### Критерии готовности
 
@@ -1347,7 +1359,7 @@ Success criterion первого PR:
 - [x] Phase 6 single-member AsyncSAC.
 - [x] Phase 7 checkpoint/recovery.
 - [ ] Phase 8 two-member population.
-- [ ] Phase 9 hierarchy example.
+- [x] Phase 9 hierarchy example.
 - [ ] Phase 10 shared-GNN example.
 - [ ] Phase 11 performance gate/documentation.
 

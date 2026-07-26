@@ -4,17 +4,17 @@ Experimental Ray-native asynchronous off-policy runtime built on RLlib.
 
 > Experimental project built on Ray/RLlib; not an official Ray project.
 
-The project has completed its bootstrap through single-member recovery. The
-Phase 8 candidate adds two concurrent fixed-config Tune members sharing one
-authoritative replay; its dedicated two-GPU acceptance test must still pass on
-the target workstation before the phase is complete. The project also contains
-the RLlib compatibility gates, deterministic replay reference model, a
-serialized Ray `ReplayActor`, atomic trusted-local replay checkpoints,
-reader-safe background `FastReplay` index publication, a bounded local batch
-pipeline, a checkpoint-complete local SAC adapter, version-aware asynchronous
-rollout, replay-isolated evaluation, and a Tune-compatible end-to-end event
-pump. It does **not** yet implement PBT exploit/explore, hierarchy, or graph
-encoders.
+The project has completed its bootstrap through single-member recovery.
+Phase 8 adds two concurrent fixed-config Tune members sharing one authoritative
+replay; its dedicated two-GPU acceptance test remains recorded in
+[`debt.md`](debt.md). Phase 9 adds a sparse hierarchy example with one
+discrete manager, two continuous workers, module-specific replay views, and a
+heterogeneous stock RLlib SAC learner. The project also contains deterministic
+replay oracles, a serialized Ray `ReplayActor`, atomic trusted-local replay
+checkpoints, reader-safe background `FastReplay` index publication, a bounded
+local batch pipeline, version-aware asynchronous rollout, replay-isolated
+evaluation, and a Tune-compatible end-to-end event pump. It does **not** yet
+implement PBT exploit/explore or graph encoders.
 
 ## Development contract
 
@@ -310,6 +310,35 @@ Each Tune trial writes only `member.snapshot`. After both trials terminate,
 `PopulationLauncher.save_checkpoint()` publishes the shared replay once.
 Periodic checkpoints while both trials remain live require a future
 cross-trial coordination protocol and are not claimed by Phase 8.
+
+## Phase 9 sparse hierarchy example
+
+Phase 9 provides:
+
+- a finite `MultiAgentEnv` where a `Discrete(2)` manager selects one of two
+  continuous workers every three environment steps;
+- sparse observation/action turns: the inactive worker produces no fabricated
+  replay transition;
+- an RLlib `MultiAgentEnvRunner` adapter preserving `env_t`, per-agent
+  `agent_t`, `agent_id`, `module_id`, and behavior-weight versions;
+- `MultiModuleEpisodeCodec` and uniform module-specific indexes in both
+  `ReferenceFastReplay` and `FastReplay`;
+- a collator and `SACLearnerAdapter` path that update all three heterogeneous
+  stock SAC modules in one `MultiAgentBatch`;
+- delta/FIFO-eviction coverage and a bounded replay plus learner
+  checkpoint/restore smoke test.
+
+Run the CPU example inside the devcontainer:
+
+```bash
+uv run --locked --extra cu118 --group dev \
+  python examples/hierarchy_three_policies.py --episodes 20
+```
+
+The three rollout module versions advance together because the pinned RLlib
+multi-agent runner installs one sequence number for a complete module state.
+The example proves the sparse hierarchy/replay/learner boundary; it does not
+claim a generic production hierarchy framework or a DQN manager.
 
 ## Architecture
 

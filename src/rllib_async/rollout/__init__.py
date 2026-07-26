@@ -6,6 +6,7 @@ from rllib_async.rollout.episode_runner import (
     EpisodeRunner,
     EpisodeRunnerError,
     WeightVersionError,
+    accept_weight_publication,
     make_episode_id,
 )
 from rllib_async.rollout.group import (
@@ -16,6 +17,7 @@ from rllib_async.rollout.group import (
     RolloutGroupState,
     RolloutGroupStats,
 )
+from rllib_async.rollout.multi_module import MultiModuleEpisodeRunner
 
 __all__ = [
     "AsyncRolloutGroup",
@@ -24,10 +26,12 @@ __all__ = [
     "EpisodeRolloutResult",
     "EpisodeRunner",
     "EpisodeRunnerError",
+    "MultiModuleEpisodeRunner",
     "RolloutCompletion",
     "RolloutGroupError",
     "RolloutGroupState",
     "RolloutGroupStats",
     "WeightVersionError",
+    "accept_weight_publication",
     "make_episode_id",
 ]

@@ -415,6 +415,7 @@ class SingleMemberAsyncSAC:
         ):
             replay_values[name] = dict(replay_values[name])
         for name in (
+            "active_module_transition_counts",
             "active_producer_episode_counts",
             "active_producer_transition_counts",
         ):

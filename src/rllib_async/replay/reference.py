@@ -11,7 +11,12 @@ from collections import Counter, OrderedDict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from rllib_async.protocols.episodes import EpisodeCodec, EpisodeEnvelope
+from rllib_async.protocols.episodes import (
+    EpisodeCodec,
+    EpisodeEnvelope,
+    ModuleEpisodeCodec,
+    MultiModuleTransition,
+)
 from rllib_async.protocols.replay import (
     CommitAck,
     ReplayCursor,
@@ -830,6 +835,31 @@ class ReferenceFastReplay:
     def episode_ids(self) -> tuple[str, ...]:
         return tuple(self._episodes)
 
+    @property
+    def module_ids(self) -> tuple[str, ...]:
+        codec = self._module_codec()
+        return tuple(
+            sorted(
+                {
+                    module_id
+                    for episode in self._episodes.values()
+                    for module_id in codec.module_ids(episode)
+                }
+            )
+        )
+
+    @property
+    def module_transition_counts(self) -> tuple[tuple[str, int], ...]:
+        codec = self._module_codec()
+        counts: Counter[str] = Counter()
+        for episode in self._episodes.values():
+            for module_id in codec.module_ids(episode):
+                counts[module_id] += codec.module_transition_count(
+                    episode,
+                    module_id,
+                )
+        return tuple(sorted(counts.items()))
+
     def load_snapshot(self, snapshot: ReplaySnapshot) -> None:
         episodes: OrderedDict[str, EpisodeEnvelope] = OrderedDict()
         total_transitions = 0
@@ -941,6 +971,78 @@ class ReferenceFastReplay:
             for episode_id, index in self.sample_coordinates(batch_size, rng=rng)
         ]
 
+    def sample_module_coordinates(
+        self,
+        module_id: str,
+        batch_size: int,
+        *,
+        rng: random.Random,
+    ) -> list[tuple[str, int]]:
+        codec = self._module_codec()
+        if not isinstance(module_id, str) or not module_id:
+            raise ValueError("module_id must be a non-empty string")
+        if (
+            not isinstance(batch_size, int)
+            or isinstance(batch_size, bool)
+            or batch_size < 1
+        ):
+            raise ValueError("batch_size must be a positive integer")
+        episode_ids: list[str] = []
+        cumulative_lengths: list[int] = []
+        total_transitions = 0
+        for episode_id, episode in self._episodes.items():
+            if module_id not in codec.module_ids(episode):
+                continue
+            total_transitions += codec.module_transition_count(
+                episode,
+                module_id,
+            )
+            episode_ids.append(episode_id)
+            cumulative_lengths.append(total_transitions)
+        if total_transitions == 0:
+            raise KeyError(module_id)
+
+        coordinates: list[tuple[str, int]] = []
+        for _ in range(batch_size):
+            flat_index = rng.randrange(total_transitions)
+            episode_index = bisect_right(cumulative_lengths, flat_index)
+            episode_start = (
+                cumulative_lengths[episode_index - 1] if episode_index else 0
+            )
+            coordinates.append(
+                (
+                    episode_ids[episode_index],
+                    flat_index - episode_start,
+                )
+            )
+        return coordinates
+
+    def sample_module(
+        self,
+        module_id: str,
+        batch_size: int,
+        *,
+        rng: random.Random,
+    ) -> list[MultiModuleTransition]:
+        codec = self._module_codec()
+        return [
+            codec.get_module_transition(
+                self._episodes[episode_id],
+                module_id,
+                index,
+            )
+            for episode_id, index in self.sample_module_coordinates(
+                module_id,
+                batch_size,
+                rng=rng,
+            )
+        ]
+
     def apply_deltas(self, deltas: Sequence[ReplayDelta]) -> None:
         for delta in deltas:
             self.apply_delta(delta)
+
+    def _module_codec(self) -> ModuleEpisodeCodec:
+        if not isinstance(self._codec, ModuleEpisodeCodec):
+            raise TypeError("the configured episode codec has no module-specific views")
+        return self._codec

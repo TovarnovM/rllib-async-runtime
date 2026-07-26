@@ -2,12 +2,17 @@
 
 from rllib_async.protocols.batches import BatchCollator
 from rllib_async.protocols.episodes import (
+    EncodedModuleTransition,
     EpisodeCodec,
     EpisodeEnvelope,
     EpisodeValidationError,
     FlatEpisodeCodec,
     FlatEpisodePayload,
     FrozenVersions,
+    ModuleEpisodeCodec,
+    MultiModuleEpisodeCodec,
+    MultiModuleEpisodePayload,
+    MultiModuleTransition,
     SchemaMismatchError,
 )
 from rllib_async.protocols.replay import (
@@ -24,12 +29,17 @@ from rllib_async.protocols.weights import WeightsDescriptor
 __all__ = [
     "BatchCollator",
     "CommitAck",
+    "EncodedModuleTransition",
     "EpisodeCodec",
     "EpisodeEnvelope",
     "EpisodeValidationError",
     "FlatEpisodeCodec",
     "FlatEpisodePayload",
     "FrozenVersions",
+    "ModuleEpisodeCodec",
+    "MultiModuleEpisodeCodec",
+    "MultiModuleEpisodePayload",
+    "MultiModuleTransition",
     "ReplayCheckpoint",
     "ReplayCursor",
     "ReplayDelta",

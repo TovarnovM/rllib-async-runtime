@@ -84,8 +84,9 @@ Phase 4 adds the algorithm boundary:
   CPU/CUDA RNG state under a checked config/space contract.
 
 The production learner subclass extends state serialization only. It does not
-override SAC loss or target-update behavior. The project still contains no
-hierarchy or graph encoder.
+override SAC loss or target-update behavior. Phase 4 itself assumes flat
+single-module batches; Phase 9 reuses the same learner boundary for a
+heterogeneous multi-module batch without changing SAC loss.
 
 Phase 5 adds the rollout boundary:
 
@@ -157,6 +158,25 @@ Phase 8 adds the population ownership boundary:
 - no PBT scheduler, exploit/explore, priorities, or lineage-aware mixing is
   present.
 
+Phase 9 adds the sparse hierarchy boundary:
+
+- a finite manager/worker environment exposes only the manager on its fixed
+  cadence and exactly one active worker on every environment step;
+- RLlib's `MultiAgentEnvRunner` remains responsible for policy execution and
+  `MultiAgentEpisode` construction;
+- rollout conversion records only real action turns and preserves `env_t`,
+  per-agent `agent_t`, agent/module identity, and behavior versions;
+- one immutable multi-module episode payload remains the authoritative
+  commit/eviction/checkpoint unit;
+- learner-local replay adds cumulative module indexes beside the global index,
+  without copying transition payloads or changing snapshot/delta publication;
+- the multi-module collator strips provenance only after sampling and sends one
+  heterogeneous `MultiAgentBatch` through the existing stock SAC learner;
+- all module rollout weights advance as one synchronized publication because
+  the pinned RLlib runner exposes one weight sequence number;
+- the example does not add DQN, generic hierarchy orchestration, or graph
+  encoders.
+
 See [ADR 0001](adr/0001-runtime-boundary.md) for the orchestration decision and
 [ADR 0002](adr/0002-episode-replay-quantum.md) and
 [ADR 0003](adr/0003-authoritative-and-reference-replay.md) for replay semantics.
@@ -177,4 +197,7 @@ the explicit loss boundary.
 [ADR 0011](adr/0011-two-member-shared-replay-population.md) records external
 replay ownership, fixed two-trial Tune topology, producer composition metrics,
 and single-copy population checkpoints.
+[ADR 0012](adr/0012-sparse-hierarchy-and-module-replay.md) records sparse
+manager/worker turns, heterogeneous SAC compatibility, module-specific replay
+indexes, synchronized publications, and checkpoint derivation.
 See [the implementation plan](IMPLEMENTATION_PLAN.md) for phase gates.

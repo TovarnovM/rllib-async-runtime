@@ -15,5 +15,5 @@ uv run --locked --extra cu118 --group dev \
 This debt is closed only when the command passes on the target two-GPU machine.
 Until then:
 
-- PR #11 must remain a draft;
+- the merged Phase 8 implementation remains hardware-unvalidated;
 - Phase 8 must remain unchecked in `docs/IMPLEMENTATION_PLAN.md`.

@@ -9,6 +9,7 @@ from rllib_async.learner.sac_adapter import (
     SACLearnerAdapter,
     SACLearnerAdapterError,
     SACUpdateResult,
+    build_rllib_multi_module_sac_batch,
     build_rllib_sac_batch,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "SACLearnerAdapter",
     "SACLearnerAdapterError",
     "SACUpdateResult",
+    "build_rllib_multi_module_sac_batch",
     "build_rllib_sac_batch",
 ]

@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 import ray
 from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
+from ray.rllib.core import DEFAULT_MODULE_ID
 
 from rllib_async.protocols import (
     CommitAck,
@@ -26,7 +27,7 @@ from rllib_async.rollout.episode_runner import (
     EpisodeRolloutMetrics,
     EpisodeRolloutResult,
     EpisodeRunner,
-    _accept_weight_publication,
+    accept_weight_publication,
     make_episode_id,
 )
 
@@ -207,10 +208,11 @@ class AsyncRolloutGroup:
             raise ValueError("num_cpus_per_runner must be finite and non-negative")
         if not isinstance(explore, bool):
             raise ValueError("explore must be a boolean")
-        _accept_weight_publication(
+        accept_weight_publication(
             None,
             initial_weights,
             member_id=member_id,
+            module_ids={DEFAULT_MODULE_ID},
         )
 
         self._config = config.copy(copy_frozen=False)
@@ -337,10 +339,11 @@ class AsyncRolloutGroup:
         """Publish weights for installation by each actor's next episode call."""
 
         self._require_not_stopped()
-        if not _accept_weight_publication(
+        if not accept_weight_publication(
             self._latest_weights,
             weights,
             member_id=self._member_id,
+            module_ids={DEFAULT_MODULE_ID},
         ):
             return False
         self._latest_weights = copy.deepcopy(weights)
