@@ -4,14 +4,17 @@ Experimental Ray-native asynchronous off-policy runtime built on RLlib.
 
 > Experimental project built on Ray/RLlib; not an official Ray project.
 
-The project has completed its bootstrap through single-member recovery.
-It contains the RLlib compatibility gates, deterministic replay reference
-model, a serialized Ray `ReplayActor`, atomic trusted-local replay checkpoints,
+The project has completed its bootstrap through single-member recovery. The
+Phase 8 candidate adds two concurrent fixed-config Tune members sharing one
+authoritative replay; its dedicated two-GPU acceptance test must still pass on
+the target workstation before the phase is complete. The project also contains
+the RLlib compatibility gates, deterministic replay reference model, a
+serialized Ray `ReplayActor`, atomic trusted-local replay checkpoints,
 reader-safe background `FastReplay` index publication, a bounded local batch
 pipeline, a checkpoint-complete local SAC adapter, version-aware asynchronous
 rollout, replay-isolated evaluation, and a Tune-compatible end-to-end event
-pump, and coordinated Tune checkpoint/recovery. It does **not** yet launch a
-population or implement hierarchy and graph encoders.
+pump. It does **not** yet implement PBT exploit/explore, hierarchy, or graph
+encoders.
 
 ## Development contract
 
@@ -264,6 +267,49 @@ checkpoint publication.
 
 With `AsyncSACTrainable`, Tune calls the same coordinated save/restore protocol
 through its standard checkpoint lifecycle.
+
+## Phase 8 two-member population
+
+Phase 8 provides:
+
+- one uniquely named detached `ReplayActor` created and owned by
+  `PopulationLauncher`;
+- exactly two fixed-config Tune trials with no PBT scheduler and no actor
+  reuse;
+- one independent learner actor, optimizer, weight namespace, batch pipeline,
+  and `FastReplay` per member;
+- replay placement resources reserved once by the launcher rather than once
+  per trial;
+- authoritative retained and learner active-view composition metrics grouped
+  by `producer_member_id`;
+- external-replay lifecycle semantics, so stopping one member leaves the other
+  member and replay alive;
+- a population checkpoint containing one `replay.snapshot`, two independent
+  member snapshots, and one checksummed manifest;
+- restore from a shared replay snapshot that may be newer than an individual
+  member cut, but never older or from another replay generation;
+- CPU integration coverage and a real two-GPU gate for the target two-RTX-3090
+  workstation.
+
+Run the two-GPU topology example inside the devcontainer:
+
+```bash
+uv run --locked --extra cu118 --group dev \
+  python examples/population_two_members.py \
+  --num-gpus-per-member 1
+```
+
+Run only the two-GPU population gate with:
+
+```bash
+uv run --locked --extra cu118 --group dev \
+  pytest -m gpu tests/gpu/test_two_gpu_population.py
+```
+
+Each Tune trial writes only `member.snapshot`. After both trials terminate,
+`PopulationLauncher.save_checkpoint()` publishes the shared replay once.
+Periodic checkpoints while both trials remain live require a future
+cross-trial coordination protocol and are not claimed by Phase 8.
 
 ## Architecture
 

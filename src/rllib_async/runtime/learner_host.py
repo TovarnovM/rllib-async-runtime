@@ -6,7 +6,7 @@ import math
 import pickle
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from numbers import Number
 from typing import Any
@@ -114,6 +114,8 @@ class LearnerHostStats:
     last_learner_metrics: tuple[tuple[str, float], ...]
     fast_replay: FastReplayStats
     batch_producer: BatchProducerStats
+    node_id: str = ""
+    accelerator_ids: tuple[str, ...] = ()
 
 
 class LearnerHost:
@@ -133,6 +135,7 @@ class LearnerHost:
         batch_seed: int,
         replay_sync_max_bytes: int,
         checkpoint_state: Mapping[str, Any] | bytes | None = None,
+        allow_replay_ahead_on_restore: bool = False,
     ) -> None:
         if not isinstance(config, SACConfig):
             raise TypeError("config must be an SACConfig")
@@ -148,11 +151,14 @@ class LearnerHost:
             raise ValueError(
                 "LearnerHost requires n_step=1 until n-step targets are constructed"
             )
+        if not isinstance(allow_replay_ahead_on_restore, bool):
+            raise TypeError("allow_replay_ahead_on_restore must be a bool")
 
         self._replay_actor = replay_actor
         self._codec = codec
         self._member_id = member_id
         self._sync_max_bytes = replay_sync_max_bytes
+        self._allow_replay_ahead_on_restore = allow_replay_ahead_on_restore
         self._fast_replay = FastReplay(codec)
         snapshot = ray.get(self._replay_actor.get_snapshot.remote())
         if not isinstance(snapshot, ReplaySnapshot):
@@ -544,11 +550,21 @@ class LearnerHost:
 
         replay_cursor = state.get("replay_cursor")
         replay = self._fast_replay.get_stats()
-        if (
-            replay_cursor is None
-            or replay.cursor != replay_cursor
-            or replay.active_cursor != replay_cursor
-        ):
+        if not isinstance(replay_cursor, ReplayCursor) or replay.cursor is None:
+            raise ValueError(
+                "learner host checkpoint does not match authoritative replay"
+            )
+        if self._allow_replay_ahead_on_restore:
+            replay_is_compatible = (
+                replay.cursor.store_generation == replay_cursor.store_generation
+                and replay.cursor.mutation_seq >= replay_cursor.mutation_seq
+                and replay.active_cursor == replay.cursor
+            )
+        else:
+            replay_is_compatible = (
+                replay.cursor == replay_cursor and replay.active_cursor == replay_cursor
+            )
+        if not replay_is_compatible:
             raise ValueError(
                 "learner host checkpoint does not match authoritative replay"
             )
@@ -669,6 +685,11 @@ class LearnerHostActor:
     """Ray process boundary around the finite-call learner host."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        context = ray.get_runtime_context()
+        self._node_id = context.get_node_id()
+        self._accelerator_ids = tuple(
+            str(value) for value in context.get_accelerator_ids().get("GPU", ())
+        )
         self._host = LearnerHost(*args, **kwargs)
 
     def start(self) -> None:
@@ -690,7 +711,11 @@ class LearnerHostActor:
         return self._host.get_published_weights()
 
     def get_stats(self) -> LearnerHostStats:
-        return self._host.get_stats()
+        return replace(
+            self._host.get_stats(),
+            node_id=self._node_id,
+            accelerator_ids=self._accelerator_ids,
+        )
 
     def get_checkpoint(self) -> LearnerHostCheckpoint:
         state = self._host.get_checkpoint_state()

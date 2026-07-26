@@ -222,3 +222,26 @@ def test_pause_timeout_marks_runtime_failed(
         runtime.resume()
     with pytest.raises(RuntimeError, match="must be 'running'"):
         runtime.pump_once()
+
+
+def test_stopping_member_does_not_kill_externally_owned_replay(monkeypatch) -> None:
+    runtime = object.__new__(SingleMemberAsyncSAC)
+    runtime._state = RuntimeState.CREATED
+    runtime._config = SimpleNamespace(shutdown_timeout_s=1.0)
+    runtime._pending_learner_tick = None
+    runtime._evaluation_group = None
+    runtime._rollout_group = None
+    runtime._learner_actor = None
+    runtime._replay_actor = object()
+    runtime._owns_replay_actor = False
+    killed: list[object] = []
+    monkeypatch.setattr(
+        controller_module.ray,
+        "kill",
+        lambda actor, **_: killed.append(actor),
+    )
+
+    runtime.stop(graceful=False)
+
+    assert runtime.state is RuntimeState.STOPPED
+    assert killed == []

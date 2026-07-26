@@ -98,6 +98,75 @@ def test_duplicate_commit_is_idempotent_and_conflict_is_explicit() -> None:
     assert stats.evicted_episodes == 0
 
 
+def test_replay_stats_report_retained_producer_composition() -> None:
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(
+        codec,
+        capacity_transitions=10,
+        capacity_bytes=10_000,
+        store_generation="population-composition",
+    )
+    member_zero = make_episode(codec, 0, [0, 1])
+    member_one = replace(
+        make_episode(codec, 1, [2, 3, 4]),
+        episode_id="member-1/runner-0/0/1",
+        producer_member_id="member-1",
+    )
+
+    store.commit_episode(member_zero)
+    store.commit_episode(member_one)
+
+    stats = store.get_stats()
+    assert dict(stats.producer_episode_counts) == {
+        "member-0": 1,
+        "member-1": 1,
+    }
+    assert dict(stats.producer_transition_counts) == {
+        "member-0": 2,
+        "member-1": 3,
+    }
+
+
+def test_replay_stats_use_incremental_producer_composition() -> None:
+    class RetainedEpisodesWithoutItems(OrderedDict[str, EpisodeEnvelope]):
+        def items(self):
+            raise AssertionError("get_stats() scanned retained episodes")
+
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(
+        codec,
+        capacity_transitions=3,
+        capacity_bytes=10_000,
+        store_generation="incremental-composition",
+    )
+    member_zero = make_episode(codec, 0, [0, 1])
+    member_one = replace(
+        make_episode(codec, 1, [2, 3]),
+        episode_id="member-1/runner-0/0/1",
+        producer_member_id="member-1",
+    )
+    latest_member_zero = make_episode(codec, 2, [4])
+
+    store.commit_episode(member_zero)
+    store.commit_episode(member_one)
+    after_eviction = store.get_stats()
+    assert dict(after_eviction.producer_episode_counts) == {"member-1": 1}
+    assert dict(after_eviction.producer_transition_counts) == {"member-1": 2}
+
+    store.commit_episode(latest_member_zero)
+    store._episodes = RetainedEpisodesWithoutItems(store._episodes)
+
+    stats = store.get_stats()
+    assert dict(stats.producer_episode_counts) == {
+        "member-0": 1,
+        "member-1": 1,
+    }
+    assert dict(stats.producer_transition_counts) == {
+        "member-0": 1,
+        "member-1": 2,
+    }
+
+
 def test_duplicate_commit_remains_idempotent_after_episode_eviction() -> None:
     codec = FlatEpisodeCodec()
     store = EpisodeStore(

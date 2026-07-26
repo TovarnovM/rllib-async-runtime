@@ -11,6 +11,44 @@ from ray.rllib.algorithms.sac import SACConfig
 
 
 @dataclass(frozen=True, slots=True)
+class SharedReplayDescriptor:
+    """Serializable lookup information for one named population replay actor."""
+
+    actor_name: str
+    namespace: str
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("actor_name", self.actor_name),
+            ("namespace", self.namespace),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"shared replay {name} must be a non-empty string")
+
+    @classmethod
+    def from_mapping(
+        cls,
+        values: Mapping[str, Any] | SharedReplayDescriptor | None,
+    ) -> SharedReplayDescriptor | None:
+        if values is None or isinstance(values, cls):
+            return values
+        if not isinstance(values, Mapping):
+            raise TypeError("shared replay descriptor must be a mapping")
+        unknown = set(values) - {"actor_name", "namespace"}
+        if unknown:
+            raise ValueError(f"unknown shared replay settings {sorted(unknown)!r}")
+        try:
+            return cls(
+                actor_name=values["actor_name"],
+                namespace=values["namespace"],
+            )
+        except KeyError as error:
+            raise ValueError(
+                "shared replay descriptor requires actor_name and namespace"
+            ) from error
+
+
+@dataclass(frozen=True, slots=True)
 class AsyncSACRuntimeConfig:
     """Runtime-only settings kept separate from RLlib's SAC configuration."""
 
@@ -43,7 +81,9 @@ class AsyncSACRuntimeConfig:
         if (
             not isinstance(self.member_id, str)
             or not self.member_id
+            or self.member_id in {".", ".."}
             or "/" in self.member_id
+            or "\\" in self.member_id
         ):
             raise ValueError("member_id must be a non-empty path segment")
         self._positive_int("runner_count", self.runner_count)

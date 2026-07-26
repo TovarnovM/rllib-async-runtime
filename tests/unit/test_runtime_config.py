@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from rllib_async.runtime import AsyncSACRuntimeConfig, AsyncSACTrainable
+from rllib_async.runtime import (
+    AsyncSACRuntimeConfig,
+    AsyncSACTrainable,
+    SharedReplayDescriptor,
+)
 from tests.helpers import make_sac_config
 
 
@@ -36,6 +40,9 @@ def test_runtime_config_rejects_unbounded_or_ambiguous_settings() -> None:
         )
     with pytest.raises(ValueError, match="between 4 and 16"):
         AsyncSACRuntimeConfig(runner_count=17)
+    for member_id in (".", "..", "parent/child", r"parent\child"):
+        with pytest.raises(ValueError, match="path segment"):
+            AsyncSACRuntimeConfig(member_id=member_id)
 
 
 def test_trainable_resource_request_covers_every_nonzero_child_actor() -> None:
@@ -62,3 +69,41 @@ def test_trainable_resource_request_covers_every_nonzero_child_actor() -> None:
         *[{"CPU": 0.5}] * 4,
         *[{"CPU": 0.25}] * 2,
     ]
+
+
+def test_population_trainable_does_not_reserve_shared_replay_per_trial() -> None:
+    sac_config = make_sac_config()
+    resources = AsyncSACTrainable.default_resource_request(
+        {
+            "member": {
+                "sac_config": sac_config,
+                "runtime": {
+                    "member_id": "member-1",
+                    "runner_count": 4,
+                    "evaluation_num_episodes": 0,
+                    "evaluation_interval_env_steps": 0,
+                    "num_cpus_per_replay": 1,
+                    "num_cpus_per_learner": 1,
+                    "num_cpus_per_runner": 0,
+                },
+            },
+            "shared_replay": {
+                "actor_name": "population-replay",
+                "namespace": "population-test",
+            },
+        }
+    )
+
+    assert resources.bundles == [
+        {"CPU": 1.0},
+        {"CPU": 1.0},
+    ]
+    assert SharedReplayDescriptor.from_mapping(
+        {
+            "actor_name": "population-replay",
+            "namespace": "population-test",
+        }
+    ) == SharedReplayDescriptor(
+        actor_name="population-replay",
+        namespace="population-test",
+    )

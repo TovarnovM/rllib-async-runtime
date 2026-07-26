@@ -4,6 +4,7 @@ import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 import pytest
 
@@ -98,7 +99,11 @@ def test_sampling_continues_on_old_view_while_index_rebuilds() -> None:
         store_generation="background-sampling",
     )
     old = make_episode(codec, 0, [("old", 0)])
-    new = make_episode(codec, 1, [("new", 0)])
+    new = replace(
+        make_episode(codec, 1, [("new", 0)]),
+        episode_id="member-1/runner-0/0/1",
+        producer_member_id="member-1",
+    )
     store.commit_episode(old)
     replay = ControlledBuildFastReplay(codec)
     replay.load_snapshot(store.get_snapshot())
@@ -112,11 +117,13 @@ def test_sampling_continues_on_old_view_while_index_rebuilds() -> None:
     assert replay.cursor == store.cursor
     assert replay.active_cursor != store.cursor
     assert replay.sample(10, rng=random.Random(1)) == [("old", 0)] * 10
+    assert dict(replay.get_stats().active_producer_episode_counts) == {"member-0": 1}
 
     release.set()
     replay.wait_for_idle(timeout=2)
     assert replay.active_cursor == store.cursor
     assert replay.sample(10, rng=random.Random(1)) == [("new", 0)] * 10
+    assert dict(replay.get_stats().active_producer_episode_counts) == {"member-1": 1}
     replay.close()
 
 

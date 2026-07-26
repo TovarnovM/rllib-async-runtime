@@ -131,6 +131,38 @@ def test_snapshot_bootstrap_materializes_index_without_copying_payloads() -> Non
     )
 
 
+def test_fast_replay_stats_report_active_producer_composition() -> None:
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(
+        codec,
+        capacity_transitions=10,
+        capacity_bytes=10_000,
+        store_generation="fast-population-composition",
+    )
+    store.commit_episode(make_episode(codec, 0, [0]))
+    store.commit_episode(
+        replace(
+            make_episode(codec, 1, [1, 2]),
+            episode_id="member-1/runner-0/0/1",
+            producer_member_id="member-1",
+        )
+    )
+    replay = FastReplay(codec)
+    try:
+        replay.load_snapshot(store.get_snapshot())
+        stats = replay.get_stats()
+        assert dict(stats.active_producer_episode_counts) == {
+            "member-0": 1,
+            "member-1": 1,
+        }
+        assert dict(stats.active_producer_transition_counts) == {
+            "member-0": 1,
+            "member-1": 2,
+        }
+    finally:
+        replay.close()
+
+
 def test_delta_swap_is_atomic_and_sampler_excludes_evicted_transitions() -> None:
     codec = FlatEpisodeCodec()
     store = EpisodeStore(
