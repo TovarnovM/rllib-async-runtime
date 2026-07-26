@@ -528,14 +528,20 @@ class AsyncRolloutGroup:
         self.stop()
 
     def _new_actor(self, runner_id: str) -> Any:
+        runner_generation = self._runner_generations[runner_id]
+        runner_config = self._config.copy(copy_frozen=False)
+        if runner_config.seed is not None:
+            runner_config.seed = int(runner_config.seed) + (
+                runner_generation * self._runner_count
+            )
         actor = EpisodeRolloutActor.options(
             num_cpus=self._num_cpus_per_runner,
         ).remote(
-            self._config,
+            runner_config,
             self._codec,
             member_id=self._member_id,
             runner_id=runner_id,
-            runner_generation=self._runner_generations[runner_id],
+            runner_generation=runner_generation,
             max_episode_steps=self._max_episode_steps,
             initial_weights=self._latest_weights,
             worker_index=self._worker_indices[runner_id],

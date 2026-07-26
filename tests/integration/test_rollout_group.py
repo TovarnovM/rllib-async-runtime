@@ -52,7 +52,8 @@ class VariableDelayOneStepEnv(gym.Env):
         action: np.ndarray,
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, object]]:
         time.sleep(self._delay_s)
-        return np.ones(3, dtype=np.float32), 1.0, True, False, {}
+        reward = float(self.np_random.random())
+        return np.ones(3, dtype=np.float32), reward, True, False, {}
 
 
 @ray.remote(num_cpus=0, max_concurrency=1)
@@ -76,7 +77,9 @@ class DelayedReplayActor:
 
 
 def make_rollout_config_and_weights() -> tuple[object, WeightsDescriptor]:
-    config = make_sac_config().environment(VariableDelayOneStepEnv)
+    config = (
+        make_sac_config().environment(VariableDelayOneStepEnv).debugging(seed=20260725)
+    )
     probe = SingleAgentEnvRunner(config=config, worker_index=0)
     try:
         module_state = probe.get_state(components=COMPONENT_RL_MODULE)[
@@ -189,6 +192,7 @@ def test_async_rollout_has_no_episode_barrier_and_tracks_weight_lag(
         assert restarted is not None
         assert restarted.episode.local_episode_seq == 0
         assert restarted.episode.episode_id != first.episode.episode_id
+        assert restarted.metrics.episode_return != first.metrics.episode_return
 
         stats = group.get_stats()
         assert stats.runner_restarts == 1

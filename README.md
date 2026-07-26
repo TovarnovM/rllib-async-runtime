@@ -224,11 +224,12 @@ Phase 7 provides:
   authoritative replay and member files;
 - episode-boundary drain before persistence, with cumulative
   training-intensity preserved;
-- complete learner, controller, rollout, evaluation, publication, and RNG
-  state;
+- complete learner, controller, rollout, evaluation, publication, and
+  learner/batch-sampler RNG state;
 - reconstruction of `FastReplay` from authoritative replay rather than
   serialization of its payload/index/thread state;
-- recreation of every rollout actor at `saved_generation + 1`;
+- recreation of every rollout actor at `saved_generation + 1`, with a
+  deterministic generation-derived rollout RNG stream for seeded runs;
 - safe duplicate episode re-delivery using restored replay deduplication state;
 - standard directory-based Tune `save_checkpoint()` and `load_checkpoint()`
   hooks;

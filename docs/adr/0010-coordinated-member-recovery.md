@@ -93,6 +93,14 @@ whether a runner's last result had reached replay. Re-delivery of an episode
 already represented in the snapshot remains safe because the authoritative
 deduplication fingerprints are restored with the store.
 
+Exact RNG state is restored for the learner and batch sampler. Arbitrary
+Gymnasium environments do not expose one portable RNG checkpoint contract, so
+seeded rollout actors instead derive a deterministic, non-repeating stream from
+their generation. The actor config seed is offset by
+`runner_generation * runner_count`; RLlib then adds the stable worker index.
+Generation zero therefore preserves the original seed mapping, while every
+restart or restore advances that runner into a disjoint seed range.
+
 `AsyncSACTrainable` implements Tune's directory-based `save_checkpoint()` and
 `load_checkpoint()` hooks. Tune iteration metadata remains Tune-owned; the
 runtime checkpoint owns member-internal counters and actor state.
