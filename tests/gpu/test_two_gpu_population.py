@@ -6,6 +6,7 @@ from ray.air import CheckpointConfig, RunConfig
 
 from rllib_async.runtime import PopulationLauncher
 from tests.integration.test_population import (
+    PopulationReadyStopper,
     make_population_specs,
     population_actor_name,
 )
@@ -28,7 +29,7 @@ def test_two_members_update_concurrently_on_distinct_gpus(
             run_config=RunConfig(
                 name="phase-8-two-gpu",
                 storage_path=str(tmp_path / "ray-results"),
-                stop={"training_iteration": 10},
+                stop=PopulationReadyStopper(),
                 checkpoint_config=CheckpointConfig(
                     num_to_keep=1,
                     checkpoint_at_end=True,

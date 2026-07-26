@@ -8,6 +8,7 @@ import pytest
 import ray
 from ray.air import CheckpointConfig, RunConfig
 from ray.rllib.algorithms.sac import SACConfig
+from ray.tune import Stopper
 
 from rllib_async.examples import SyntheticThroughputEnv
 from rllib_async.runtime import (
@@ -90,6 +91,59 @@ def make_population_specs(
 
 def population_actor_name(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex}"
+
+
+class PopulationReadyStopper(Stopper):
+    """Wait for both population data and learner progress, with a hard bound."""
+
+    def __init__(self, *, max_iterations: int = 100) -> None:
+        self._max_iterations = max_iterations
+
+    def __call__(self, trial_id: str, result: dict) -> bool:
+        del trial_id
+        producers = set(
+            result.get("fast_replay", {}).get(
+                "active_producer_episode_counts",
+                {},
+            )
+        )
+        learner_updates = result.get("learner", {}).get("learner_updates", 0)
+        ready = learner_updates >= 1 and {"member-0", "member-1"}.issubset(producers)
+        return ready or result.get("training_iteration", 0) >= self._max_iterations
+
+    def stop_all(self) -> bool:
+        return False
+
+
+def test_population_ready_stopper_requires_data_and_learner_progress() -> None:
+    stopper = PopulationReadyStopper(max_iterations=3)
+    one_producer = {
+        "training_iteration": 1,
+        "learner": {"learner_updates": 1},
+        "fast_replay": {
+            "active_producer_episode_counts": {"member-0": 1},
+        },
+    }
+    no_updates = {
+        "training_iteration": 2,
+        "learner": {"learner_updates": 0},
+        "fast_replay": {
+            "active_producer_episode_counts": {
+                "member-0": 1,
+                "member-1": 1,
+            },
+        },
+    }
+    ready = {
+        **no_updates,
+        "learner": {"learner_updates": 1},
+    }
+
+    assert not stopper("member-0", one_producer)
+    assert not stopper("member-0", no_updates)
+    assert stopper("member-0", ready)
+    assert stopper("member-0", {"training_iteration": 3})
+    assert not stopper.stop_all()
 
 
 @pytest.mark.integration
@@ -196,7 +250,7 @@ def test_tune_population_checkpoint_restores_shared_replay_once(
             run_config=RunConfig(
                 name="phase-8-population",
                 storage_path=str(tmp_path / "ray-results"),
-                stop={"training_iteration": 10},
+                stop=PopulationReadyStopper(),
                 checkpoint_config=CheckpointConfig(
                     num_to_keep=1,
                     checkpoint_at_end=True,
