@@ -1145,7 +1145,7 @@ Graph observation:
 
 ### Матрица
 
-- rollout actors: 1, 4, 8, 16;
+- rollout actors: 1, 4, 8, 16 для one-member topology и 1, 4, 8, 12 для two-member shared-replay topology;
 - flat и nested/GNN payload;
 - короткие и длинные эпизоды;
 - один member и два members;
