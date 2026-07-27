@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import benchmarks.end_to_end_throughput as end_to_end_throughput
 from benchmarks.common import (
     PerformanceGateError,
     graph_codec,
@@ -15,6 +16,7 @@ from benchmarks.common import (
     runtime_invariant_gates,
 )
 from benchmarks.end_to_end_throughput import (
+    _PopulationMeasurementStopper,
     _profile_path,
     _required_cluster_resources,
     _selected_modes,
@@ -86,6 +88,19 @@ def make_args(**overrides: object) -> argparse.Namespace:
     }
     values.update(overrides)
     return argparse.Namespace(**values)
+
+
+def make_population_report(
+    member_id: str,
+    *,
+    env_steps: int,
+    learner_updates: int,
+) -> dict[str, object]:
+    return {
+        "controller": {"member_id": member_id},
+        "rollout": {"env_steps": env_steps},
+        "learner": {"learner_updates": learner_updates},
+    }
 
 
 def test_benchmark_episode_builders_satisfy_codec_contracts() -> None:
@@ -182,3 +197,66 @@ def test_end_to_end_profile_path_identifies_the_complete_matrix_point() -> None:
     assert _profile_path(first, "direct") != _profile_path(second, "direct")
     assert _profile_path(first, "direct") != _profile_path(first, "queued")
     assert _profile_path(make_args(profile_dir=None), "direct") is None
+
+
+def test_population_measurement_excludes_setup_warmup_and_checkpoint_time(
+    monkeypatch,
+) -> None:
+    now = [0.0]
+    monkeypatch.setattr(
+        end_to_end_throughput.time,
+        "perf_counter",
+        lambda: now[0],
+    )
+    stopper = _PopulationMeasurementStopper(
+        member_ids=("member-0", "member-1"),
+        warmup_timesteps=100,
+        measure_timesteps=50,
+        max_duration_s=100,
+    )
+
+    now[0] = 10
+    assert not stopper(
+        "trial-0",
+        make_population_report("member-0", env_steps=120, learner_updates=12),
+    )
+    assert not stopper.stop_all()
+
+    now[0] = 20
+    assert not stopper(
+        "trial-1",
+        make_population_report("member-1", env_steps=105, learner_updates=10),
+    )
+
+    now[0] = 25
+    assert not stopper(
+        "trial-0",
+        make_population_report("member-0", env_steps=180, learner_updates=18),
+    )
+    assert not stopper.stop_all()
+
+    now[0] = 30
+    assert not stopper(
+        "trial-1",
+        make_population_report("member-1", env_steps=160, learner_updates=16),
+    )
+    assert stopper.stop_all()
+
+    now[0] = 80
+    duration_s, members = stopper.measurement()
+
+    assert duration_s == 10
+    assert members == {
+        "member-0": {
+            "baseline_env_steps": 120,
+            "measured_env_steps": 60,
+            "baseline_learner_updates": 12,
+            "measured_learner_updates": 6,
+        },
+        "member-1": {
+            "baseline_env_steps": 105,
+            "measured_env_steps": 55,
+            "baseline_learner_updates": 10,
+            "measured_learner_updates": 6,
+        },
+    }

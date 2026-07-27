@@ -175,6 +175,9 @@ Every JSON document has `schema_version: 1` and records:
 End-to-end runtime results additionally contain the complete final runtime
 report and these measured signals:
 
+- post-warm-up environment steps, learner updates, duration, and rates; the
+  two-member path establishes per-member baselines only after both members
+  reach warm-up and ends its shared timer before Tune checkpoint teardown;
 - `batching.data_wait_s`, calls, and timeouts;
 - `batching.batch_build_ms_p50/p95`;
 - `learner.data_wait_fraction`;

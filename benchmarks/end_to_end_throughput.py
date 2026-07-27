@@ -17,6 +17,7 @@ from ray.rllib.utils.metrics import (
     NUM_ENV_STEPS_SAMPLED_LIFETIME,
     NUM_ENV_STEPS_TRAINED_LIFETIME,
 )
+from ray.tune import Stopper
 
 from benchmarks.common import (
     benchmark_document,
@@ -33,6 +34,97 @@ from rllib_async.runtime import (
     PopulationMemberSpec,
     SingleMemberAsyncSAC,
 )
+
+
+class _PopulationMeasurementStopper(Stopper):
+    """Measure only the shared post-warmup window of a Tune population."""
+
+    def __init__(
+        self,
+        *,
+        member_ids: tuple[str, ...],
+        warmup_timesteps: int,
+        measure_timesteps: int,
+        max_duration_s: float,
+    ) -> None:
+        self._member_ids = frozenset(member_ids)
+        self._warmup_timesteps = warmup_timesteps
+        self._measure_timesteps = measure_timesteps
+        self._deadline = time.perf_counter() + max_duration_s
+        self._latest: dict[str, tuple[int, int]] = {}
+        self._baselines: dict[str, tuple[int, int]] | None = None
+        self._final: dict[str, tuple[int, int]] | None = None
+        self._started_at: float | None = None
+        self._finished_at: float | None = None
+        self._timed_out = False
+
+    def __call__(self, trial_id: str, result: dict) -> bool:
+        del trial_id
+        if self._final is not None:
+            return False
+        member_id = str(result["controller"]["member_id"])
+        if member_id not in self._member_ids:
+            raise RuntimeError(f"unexpected population member ID {member_id!r}")
+        self._latest[member_id] = (
+            int(result["rollout"]["env_steps"]),
+            int(result["learner"]["learner_updates"]),
+        )
+        if self._baselines is None:
+            if self._member_ids == self._latest.keys() and all(
+                env_steps >= self._warmup_timesteps
+                for env_steps, _ in self._latest.values()
+            ):
+                self._baselines = dict(self._latest)
+                self._started_at = time.perf_counter()
+            return False
+        if all(
+            self._latest[expected_member_id][0] - self._baselines[expected_member_id][0]
+            >= self._measure_timesteps
+            for expected_member_id in self._member_ids
+        ):
+            self._final = dict(self._latest)
+            self._finished_at = time.perf_counter()
+        return False
+
+    def stop_all(self) -> bool:
+        if self._final is not None:
+            return True
+        if time.perf_counter() >= self._deadline:
+            self._timed_out = True
+            return True
+        return False
+
+    def measurement(self) -> tuple[float, dict[str, dict[str, int]]]:
+        if self._timed_out:
+            raise TimeoutError(
+                "population benchmark exceeded --max-duration-s before "
+                "completing the measurement window"
+            )
+        if (
+            self._baselines is None
+            or self._final is None
+            or self._started_at is None
+            or self._finished_at is None
+        ):
+            raise RuntimeError("population measurement window did not complete")
+        duration_s = self._finished_at - self._started_at
+        if duration_s <= 0 or not math.isfinite(duration_s):
+            raise RuntimeError("population measurement duration is not positive")
+        members: dict[str, dict[str, int]] = {}
+        for member_id in sorted(self._member_ids):
+            baseline_env_steps, baseline_learner_updates = self._baselines[member_id]
+            final_env_steps, final_learner_updates = self._final[member_id]
+            measured_env_steps = final_env_steps - baseline_env_steps
+            measured_learner_updates = final_learner_updates - baseline_learner_updates
+            if measured_env_steps < 0 or measured_learner_updates < 0:
+                raise RuntimeError("population counters decreased during measurement")
+            members[member_id] = {
+                "baseline_env_steps": baseline_env_steps,
+                "measured_env_steps": measured_env_steps,
+                "baseline_learner_updates": baseline_learner_updates,
+                "measured_learner_updates": measured_learner_updates,
+            }
+        return duration_s, members
 
 
 def parse_args() -> argparse.Namespace:
@@ -296,16 +388,18 @@ def run_population(
         for member_index in range(2)
     )
     run_name = f"phase11-{mode}-{uuid.uuid4().hex[:8]}"
-    started = time.perf_counter()
+    measurement_stopper = _PopulationMeasurementStopper(
+        member_ids=tuple(member.runtime_config.member_id for member in members),
+        warmup_timesteps=args.warmup_timesteps,
+        measure_timesteps=args.measure_timesteps,
+        max_duration_s=args.max_duration_s,
+    )
     with PopulationLauncher(members) as launcher:
         results = launcher.fit(
             run_config=RunConfig(
                 name=run_name,
                 storage_path=str(args.storage_path.resolve()),
-                stop={
-                    "timesteps_total": (args.warmup_timesteps + args.measure_timesteps),
-                    "time_total_s": args.max_duration_s,
-                },
+                stop=measurement_stopper,
                 checkpoint_config=CheckpointConfig(
                     num_to_keep=1,
                     checkpoint_at_end=True,
@@ -313,18 +407,20 @@ def run_population(
                 verbose=0,
             )
         )
-        duration_s = time.perf_counter() - started
+        duration_s, measurements = measurement_stopper.measurement()
         member_results = []
         for result in results:
             report = result.metrics
+            member_id = str(report["controller"]["member_id"])
+            measurement = measurements[member_id]
             gates = runtime_invariant_gates(
                 report,
                 replay_capacity_transitions=args.replay_capacity_transitions,
                 replay_capacity_bytes=args.replay_capacity_bytes,
             )
             gates["measurement_completed"] = (
-                report["rollout"]["env_steps"]
-                >= args.warmup_timesteps + args.measure_timesteps
+                measurement["baseline_env_steps"] >= args.warmup_timesteps
+                and measurement["measured_env_steps"] >= args.measure_timesteps
             )
             gates["all_passed"] = all(
                 passed for name, passed in gates.items() if name != "all_passed"
@@ -332,18 +428,22 @@ def run_population(
             require_gates(gates)
             member_results.append(
                 {
-                    "member_id": report["controller"]["member_id"],
-                    "env_steps": report["rollout"]["env_steps"],
-                    "env_steps_per_s": report["rollout"]["env_steps_per_s"],
-                    "learner_updates": report["learner"]["learner_updates"],
-                    "learner_updates_per_s": report["learner"]["updates_per_s"],
+                    "member_id": member_id,
+                    "baseline_env_steps": measurement["baseline_env_steps"],
+                    "measured_env_steps": measurement["measured_env_steps"],
+                    "env_steps_per_s": (measurement["measured_env_steps"] / duration_s),
+                    "baseline_learner_updates": measurement["baseline_learner_updates"],
+                    "measured_learner_updates": measurement["measured_learner_updates"],
+                    "learner_updates_per_s": (
+                        measurement["measured_learner_updates"] / duration_s
+                    ),
                     "accelerator_ids": report["learner"]["accelerator_ids"],
                     "bottleneck_indicator": bottleneck_indicator(report),
                     "gates": gates,
                     "final_report": report,
                 }
             )
-    aggregate_steps = sum(int(item["env_steps"]) for item in member_results)
+    aggregate_steps = sum(int(item["measured_env_steps"]) for item in member_results)
     expected_member_ids = {"member-0", "member-1"}
     accelerator_ids = [tuple(item["accelerator_ids"]) for item in member_results]
     intervals = [
@@ -382,7 +482,7 @@ def run_population(
         "mode": mode,
         "members": 2,
         "duration_s": duration_s,
-        "aggregate_env_steps": aggregate_steps,
+        "aggregate_measured_env_steps": aggregate_steps,
         "aggregate_env_steps_per_s": aggregate_steps / duration_s,
         "member_results": member_results,
         "gates": gates,
