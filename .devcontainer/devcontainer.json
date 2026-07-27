@@ -9,7 +9,7 @@
   },
   "runArgs": [
     "--gpus=all",
-    "--shm-size=8g"
+    "--shm-size=16g"
   ],
   "remoteUser": "vscode",
   "postCreateCommand": "uv sync --locked --extra cu118 --group dev",
