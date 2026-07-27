@@ -138,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--runner-count",
         type=int,
-        choices=(1, 4, 8, 16),
+        choices=(1, 4, 8, 12, 16),
         default=4,
     )
     parser.add_argument("--episode-length", type=int, default=32)

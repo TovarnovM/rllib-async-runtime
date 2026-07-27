@@ -200,10 +200,10 @@ The benchmark matrix records JSON reports and driver-local `cProfile`
 artifacts. End-to-end commands combine the harness `--max-duration-s` deadline
 with an external process timeout that also covers Ray initialization and actor
 scheduling. A deterministic correctness or boundedness gate failure makes the
-command fail. The 16-runner points require at least 18 Ray CPU slots for one
-member and 37 for two concurrent members; the harness checks this before
-scheduling and records the complete Ray resource map in every end-to-end JSON
-document.
+command fail. The largest prepared points require at least 18 Ray CPU slots
+for one member with 16 runners and 29 for two concurrent members with 12
+runners each; the harness checks this before scheduling and records the
+complete Ray resource map in every end-to-end JSON document.
 
 ### Component profiles
 
@@ -296,7 +296,7 @@ authoritative replay, so this matrix compares only direct and queued runtime
 modes:
 
 ```bash
-for runners in 1 4 8 16; do
+for runners in 1 4 8 12; do
   for episode_length in 32 512; do
     for batch_size in 128 512; do
       for intensity in 1 4; do
@@ -365,7 +365,7 @@ expected_names.update(
 )
 expected_names.update(
     f"gpu-population-r{runners}-e{episode_length}-b{batch_size}-u{intensity}.json"
-    for runners in (1, 4, 8, 16)
+    for runners in (1, 4, 8, 12)
     for episode_length in (32, 512)
     for batch_size in (128, 512)
     for intensity in (1, 4)

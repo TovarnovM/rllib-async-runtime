@@ -386,8 +386,9 @@ Phase 11 provides:
 - direct batch construction with `batch_queue_capacity=0`, providing a real
   no-background-batching baseline;
 - an end-to-end matrix for stock RLlib SAC, direct runtime, and queued runtime,
-  including 1/4/8/16 runners, short/long episodes, multiple batch sizes and
-  update-to-data ratios, and one/two runtime members;
+  including 1/4/8/16 runners for one member and 1/4/8/12 for the two-member
+  shared-replay topology, short/long episodes, multiple batch sizes, and
+  update-to-data ratios;
 - JSON reports with environment and Git revision metadata plus optional
   `cProfile` artifacts;
 - deterministic gates for pending RPCs, queue capacity, replay transition/byte

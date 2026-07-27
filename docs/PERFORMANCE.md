@@ -115,7 +115,9 @@ done
 ```
 
 The two-member CPU topology is a boundedness and contention gate, not a stock
-RLlib parity measurement:
+RLlib parity measurement. Its largest point uses 12 runners per member so the
+shared topology requires 29 Ray CPU slots and fits the target 32-slot
+workstation while retaining four runner-count levels:
 
 ```bash
 set -euo pipefail
@@ -124,7 +126,7 @@ run_id="cpu-population-$(git rev-parse --short HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
 artifact_dir="artifacts/performance/$run_id"
 mkdir -p "$artifact_dir/profiles" "$artifact_dir/ray"
 
-for runners in 1 4 8 16; do
+for runners in 1 4 8 12; do
   for episode_length in 32 512; do
     for batch_size in 128 512; do
       for intensity in 1 4; do

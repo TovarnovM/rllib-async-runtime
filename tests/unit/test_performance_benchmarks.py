@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import sys
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from benchmarks.end_to_end_throughput import (
     _validate_args,
     build_runtime_config,
     build_sac_config,
+    parse_args,
 )
 from rllib_async.protocols import FlatEpisodeCodec
 
@@ -103,6 +105,27 @@ def make_population_report(
     }
 
 
+def test_end_to_end_cli_accepts_twelve_runner_population_point(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "end_to_end_throughput",
+            "--members",
+            "2",
+            "--runner-count",
+            "12",
+        ],
+    )
+
+    args = parse_args()
+
+    assert args.members == 2
+    assert args.runner_count == 12
+
+
 def test_benchmark_episode_builders_satisfy_codec_contracts() -> None:
     flat_codec = FlatEpisodeCodec()
     flat = make_flat_episode(3, 8, flat_codec)
@@ -172,8 +195,8 @@ def test_end_to_end_modes_preserve_parity_and_reject_fake_stock_population() -> 
     assert _selected_modes(population) == ("direct", "queued")
     assert _required_cluster_resources(args) == (6.0, 0.0)
     assert _required_cluster_resources(
-        make_args(members=2, runner_count=16, num_gpus_per_learner=1)
-    ) == (37.0, 2.0)
+        make_args(members=2, runner_count=12, num_gpus_per_learner=1)
+    ) == (29.0, 2.0)
     with pytest.raises(ValueError, match="no shared-replay member topology"):
         _validate_args(make_args(members=2, mode="stock"))
 
