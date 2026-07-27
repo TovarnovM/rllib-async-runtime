@@ -1,4 +1,4 @@
-"""Run the Phase 10 shared-policy ego-GNN pipeline on CPU."""
+"""Run the Phase 10 shared-policy ego-GNN pipeline on one learner device."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from rllib_async.rollout import MultiModuleEpisodeRunner
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=20)
+    parser.add_argument("--num-gpus-per-learner", type=int, choices=(0, 1), default=0)
     parser.add_argument("--seed", type=int, default=20260726)
     return parser.parse_args()
 
@@ -31,7 +32,10 @@ def main() -> None:
     args = parse_args()
     if args.episodes < 1:
         raise ValueError("--episodes must be positive")
-    config = build_shared_gnn_sac_config(seed=args.seed)
+    config = build_shared_gnn_sac_config(
+        num_gpus_per_learner=args.num_gpus_per_learner,
+        seed=args.seed,
+    )
     codec = GraphEpisodeCodec(
         node_feature_dim=GRAPH_NODE_FEATURE_DIM,
         edge_feature_dim=GRAPH_EDGE_FEATURE_DIM,
@@ -102,6 +106,7 @@ def main() -> None:
                     "env_steps": env_steps,
                     "agent_steps": agent_steps,
                     "learner_updates": adapter.learner_updates,
+                    "num_gpus_per_learner": args.num_gpus_per_learner,
                     "module_transition_counts": dict(
                         fast_replay.module_transition_counts
                     ),

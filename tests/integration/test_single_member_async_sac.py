@@ -145,6 +145,47 @@ def test_end_to_end_runtime_reports_all_layers_and_stops_actors(
 
 
 @pytest.mark.integration
+def test_single_runner_direct_batching_baseline_reports_bounded_state(
+    ray_runtime: None,
+) -> None:
+    sac_config, runtime_config = make_configs()
+    runtime_config = AsyncSACRuntimeConfig(
+        **{
+            **asdict(runtime_config),
+            "runner_count": 1,
+            "pending_commit_high_watermark": 2,
+            "pending_commit_low_watermark": 0,
+            "batch_queue_capacity": 0,
+            "evaluation_interval_env_steps": 0,
+            "evaluation_num_episodes": 0,
+        }
+    )
+    runtime = SingleMemberAsyncSAC(sac_config, runtime_config)
+    report = None
+    try:
+        runtime.start()
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            report = runtime.run_for(0.2)
+            if report["learner"]["learner_updates"] >= 1:
+                break
+        assert report is not None
+        assert report["learner"]["learner_updates"] >= 1
+        assert report["rollout"]["runner_count"] == 1
+        assert not report["batching"]["prefetch_enabled"]
+        assert report["batching"]["queue_capacity"] == 0
+        assert report["batching"]["queue_high_watermark"] == 0
+        assert report["batching"]["batch_builds"] >= 1
+        assert report["learner"]["data_wait_fraction"] >= 0
+        assert (
+            report["controller"]["pending_rpc_high_watermark"]
+            <= report["controller"]["pending_rpc_bound"]
+        )
+    finally:
+        runtime.stop(timeout_s=15)
+
+
+@pytest.mark.integration
 def test_controlled_crash_restores_every_runtime_layer(
     ray_runtime: None,
     tmp_path,

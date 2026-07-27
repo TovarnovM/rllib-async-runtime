@@ -151,6 +151,80 @@ def test_bounded_queue_applies_backpressure_without_exceeding_capacity() -> None
         replay.close()
 
 
+def test_zero_capacity_builds_batches_synchronously_without_a_queue() -> None:
+    _, replay = make_replay(
+        [
+            {"value": index, "vector": np.array([index], dtype=np.float32)}
+            for index in range(8)
+        ]
+    )
+    producer = BatchProducer(
+        replay,
+        FlatBatchCollator(),
+        batch_size=4,
+        queue_capacity=0,
+        seed=19,
+    )
+    try:
+        producer.start()
+        batch = producer.get(timeout=1)
+        stats = producer.get_stats()
+
+        assert batch["value"].shape == (4,)
+        assert not stats.prefetch_enabled
+        assert stats.queue_size == 0
+        assert stats.queue_capacity == 0
+        assert stats.queue_high_watermark == 0
+        assert stats.batches_produced == 1
+        assert stats.batches_consumed == 1
+        assert stats.batch_builds == 1
+        assert stats.batch_build_s > 0
+        assert stats.data_wait_calls == 1
+
+        producer.pause(timeout=1)
+        assert producer.get_stats().state is BatchProducerState.PAUSED
+        assert producer.drain() == []
+        producer.resume()
+        assert producer.get_stats().state is BatchProducerState.RUNNING
+    finally:
+        producer.stop(timeout=2)
+        replay.close()
+
+
+def test_zero_capacity_sampler_rng_round_trips_at_a_pause_boundary() -> None:
+    _, replay = make_replay([{"value": index} for index in range(32)])
+    source = BatchProducer(
+        replay,
+        FlatBatchCollator(),
+        batch_size=8,
+        queue_capacity=0,
+        seed=21,
+    )
+    restored = BatchProducer(
+        replay,
+        FlatBatchCollator(),
+        batch_size=8,
+        queue_capacity=0,
+        seed=999,
+    )
+    try:
+        source.start()
+        source.get(timeout=1)
+        source.pause(timeout=1)
+        restored.set_rng_state(source.get_rng_state())
+
+        source.resume()
+        restored.start()
+        expected = source.get(timeout=1)
+        actual = restored.get(timeout=1)
+
+        np.testing.assert_array_equal(actual["value"], expected["value"])
+    finally:
+        source.stop(timeout=2)
+        restored.stop(timeout=2)
+        replay.close()
+
+
 def test_empty_queue_records_data_wait_then_recovers_when_replay_fills() -> None:
     store, replay = make_replay([])
     producer = BatchProducer(
@@ -222,13 +296,16 @@ class FailingCollator:
         raise ValueError("controlled collator failure")
 
 
-def test_producer_failure_is_visible_to_consumer_and_metrics() -> None:
+@pytest.mark.parametrize("queue_capacity", [0, 1])
+def test_producer_failure_is_visible_to_consumer_and_metrics(
+    queue_capacity: int,
+) -> None:
     _, replay = make_replay([{"value": 1}])
     producer = BatchProducer(
         replay,
         FailingCollator(),
         batch_size=1,
-        queue_capacity=1,
+        queue_capacity=queue_capacity,
         seed=31,
     )
     try:
@@ -241,6 +318,7 @@ def test_producer_failure_is_visible_to_consumer_and_metrics() -> None:
         assert stats.queue_size == 0
     finally:
         producer.stop(timeout=2)
+        assert producer.get_stats().state is BatchProducerState.FAILED
         replay.close()
 
 

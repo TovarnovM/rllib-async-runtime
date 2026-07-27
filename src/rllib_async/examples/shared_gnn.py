@@ -287,6 +287,7 @@ def build_shared_gnn_sac_config(
     episode_length: int = 8,
     hidden_dim: int = 32,
     message_layers: int = 2,
+    num_gpus_per_learner: int = 0,
     seed: int = 20260726,
 ) -> SACConfig:
     """Build the fixed shared-policy discrete SAC configuration for Phase 10."""
@@ -299,6 +300,12 @@ def build_shared_gnn_sac_config(
     ):
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise ValueError(f"{name} must be a positive integer")
+    if (
+        not isinstance(num_gpus_per_learner, int)
+        or isinstance(num_gpus_per_learner, bool)
+        or num_gpus_per_learner not in {0, 1}
+    ):
+        raise ValueError("num_gpus_per_learner must be 0 or 1")
     spaces = shared_gnn_module_spaces(agent_count)
     observation_space, action_space = spaces[SHARED_GNN_MODULE_ID]
     model_config = {
@@ -329,7 +336,10 @@ def build_shared_gnn_sac_config(
             batch_mode="complete_episodes",
             episodes_to_numpy=True,
         )
-        .learners(num_learners=0, num_gpus_per_learner=0)
+        .learners(
+            num_learners=0,
+            num_gpus_per_learner=num_gpus_per_learner,
+        )
         .multi_agent(
             policies={
                 SHARED_GNN_MODULE_ID: PolicySpec(

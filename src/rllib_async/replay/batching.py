@@ -6,6 +6,7 @@ import queue
 import random
 import threading
 import time
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -53,6 +54,7 @@ class BatchProducerState(str, Enum):
 @dataclass(frozen=True, slots=True)
 class BatchProducerStats:
     state: BatchProducerState
+    prefetch_enabled: bool
     queue_size: int
     queue_capacity: int
     queue_high_watermark: int
@@ -66,6 +68,10 @@ class BatchProducerStats:
     data_wait_timeouts: int
     data_wait_s: float
     last_data_wait_ms: float
+    batch_builds: int
+    batch_build_s: float
+    batch_build_ms_p50: float
+    batch_build_ms_p95: float
 
 
 class FlatBatchCollator:
@@ -173,7 +179,7 @@ class MultiModuleBatchCollator:
 
 
 class BatchProducer(Generic[BatchT]):
-    """Build batches on one background thread into a bounded FIFO queue."""
+    """Build batches directly or on one thread into a bounded FIFO queue."""
 
     def __init__(
         self,
@@ -193,16 +199,20 @@ class BatchProducer(Generic[BatchT]):
         if (
             not isinstance(queue_capacity, int)
             or isinstance(queue_capacity, bool)
-            or queue_capacity < 1
+            or queue_capacity < 0
         ):
-            raise ValueError("queue_capacity must be a positive integer")
+            raise ValueError("queue_capacity must be a non-negative integer")
         if not isinstance(seed, int) or isinstance(seed, bool):
             raise ValueError("seed must be an integer")
 
         self._replay = replay
         self._collator = collator
         self._batch_size = batch_size
-        self._queue: queue.Queue[BatchT] = queue.Queue(maxsize=queue_capacity)
+        self._prefetch_enabled = queue_capacity > 0
+        self._queue_capacity = queue_capacity
+        self._queue: queue.Queue[BatchT] = queue.Queue(
+            maxsize=max(queue_capacity, 1),
+        )
         self._rng = random.Random(seed)
         self._condition = threading.Condition()
         self._state = BatchProducerState.CREATED
@@ -221,6 +231,9 @@ class BatchProducer(Generic[BatchT]):
         self._data_wait_timeouts = 0
         self._data_wait_s = 0.0
         self._last_data_wait_ms = 0.0
+        self._batch_builds = 0
+        self._batch_build_s = 0.0
+        self._batch_build_times_ms: deque[float] = deque(maxlen=1_024)
 
     def start(self) -> None:
         """Start a new producer or resume a paused one."""
@@ -238,6 +251,9 @@ class BatchProducer(Generic[BatchT]):
                 )
 
             self._state = BatchProducerState.RUNNING
+            if not self._prefetch_enabled:
+                self._condition.notify_all()
+                return
             thread = threading.Thread(
                 target=self._run,
                 name=f"batch-producer-{id(self):x}",
@@ -267,6 +283,10 @@ class BatchProducer(Generic[BatchT]):
                     f"cannot pause batch producer in state {self._state.value!r}"
                 )
             self._state = BatchProducerState.PAUSED
+            if not self._prefetch_enabled:
+                self._pause_acknowledged = True
+                self._condition.notify_all()
+                return
             self._condition.notify_all()
             while not self._pause_acknowledged:
                 if self._state is BatchProducerState.FAILED:
@@ -281,6 +301,9 @@ class BatchProducer(Generic[BatchT]):
 
     def get(self, *, timeout: float | None = None) -> BatchT:
         """Return one batch and account for consumer-side data wait."""
+
+        if not self._prefetch_enabled:
+            return self._get_direct(timeout=timeout)
         deadline = self._deadline(timeout)
         started = time.monotonic()
         with self._condition:
@@ -320,6 +343,9 @@ class BatchProducer(Generic[BatchT]):
 
     def drain(self) -> list[BatchT]:
         """Remove and return every batch currently queued."""
+
+        if not self._prefetch_enabled:
+            return []
         drained: list[BatchT] = []
         while True:
             try:
@@ -332,6 +358,7 @@ class BatchProducer(Generic[BatchT]):
 
     def stop(self, *, timeout: float | None = None) -> None:
         """Stop the producer thread; queued batches remain available to drain."""
+
         deadline = self._deadline(timeout)
         with self._condition:
             if self._state is BatchProducerState.CREATED:
@@ -343,7 +370,15 @@ class BatchProducer(Generic[BatchT]):
                 BatchProducerState.FAILED,
             }:
                 thread = self._thread
-            else:
+            if not self._prefetch_enabled:
+                if self._state is not BatchProducerState.FAILED:
+                    self._state = BatchProducerState.STOPPED
+                self._condition.notify_all()
+                return
+            if self._state not in {
+                BatchProducerState.STOPPED,
+                BatchProducerState.FAILED,
+            }:
                 self._state = BatchProducerState.STOPPING
                 self._condition.notify_all()
                 thread = self._thread
@@ -365,8 +400,9 @@ class BatchProducer(Generic[BatchT]):
                 backpressure_s += time.monotonic() - self._active_backpressure_started
             return BatchProducerStats(
                 state=self._state,
+                prefetch_enabled=self._prefetch_enabled,
                 queue_size=self._queue.qsize(),
-                queue_capacity=self._queue.maxsize,
+                queue_capacity=self._queue_capacity,
                 queue_high_watermark=self._queue_high_watermark,
                 batches_produced=self._batches_produced,
                 batches_consumed=self._batches_consumed,
@@ -378,6 +414,16 @@ class BatchProducer(Generic[BatchT]):
                 data_wait_timeouts=self._data_wait_timeouts,
                 data_wait_s=self._data_wait_s,
                 last_data_wait_ms=self._last_data_wait_ms,
+                batch_builds=self._batch_builds,
+                batch_build_s=self._batch_build_s,
+                batch_build_ms_p50=self._percentile(
+                    self._batch_build_times_ms,
+                    50,
+                ),
+                batch_build_ms_p95=self._percentile(
+                    self._batch_build_times_ms,
+                    95,
+                ),
             )
 
     def get_rng_state(self) -> object:
@@ -428,6 +474,7 @@ class BatchProducer(Generic[BatchT]):
                         continue
                     if not self._wait_until_running():
                         break
+                    build_started = time.monotonic()
                     try:
                         transitions = self._replay.sample(
                             self._batch_size,
@@ -438,6 +485,8 @@ class BatchProducer(Generic[BatchT]):
                     except ReplayError:
                         continue
                     pending = self._collator.collate(transitions)
+                    with self._condition:
+                        self._record_batch_build_locked(build_started)
 
                 if not self._put_when_running(cast(BatchT, pending)):
                     break
@@ -511,6 +560,54 @@ class BatchProducer(Generic[BatchT]):
             f"batch producer failed: {self._error}"
         ) from self._error
 
+    def _get_direct(self, *, timeout: float | None) -> BatchT:
+        started = time.monotonic()
+        with self._condition:
+            if self._state is BatchProducerState.CREATED:
+                self._record_data_wait_locked(started, timed_out=False)
+                raise BatchProducerError("start the batch producer before reading")
+            if self._state is not BatchProducerState.RUNNING:
+                self._record_data_wait_locked(started, timed_out=False)
+                raise BatchProducerError(f"cannot read in state {self._state.value!r}")
+        try:
+            available = self._replay.wait_for_transitions(timeout=timeout)
+            if not available:
+                if self._replay.get_stats().closed:
+                    raise ReplayClosedError(
+                        "learner-local replay closed while producing batches"
+                    )
+                with self._condition:
+                    self._record_data_wait_locked(started, timed_out=True)
+                raise BatchQueueEmptyError("timed out waiting for a learner batch")
+            build_started = time.monotonic()
+            transitions = self._replay.sample(
+                self._batch_size,
+                rng=self._rng,
+            )
+            batch = self._collator.collate(transitions)
+        except BatchQueueEmptyError:
+            raise
+        except Exception as error:
+            with self._condition:
+                self._record_data_wait_locked(started, timed_out=False)
+                self._error = error
+                self._producer_failures += 1
+                self._state = BatchProducerState.FAILED
+                self._condition.notify_all()
+            raise BatchProducerError(f"batch producer failed: {error}") from error
+        with self._condition:
+            self._record_batch_build_locked(build_started)
+            self._batches_produced += 1
+            self._batches_consumed += 1
+            self._record_data_wait_locked(started, timed_out=False)
+        return batch
+
+    def _record_batch_build_locked(self, started: float) -> None:
+        elapsed = time.monotonic() - started
+        self._batch_builds += 1
+        self._batch_build_s += elapsed
+        self._batch_build_times_ms.append(elapsed * 1_000)
+
     def _record_data_wait_locked(
         self,
         started: float,
@@ -523,6 +620,12 @@ class BatchProducer(Generic[BatchT]):
         self._last_data_wait_ms = elapsed * 1_000
         if timed_out:
             self._data_wait_timeouts += 1
+
+    @staticmethod
+    def _percentile(values: Sequence[float], percentile: int) -> float:
+        if not values:
+            return 0.0
+        return float(np.percentile(tuple(values), percentile))
 
     @staticmethod
     def _deadline(timeout: float | None) -> float | None:

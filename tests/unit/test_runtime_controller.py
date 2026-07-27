@@ -245,3 +245,35 @@ def test_stopping_member_does_not_kill_externally_owned_replay(monkeypatch) -> N
 
     assert runtime.state is RuntimeState.STOPPED
     assert killed == []
+
+
+def test_force_stop_kills_learner_without_waiting_for_remote_shutdown(
+    monkeypatch,
+) -> None:
+    runtime = object.__new__(SingleMemberAsyncSAC)
+    runtime._state = RuntimeState.RUNNING
+    runtime._config = SimpleNamespace(shutdown_timeout_s=1.0)
+    runtime._pending_learner_tick = None
+    runtime._evaluation_group = None
+    runtime._rollout_group = None
+    learner = SimpleNamespace(stop=RecordingRemoteMethod())
+    runtime._learner_actor = learner
+    runtime._replay_actor = None
+    runtime._owns_replay_actor = False
+    killed: list[object] = []
+    monkeypatch.setattr(
+        controller_module.ray,
+        "get",
+        Mock(side_effect=AssertionError("force-stop must not wait on the learner")),
+    )
+    monkeypatch.setattr(
+        controller_module.ray,
+        "kill",
+        lambda actor, **_: killed.append(actor),
+    )
+
+    runtime.stop(graceful=False)
+
+    assert runtime.state is RuntimeState.STOPPED
+    assert learner.stop.calls == []
+    assert killed == [learner]

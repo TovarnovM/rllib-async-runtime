@@ -1,8 +1,9 @@
 # `rllib-async-runtime`: подробный план реализации
 
 **Статус:** Phase 0–7 реализованы; код Phase 8 слит с открытым two-GPU debt;
-Phase 9 hierarchy и Phase 10 shared-GNN реализованы; следующий этап —
-performance gate/documentation в Phase 11
+Phase 9 hierarchy и Phase 10 shared-GNN реализованы; tooling Phase 11
+реализован, но hardware acceptance остаётся открытым до выполнения GPU-матрицы
+из `debt.md`
 
 **Дата фиксации:** 24 июля 2026
 
@@ -243,10 +244,10 @@ class EpisodeCodec(Protocol):
 Реализованы:
 
 - `FlatEpisodeCodec` для обычного continuous-control env;
-- `MultiModuleEpisodeCodec` для sparse hierarchy.
+- `MultiModuleEpisodeCodec` для sparse hierarchy;
+- `GraphEpisodeCodec` для variable-size ego-graph payload.
 
-`GraphEpisodeCodec` остаётся задачей Phase 10. Registry/plugins не нужны:
-выбор codec остаётся явным на границе runtime.
+Registry/plugins не нужны: выбор codec остаётся явным на границе runtime.
 
 ## 5.3. `ReplayActor`
 
@@ -354,9 +355,8 @@ class BatchCollator(Protocol):
 Реализованы:
 
 - `FlatBatchCollator`;
-- `MultiModuleBatchCollator` для hierarchy example.
-
-`GraphBatchCollator` остаётся задачей Phase 10.
+- `MultiModuleBatchCollator` для hierarchy example;
+- `GraphBatchCollator` для packed variable-size ego-graphs.
 
 Pinned memory применяется только к уже собранному tensor batch. Произвольный
 Python replay нельзя считать pinned или zero-copy.
@@ -598,9 +598,9 @@ batch_build_capacity   >= GPU_batch_consumption_rate
 - `learner/updates_per_s`;
 - `learner/samples_per_s`;
 - `learner/update_to_data_ratio`;
-- `learner/batch_build_ms_p50/p95`;
-- `learner/gpu_update_ms_p50/p95`;
-- `learner/batch_queue_depth`;
+- `batching/batch_build_ms_p50/p95`;
+- `learner/update_time_ms_p50/p95`;
+- `batching/queue_size`;
 - `learner/batch_queue_empty_fraction`;
 - `learner/data_wait_fraction`;
 - `learner/weights_version`;
@@ -625,6 +625,7 @@ rllib-async-runtime/
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── IMPLEMENTATION_PLAN.md
+│   ├── PERFORMANCE.md
 │   └── adr/
 │       ├── 0001-runtime-boundary.md
 │       ├── 0002-episode-replay-quantum.md
@@ -637,7 +638,8 @@ rllib-async-runtime/
 │       ├── 0009-single-member-async-sac.md
 │       ├── 0010-coordinated-member-recovery.md
 │       ├── 0011-two-member-shared-replay-population.md
-│       └── 0012-sparse-hierarchy-and-module-replay.md
+│       ├── 0012-sparse-hierarchy-and-module-replay.md
+│       └── 0013-shared-ego-graph-policy.md
 ├── examples/
 │   ├── async_sac_pendulum.py
 │   ├── async_sac_throughput.py
@@ -1117,6 +1119,30 @@ Graph observation:
 
 ## Phase 11. Performance gate и документация
 
+**Статус реализации:** instrumentation и воспроизводимый benchmark harness
+завершены 26 июля 2026. Аппаратный gate не выполнялся и остаётся открытым в
+`debt.md`; поэтому Phase 11 пока не отмечается завершённой в общем трекере.
+
+### Реализованные задачи
+
+1. [x] Добавлен настоящий no-background-batching режим:
+   `batch_queue_capacity=0` строит batch синхронно без producer thread.
+2. [x] Добавлены измерения batch build p50/p95, learner update p50/p95,
+   samples/s, learner data-wait fraction и empty-queue fraction.
+3. [x] Добавлены детерминированные flat и variable-size GNN workloads.
+4. [x] Добавлены отдельные authoritative-ingest и FastReplay
+   sampling/collation benchmarks с JSON и `cProfile` artifacts.
+5. [x] Добавлен end-to-end stock/direct/queued harness для 1/4/8/16 runners,
+   коротких/длинных episodes, разных batch size и training intensity.
+6. [x] Добавлен two-member direct/queued harness с gates общего replay,
+   перекрытия выполнения и назначения разных GPU при аппаратном запуске.
+7. [x] Добавлены строгие gates для pending RPC, queue, authoritative/FastReplay
+   transition/byte capacity, failures и наличия измерений.
+8. [x] Документированы CPU workflow, report schema, интерпретация профилей и
+   известные ограничения в `docs/PERFORMANCE.md`.
+9. [x] Подготовлены точные target-GPU команды, evidence layout и критерии
+   закрытия в `debt.md` без выполнения GPU-тестов.
+
 ### Матрица
 
 - rollout actors: 1, 4, 8, 16;
@@ -1134,13 +1160,14 @@ Graph observation:
 
 ### Критерии готовности
 
-- нет неограниченного роста pending refs/queues;
-- authoritative replay memory следует capacity;
-- learner data wait измерен, а не оценён на глаз;
-- bottleneck определён профилированием;
-- все команды запуска документированы;
-- README ясно отделяет готовое от roadmap;
-- известные ограничения перечислены.
+- [x] pending refs/queues имеют проверяемые high-watermark gates;
+- [x] authoritative и learner-local replay сверяются с transition/byte
+  capacity;
+- [x] learner data wait измерен, а не оценён на глаз;
+- [ ] bottleneck подтверждён target-GPU profiling evidence;
+- [x] все CPU и GPU команды запуска документированы;
+- [x] README ясно отделяет готовое tooling от открытого hardware acceptance;
+- [x] известные ограничения перечислены.
 
 ---
 

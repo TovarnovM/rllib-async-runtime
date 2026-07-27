@@ -45,10 +45,12 @@ collection advances `local_episode_seq`. Replacing an actor increments
 `runner_generation` and resets its local sequence to zero, so the first
 post-restart identity cannot collide with an earlier generation.
 
-`AsyncRolloutGroup` owns 4–16 actors and exposes a finite, non-blocking
-`poll()` operation. It keeps at most one sampling call active per actor and
-uses `ray.wait` over independently completing sample and commit RPCs; there is
-no all-runner wait.
+`AsyncRolloutGroup` originally owned 4–16 actors for the Phase 5 production
+path. Phase 11 later admitted one actor as an explicit comparison baseline;
+the production default remains four. The group exposes a finite, non-blocking
+`poll()` operation, keeps at most one sampling call active per actor, and uses
+`ray.wait` over independently completing sample and commit RPCs; there is no
+all-runner wait.
 
 Before starting an episode, the group reserves one slot that remains occupied
 until that episode's replay commit is acknowledged. Therefore:

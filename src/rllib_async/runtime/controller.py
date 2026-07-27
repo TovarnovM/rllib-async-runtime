@@ -682,14 +682,15 @@ class SingleMemberAsyncSAC:
             if self._rollout_group is not None:
                 self._rollout_group.stop()
             if self._learner_actor is not None:
-                try:
-                    ray.get(
-                        self._learner_actor.stop.remote(timeout_s=timeout_s),
-                        timeout=timeout_s,
-                    )
-                except BaseException as error:
-                    if shutdown_error is None:
-                        shutdown_error = error
+                if graceful:
+                    try:
+                        ray.get(
+                            self._learner_actor.stop.remote(timeout_s=timeout_s),
+                            timeout=timeout_s,
+                        )
+                    except BaseException as error:
+                        if shutdown_error is None:
+                            shutdown_error = error
                 ray.kill(self._learner_actor, no_restart=True)
             if self._replay_actor is not None and self._owns_replay_actor:
                 ray.kill(self._replay_actor, no_restart=True)

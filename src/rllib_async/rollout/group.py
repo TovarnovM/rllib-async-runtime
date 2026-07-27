@@ -169,9 +169,9 @@ class AsyncRolloutGroup:
         if (
             not isinstance(runner_count, int)
             or isinstance(runner_count, bool)
-            or not 4 <= runner_count <= 16
+            or not 1 <= runner_count <= 16
         ):
-            raise ValueError("runner_count must be between 4 and 16")
+            raise ValueError("runner_count must be between 1 and 16")
         if (
             not isinstance(pending_commit_high_watermark, int)
             or isinstance(pending_commit_high_watermark, bool)

@@ -86,9 +86,12 @@ class AsyncSACRuntimeConfig:
             or "\\" in self.member_id
         ):
             raise ValueError("member_id must be a non-empty path segment")
-        self._positive_int("runner_count", self.runner_count)
-        if not 4 <= self.runner_count <= 16:
-            raise ValueError("runner_count must be between 4 and 16")
+        if (
+            not isinstance(self.runner_count, int)
+            or isinstance(self.runner_count, bool)
+            or not 1 <= self.runner_count <= 16
+        ):
+            raise ValueError("runner_count must be between 1 and 16")
         for name in (
             "max_episode_steps",
             "replay_capacity_transitions",
@@ -97,11 +100,16 @@ class AsyncSACRuntimeConfig:
             "replay_sync_max_bytes",
             "pending_commit_high_watermark",
             "batch_size",
-            "batch_queue_capacity",
             "learner_updates_per_tick",
             "publication_interval_updates",
         ):
             self._positive_int(name, getattr(self, name))
+        if (
+            not isinstance(self.batch_queue_capacity, int)
+            or isinstance(self.batch_queue_capacity, bool)
+            or self.batch_queue_capacity < 0
+        ):
+            raise ValueError("batch_queue_capacity must be a non-negative integer")
         if (
             not isinstance(self.pending_commit_low_watermark, int)
             or isinstance(self.pending_commit_low_watermark, bool)
