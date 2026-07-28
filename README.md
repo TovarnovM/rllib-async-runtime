@@ -4,22 +4,23 @@ Experimental Ray-native asynchronous off-policy runtime built on RLlib.
 
 > Experimental project built on Ray/RLlib; not an official Ray project.
 
-The project has completed its bootstrap through single-member recovery.
-Phase 8 adds two concurrent fixed-config Tune members sharing one authoritative
-replay; its dedicated two-GPU acceptance test remains recorded in
-[`debt.md`](debt.md). Phase 9 adds a sparse hierarchy example with one
-discrete manager, two continuous workers, module-specific replay views, and a
-heterogeneous stock RLlib SAC learner. Phase 10 adds homogeneous logical agents
-using one shared ego-GNN SAC module, variable-size graph replay, and packed
-graph batches. Phase 11 adds deterministic component and end-to-end performance
+The planned `v0.1` phases through Phase 11 are implemented. Phase 8 adds two
+concurrent fixed-config Tune members sharing one authoritative replay; its
+dedicated two-GPU acceptance passed on the target workstation. Phase 9 adds a
+sparse hierarchy example with one discrete manager, two continuous workers,
+module-specific replay views, and a heterogeneous stock RLlib SAC learner.
+Phase 10 adds homogeneous logical agents using one shared ego-GNN SAC module,
+variable-size graph replay, and packed graph batches; its CUDA learner check
+also passed. Phase 11 adds deterministic component and end-to-end performance
 harnesses, a true no-prefetch comparison mode, boundedness gates, and measured
-batch/learner timing. Its target-GPU evidence remains open in
-[`debt.md`](debt.md). The project also contains deterministic replay oracles, a
-serialized Ray `ReplayActor`, atomic trusted-local replay checkpoints,
-reader-safe background `FastReplay` index publication, a bounded local batch
-pipeline, version-aware asynchronous rollout, replay-isolated evaluation, and
-a Tune-compatible end-to-end event pump. It does **not** yet implement PBT
-exploit/explore or centralized full-graph inference.
+batch/learner timing. Its reviewed target-GPU evidence closes the performance
+gate without making a portable speedup claim. The project also contains
+deterministic replay oracles, a serialized Ray `ReplayActor`, atomic
+trusted-local replay checkpoints, reader-safe background `FastReplay` index
+publication, a bounded local batch pipeline, version-aware asynchronous
+rollout, replay-isolated evaluation, and a Tune-compatible end-to-end event
+pump. It does **not** yet implement PBT exploit/explore or centralized
+full-graph inference.
 
 ## Development contract
 
@@ -313,8 +314,9 @@ Each Tune trial writes only `member.snapshot`. After both trials terminate,
 `PopulationLauncher.save_checkpoint()` publishes the shared replay once.
 Periodic checkpoints while both trials remain live require a future
 cross-trial coordination protocol and are not claimed by Phase 8.
-The corresponding target-hardware example, still-open validation command, and
-required evidence are in [`debt.md`](debt.md).
+The corresponding target-hardware example and validation passed on
+2026-07-28. The commands and closure evidence are recorded in
+[`debt.md`](debt.md).
 
 ## Phase 9 sparse hierarchy example
 
@@ -377,6 +379,11 @@ critic, twin-critic, and target encoders inside that one module. The example
 does not claim one centralized graph forward for the whole environment,
 continuous graph SAC, or masked-action semantics.
 
+The target-hardware CUDA run completed 200 learner updates for module
+`shared_graph` and advanced its module version to 200. Its functional log and
+profiler are included in the closure evidence described in
+[`debt.md`](debt.md).
+
 ## Phase 11 performance gate
 
 Phase 11 provides:
@@ -407,9 +414,9 @@ uv run --locked --extra cu118 --group dev \
 These commands validate instrumentation and invariants; their throughput is not
 a portable performance claim. The full CPU matrix, report schema, profiling
 guidance, and known limitations are in
-[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). Phase 11 remains acceptance-open
-until the prepared target-GPU matrix in [`debt.md`](debt.md) is executed and
-its evidence is reviewed.
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). The reviewed target-GPU matrix
+passed all deterministic gates and closed Phase 11 on 2026-07-28. Its
+provenance and reproduction protocol are recorded in [`debt.md`](debt.md).
 
 ## Architecture
 

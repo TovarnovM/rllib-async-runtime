@@ -1,15 +1,46 @@
 # Technical debt
 
 This file is the single source of truth for target-hardware GPU validation.
-The commands below are prepared but were **not executed while implementing
-Phase 11**. CPU tests, component profiling, and CI do not substitute for this
-evidence.
+The Phase 8, Phase 10, and Phase 11 gates were executed and reviewed on
+2026-07-28. The commands below remain the reproduction protocol; CPU tests,
+component profiling, and CI alone do not substitute for this evidence.
+
+## Closure evidence
+
+| Field | Reviewed value |
+| --- | --- |
+| Run ID | `gpu-aee9c5a-20260728T090201Z` |
+| Archive SHA-256 | `bbc7591eeda0224495762393f84d46a342a457a78417349464e991c93d0a1c0f` |
+| Benchmark documents | 70 valid JSON reports |
+| Profiles | 180 unique, non-empty, readable `cProfile` artifacts |
+| Clean commits | `aee9c5aef4e5febd14020694698108fcac040190`, `1b8904bc9c46e69e731ffaa9d552de0b58373224` |
+| Environment | Python 3.11.13, Ray 2.56.1, PyTorch 2.7.0+cu118, CUDA 11.8, two RTX 3090 GPUs |
+| Validator result | `validated 70 benchmark documents and 180 unique profiles` |
+
+The second commit is a descendant of the first and changes benchmark
+publication, evidence validation, documentation, and regression tests only.
+It fixes population-report serialization without changing runtime behavior.
+Every report records its own clean commit and environment.
+
+The reviewed bundle establishes:
+
+- the Phase 8 single-GPU and two-GPU tests passed, both population members
+  overlapped, updated on distinct devices, and sampled both producers;
+- the Phase 10 CUDA example completed 200 `shared_graph` learner updates and
+  advanced the module version to 200;
+- every Phase 11 deterministic gate passed, all 180 profiles were readable,
+  and the telemetry reached at most 62 °C with no thermal-violation or PCIe
+  error samples.
+
+Performance findings and interpretation limits are recorded in
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). The evidence archive remains
+outside Git rather than committing generated benchmark output.
 
 Target environment:
 
 - two NVIDIA RTX 3090 GPUs;
 - host driver 550.144.03;
-- repository devcontainer with Python 3.11;
+- repository devcontainer with Python 3.11.13;
 - Ray/RLlib 2.56.1;
 - PyTorch 2.7.0 CUDA 11.8 wheel selected by the `cu118` extra.
 
@@ -102,7 +133,7 @@ trap - EXIT
 
 ## Phase 8 — target two-GPU gate
 
-**Status:** open
+**Status:** closed on 2026-07-28
 
 As a single-member end-to-end accelerator smoke, run the finite Pendulum
 example:
@@ -126,7 +157,7 @@ timeout --signal=TERM --kill-after=30s 900s \
   2>&1 | tee "$artifact_dir/single-gpu-pytest.log"
 ```
 
-Then run the unresolved Phase 8 topology gate:
+Then run the Phase 8 topology gate:
 
 ```bash
 timeout --signal=TERM --kill-after=30s 1800s \
@@ -148,19 +179,21 @@ timeout --signal=TERM --kill-after=30s 1800s \
   2>&1 | tee "$artifact_dir/two-gpu-population-example.log"
 ```
 
-The Phase 8 debt closes only when the two-GPU pytest command passes and the
-user-facing topology example completes while proving:
+The closure criteria require the two-GPU pytest command to pass and the
+user-facing topology example to complete while proving:
 
 - two members overlap in time and both perform learner updates;
 - Ray assigns exactly one distinct accelerator ID to each learner;
 - both learner-local replay views contain episodes from both producer members;
 - stopping the launcher cleans up without a replay ownership failure.
 
-Until then, Phase 8 remains unchecked in `docs/IMPLEMENTATION_PLAN.md`.
+The reviewed run satisfied these criteria. The example reported
+`member-0` on GPU 0 with 165 updates and a 724/726 producer split, and
+`member-1` on GPU 1 with 168 updates and a 735/738 producer split.
 
 ## Phase 10 — shared ego-GNN learner on CUDA
 
-**Status:** prepared, not executed
+**Status:** closed on 2026-07-28
 
 The example now accepts an explicit learner device count. Run a functional
 shared-GNN update sequence on one GPU:
@@ -192,9 +225,14 @@ learner-update count, the `shared_graph` replay module, and an advanced module
 version. The profiler report must be retained even if the workload is
 CPU-bound; low GPU utilization is a result, not a reason to discard evidence.
 
+The reviewed run reported 200 learner updates, 6,400 `shared_graph`
+transitions, module version 200, and one CUDA learner. The profiler localized
+material graph work in normalization/packed collation and
+`index_add_`/`scatter_add_`, alongside optimizer kernels.
+
 ## Phase 11 — target-GPU performance matrix
 
-**Status:** open; harness complete, hardware evidence absent
+**Status:** closed on 2026-07-28
 
 The benchmark matrix records JSON reports and driver-local `cProfile`
 artifacts. End-to-end commands combine the harness `--max-duration-s` deadline
@@ -344,7 +382,7 @@ Every document still must record a full Git commit, `git_dirty: false`, and the
 required CUDA inventory. The final output lists every commit represented in
 the bundle.
 
-Phase 11 closes only after the evidence bundle demonstrates:
+The reviewed evidence bundle demonstrates:
 
 - every deterministic gate passes for every matrix point;
 - no pending RPC, batch queue, authoritative replay, or learner-local replay
@@ -363,5 +401,5 @@ Phase 11 closes only after the evidence bundle demonstrates:
 No fixed throughput improvement is a closure criterion: throughput depends on
 the workstation and driver state. The required result is a reproducible
 comparison, bounded runtime behavior, and an evidence-backed bottleneck
-finding. Until that review is complete, Phase 11 remains unchecked in
+finding. The reviewed run satisfies that contract, so Phase 11 is closed in
 `docs/IMPLEMENTATION_PLAN.md`.
