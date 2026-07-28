@@ -6,8 +6,9 @@ remain hard gates. Throughput, latency, and the winning mode are observations
 that must be reported together with the generated environment metadata.
 
 Target-GPU execution is intentionally not part of the ordinary development
-loop. The complete deferred hardware matrix, commands, artifact requirements,
-and closure criteria are maintained in [`../debt.md`](../debt.md).
+loop. The complete hardware matrix, reproduction commands, artifact
+requirements, and reviewed closure record are maintained in
+[`../debt.md`](../debt.md).
 
 ## Modes and scope
 
@@ -26,6 +27,73 @@ The two-member benchmark supports `direct` and `queued`. Stock SAC has no
 equivalent topology with two independent learners sharing one authoritative
 episode store, so the harness rejects `--members 2 --mode stock` rather than
 presenting a misleading comparison.
+
+## Reviewed target-GPU evidence
+
+The target-workstation matrix was executed and reviewed on 2026-07-28.
+
+| Field | Value |
+| --- | --- |
+| Run ID | `gpu-aee9c5a-20260728T090201Z` |
+| Hardware | Two NVIDIA GeForce RTX 3090 GPUs |
+| Software | Python 3.11.13, Ray 2.56.1, PyTorch 2.7.0+cu118, CUDA 11.8 |
+| Clean commits | `aee9c5aef4e5febd14020694698108fcac040190`, `1b8904bc9c46e69e731ffaa9d552de0b58373224` |
+| Evidence | 70 valid JSON reports and 180 unique, non-empty profiles |
+| Archive SHA-256 | `bbc7591eeda0224495762393f84d46a342a457a78417349464e991c93d0a1c0f` |
+
+The validator accepted every required matrix point and every referenced
+profile. All deterministic top-level and member gates passed. The two-member
+functional run assigned GPU 0 and GPU 1 to different learners, both learners
+updated concurrently, and each replay view received approximately half of its
+episodes from each producer. The shared-GNN CUDA run completed 200 learner
+updates for `shared_graph` and advanced the module version to 200. Device
+telemetry peaked at 62 °C with no thermal-violation or PCIe error samples.
+
+### Measured observations
+
+The following ratios are geometric means across the complete matrix. They use
+measured environment throughput and are observations of this run, not
+work-normalized speedup claims.
+
+| Comparison | Geometric-mean ratio |
+| --- | ---: |
+| One-member `direct / stock` | 1.451× |
+| One-member `queued / stock` | 1.424× |
+| One-member `queued / direct` | 0.982× |
+| Two-member aggregate `queued / direct` | 0.995× |
+
+Background batching did not improve the flat end-to-end workload. Direct mode
+was classified as batch-supply-bound for 21 of 32 one-member results and 42 of
+64 population-member results; the remaining classifications were 10/20
+learner-update-bound and 1/2 balanced. Queued mode shifted all 32 one-member
+and all 64 population-member results to learner-update-bound without improving
+throughput.
+
+The component matrix measured 28.6–70.8k flat transitions/s versus
+4.4–8.4k graph transitions/s across direct and queued modes. The graph profiles
+localized the additional cost in graph normalization/decode, packed
+collation, and `index_add_`/`scatter_add_`; optimizer kernels remain part of
+the learner cost. Authoritative replay ingest retained substantial headroom
+over end-to-end consumption and was not the observed bottleneck. Small models
+plus CPU decoding, collation, and orchestration left the GPUs underutilized.
+
+### Interpretation boundary
+
+The environment-throughput ratios above must not be reported as proof that the
+runtime is 1.45× faster than stock RLlib:
+
+- with target training intensity 4, median achieved intensity was 1.218
+  (`direct`) and 1.177 (`queued`) for one member, and 1.193/1.176 for
+  population members, so learner-update debt accumulated;
+- the stock reports did not expose a usable RLlib trained-step counter and
+  recorded zero trained steps;
+- each matrix point was measured once, without repetitions or confidence
+  intervals.
+
+The evidence is sufficient for the Phase 11 contract: reproducible execution,
+bounded runtime state, complete measurement coverage, and an evidence-backed
+bottleneck finding. A public speedup claim requires a separate
+work-normalized, repeated benchmark.
 
 ## Benchmark inventory
 
@@ -218,9 +286,9 @@ Representative CPU component profiling during Phase 11 localized:
 - authoritative ingest in payload fingerprint serialization;
 - queued consumer time predominantly in bounded queue wait.
 
-Those observations justify the instrumentation boundaries. They are not
-target-workstation throughput conclusions and no numeric result is committed
-to the repository.
+Those observations justify the instrumentation boundaries. The reviewed
+target-workstation findings above supersede them for Phase 11 closure; neither
+set of measurements is a portable throughput claim.
 
 ## Required invariant gates
 
@@ -257,7 +325,7 @@ metadata remains monotonic, as documented in the architecture and README.
 - One logical environment still belongs to each rollout actor.
 - The two-member mode measures the custom shared-replay topology only; there
   is no fabricated stock equivalent.
-- CPU component findings do not close either the Phase 8 two-GPU gate or Phase
-  11 target-hardware acceptance.
+- The reviewed target-hardware evidence closes the Phase 8 and Phase 11 gates,
+  but it does not establish a work-normalized speedup.
 - Benchmark and profiler outputs live under ignored `artifacts/` paths and
   must be archived externally when used as release evidence.

@@ -1,11 +1,10 @@
 # `rllib-async-runtime`: подробный план реализации
 
-**Статус:** Phase 0–7 реализованы; код Phase 8 слит с открытым two-GPU debt;
-Phase 9 hierarchy и Phase 10 shared-GNN реализованы; tooling Phase 11
-реализован, но hardware acceptance остаётся открытым до выполнения GPU-матрицы
-из `debt.md`
+**Статус:** Phase 0–11 реализованы; two-GPU gate Phase 8, CUDA-проверка
+shared-GNN Phase 10 и target-hardware performance gate Phase 11 закрыты
+проверенным evidence-комплектом из `debt.md`
 
-**Дата фиксации:** 24 июля 2026
+**Дата фиксации:** 28 июля 2026
 
 **Рекомендуемый GitHub-репозиторий:** `TovarnovM/rllib-async-runtime`
 
@@ -989,6 +988,11 @@ Phase 3 разделён на correctness-first Phase 3A и асинхронны
 
 ## Phase 8. Две особи, две GPU, один replay
 
+**Статус реализации:** завершено 28 июля 2026. Target-hardware тест и
+пользовательский пример подтвердили одновременные updates двух members,
+раздельные GPU 0/1 и примерно равное присутствие обоих producers в каждом
+learner-local replay.
+
 ### Задачи
 
 1. Population launcher создаёт один named/detached `ReplayActor`.
@@ -1063,10 +1067,11 @@ workers удобно делать continuous SAC policies. Не нужно ск�
 
 ## Phase 10. Shared-GNN multi-agent example
 
-**Статус реализации:** завершено 26 июля 2026. Зафиксированная ниже
-ego-graph трактовка реализована через один shared RLModule, graph-aware codec,
-packed collator и pure-PyTorch encoder; centralized full-graph runner не
-добавлялся.
+**Статус реализации:** завершено 26 июля 2026; target-hardware CUDA-проверка
+закрыта 28 июля 2026. Зафиксированная ниже ego-graph трактовка реализована
+через один shared RLModule, graph-aware codec, packed collator и pure-PyTorch
+encoder; centralized full-graph runner не добавлялся. CUDA-прогон выполнил 200
+learner updates и довёл версию `shared_graph` до 200.
 
 ### Зафиксированная трактовка
 
@@ -1120,8 +1125,9 @@ Graph observation:
 ## Phase 11. Performance gate и документация
 
 **Статус реализации:** instrumentation и воспроизводимый benchmark harness
-завершены 26 июля 2026. Аппаратный gate не выполнялся и остаётся открытым в
-`debt.md`; поэтому Phase 11 пока не отмечается завершённой в общем трекере.
+завершены 26 июля 2026; target-hardware gate выполнен и закрыт 28 июля 2026.
+Проверенный комплект содержит 70 benchmark JSON и 180 уникальных профилей на
+двух чистых commit, его provenance и SHA-256 зафиксированы в `debt.md`.
 
 ### Реализованные задачи
 
@@ -1141,7 +1147,10 @@ Graph observation:
 8. [x] Документированы CPU workflow, report schema, интерпретация профилей и
    известные ограничения в `docs/PERFORMANCE.md`.
 9. [x] Подготовлены точные target-GPU команды, evidence layout и критерии
-   закрытия в `debt.md` без выполнения GPU-тестов.
+   закрытия в `debt.md`.
+10. [x] Выполнена полная target-GPU матрица, проверены функциональные логи,
+    JSON, профили и системная телеметрия; выводы записаны в
+    `docs/PERFORMANCE.md`.
 
 ### Матрица
 
@@ -1164,9 +1173,9 @@ Graph observation:
 - [x] authoritative и learner-local replay сверяются с transition/byte
   capacity;
 - [x] learner data wait измерен, а не оценён на глаз;
-- [ ] bottleneck подтверждён target-GPU profiling evidence;
+- [x] bottleneck подтверждён target-GPU profiling evidence;
 - [x] все CPU и GPU команды запуска документированы;
-- [x] README ясно отделяет готовое tooling от открытого hardware acceptance;
+- [x] README ясно отделяет закрытый hardware gate от ограничений интерпретации;
 - [x] известные ограничения перечислены.
 
 ---
@@ -1391,10 +1400,10 @@ Success criterion первого PR:
 - [x] Phase 5 rollout/version sync.
 - [x] Phase 6 single-member AsyncSAC.
 - [x] Phase 7 checkpoint/recovery.
-- [ ] Phase 8 two-member population.
+- [x] Phase 8 two-member population.
 - [x] Phase 9 hierarchy example.
 - [x] Phase 10 shared-GNN example.
-- [ ] Phase 11 performance gate/documentation.
+- [x] Phase 11 performance gate/documentation.
 
 ---
 
