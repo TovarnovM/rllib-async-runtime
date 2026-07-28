@@ -179,7 +179,7 @@ script:
 
 ```bash
 timeout --signal=TERM --kill-after=30s 1800s \
-  uv run --locked --extra cu118 --group dev \
+  uv run --locked --extra cu118 --group dev --with pip \
   python -m torch.utils.bottleneck \
   examples/shared_gnn_multiagent.py \
   --episodes 200 \
@@ -330,101 +330,19 @@ In addition to each member's resource gates, every two-member report must pass
 
 ### Evidence review and closure
 
-After all runs, verify that every JSON result contains only passing gate sets:
+After all runs, verify matrix coverage, per-document provenance, passing gate
+sets, and referenced profiles:
 
 ```bash
-uv run --locked --extra cu118 --group dev python - "$artifact_dir" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-documents = []
-for path in sorted(root.glob("*.json")):
-    document = json.loads(path.read_text(encoding="utf-8"))
-    if document.get("schema_version") == 1 and document.get("benchmark"):
-        documents.append((path, document))
-if not documents:
-    raise SystemExit("no benchmark JSON documents found")
-
-expected_names = {
-    "replay-ingest-short.json",
-    "replay-ingest-long.json",
-}
-expected_names.update(
-    f"fast-replay-e{episode_length}-b{batch_size}.json"
-    for episode_length in (32, 512)
-    for batch_size in (128, 512)
-)
-expected_names.update(
-    f"gpu-single-r{runners}-e{episode_length}-b{batch_size}-u{intensity}.json"
-    for runners in (1, 4, 8, 16)
-    for episode_length in (32, 512)
-    for batch_size in (128, 512)
-    for intensity in (1, 4)
-)
-expected_names.update(
-    f"gpu-population-r{runners}-e{episode_length}-b{batch_size}-u{intensity}.json"
-    for runners in (1, 4, 8, 12)
-    for episode_length in (32, 512)
-    for batch_size in (128, 512)
-    for intensity in (1, 4)
-)
-
-observed_names = {path.name for path, _ in documents}
-missing = sorted(expected_names - observed_names)
-unexpected = sorted(observed_names - expected_names)
-if missing or unexpected:
-    raise SystemExit(
-        f"matrix mismatch: missing={missing}, unexpected={unexpected}"
-    )
-
-expected_commit = (root / "commit.txt").read_text(encoding="utf-8").strip()
-failed = []
-profile_names = set()
-for path, document in documents:
-    environment = document.get("environment", {})
-    if (
-        environment.get("git_commit") != expected_commit
-        or environment.get("git_dirty") is not False
-        or environment.get("cuda_available") is not True
-        or environment.get("cuda_device_count", 0) < 2
-    ):
-        failed.append(f"{path.name}:environment")
-    results = document.get("results")
-    if not results:
-        failed.append(f"{path.name}:missing-results")
-        continue
-    for index, result in enumerate(results):
-        gates = result.get("gates", {})
-        if gates.get("all_passed") is not True:
-            failed.append(f"{path.name}:result[{index}]")
-        for member_index, member in enumerate(result.get("member_results", [])):
-            if member.get("gates", {}).get("all_passed") is not True:
-                failed.append(
-                    f"{path.name}:result[{index}]:member[{member_index}]"
-                )
-        profile = result.get("profile")
-        if not profile:
-            failed.append(f"{path.name}:result[{index}]:missing-profile")
-            continue
-        profile_name = Path(profile).name
-        profile_names.add(profile_name)
-        if not (root / "profiles" / profile_name).is_file():
-            failed.append(f"{path.name}:result[{index}]:profile-not-found")
-
-if failed:
-    raise SystemExit("failed gates: " + ", ".join(failed))
-if len(profile_names) != 180:
-    raise SystemExit(
-        f"expected 180 unique profiles, found {len(profile_names)}"
-    )
-print(
-    f"validated {len(documents)} benchmark documents and "
-    f"{len(profile_names)} unique profiles"
-)
-PY
+uv run --locked --extra cu118 --group dev \
+  python -m benchmarks.validate_evidence "$artifact_dir"
 ```
+
+The validator accepts documents produced by more than one clean commit so a
+completed matrix point does not need to be repeated after a harness-only fix.
+Every document still must record a full Git commit, `git_dirty: false`, and the
+required CUDA inventory. The final output lists every commit represented in
+the bundle.
 
 Phase 11 closes only after the evidence bundle demonstrates:
 
@@ -438,7 +356,7 @@ Phase 11 closes only after the evidence bundle demonstrates:
   episodes from both producer members;
 - `nvidia-dmon.log`, component profiles, end-to-end profiles, and timing
   metrics support a written bottleneck conclusion for flat and graph paths;
-- the evidence records the exact clean Git commit and environment inventory;
+- every JSON records its exact clean Git commit and environment inventory;
 - the complete `artifacts/performance/$run_id` directory is archived outside
   the Git repository.
 

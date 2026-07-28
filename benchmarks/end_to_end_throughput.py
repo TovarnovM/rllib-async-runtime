@@ -35,6 +35,19 @@ from rllib_async.runtime import (
     SingleMemberAsyncSAC,
 )
 
+_RUNTIME_REPORT_KEYS = (
+    "timesteps_this_iter",
+    "episodes_this_iter",
+    "episode_reward_mean",
+    "controller",
+    "rollout",
+    "authoritative_replay",
+    "fast_replay",
+    "batching",
+    "learner",
+    "evaluation",
+)
+
 
 class _PopulationMeasurementStopper(Stopper):
     """Measure only the shared post-warmup window of a Tune population."""
@@ -125,6 +138,12 @@ class _PopulationMeasurementStopper(Stopper):
                 "measured_learner_updates": measured_learner_updates,
             }
         return duration_s, members
+
+
+def _extract_runtime_report(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop Tune-added result metadata from an AsyncSAC runtime report."""
+
+    return {key: metrics[key] for key in _RUNTIME_REPORT_KEYS}
 
 
 def parse_args() -> argparse.Namespace:
@@ -410,7 +429,7 @@ def run_population(
         duration_s, measurements = measurement_stopper.measurement()
         member_results = []
         for result in results:
-            report = result.metrics
+            report = _extract_runtime_report(result.metrics)
             member_id = str(report["controller"]["member_id"])
             measurement = measurements[member_id]
             gates = runtime_invariant_gates(

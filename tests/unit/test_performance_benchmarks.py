@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from benchmarks.common import (
     runtime_invariant_gates,
 )
 from benchmarks.end_to_end_throughput import (
+    _extract_runtime_report,
     _PopulationMeasurementStopper,
     _profile_path,
     _required_cluster_resources,
@@ -124,6 +126,33 @@ def test_end_to_end_cli_accepts_twelve_runner_population_point(
 
     assert args.members == 2
     assert args.runner_count == 12
+
+
+def test_population_report_excludes_tune_metadata_before_publication() -> None:
+    metrics = {
+        "timesteps_this_iter": 32,
+        "episodes_this_iter": 1,
+        "episode_reward_mean": 0.0,
+        **make_report(),
+        "evaluation": {"enabled": False},
+        "config": {
+            "member": {
+                "sac_config": build_sac_config(
+                    make_args(),
+                    stock=False,
+                    seed=20260726,
+                )
+            }
+        },
+    }
+
+    with pytest.raises(TypeError, match="SACConfig"):
+        json.dumps(metrics)
+
+    report = _extract_runtime_report(metrics)
+
+    assert "config" not in report
+    json.dumps(report, allow_nan=False)
 
 
 def test_benchmark_episode_builders_satisfy_codec_contracts() -> None:
