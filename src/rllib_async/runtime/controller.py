@@ -17,6 +17,7 @@ from ray.rllib.env.single_agent_env_runner import SingleAgentEnvRunner
 from ray.tune import Trainable
 from ray.tune.execution.placement_groups import PlacementGroupFactory
 
+from rllib_async.learner import PBTModelState
 from rllib_async.protocols import (
     FlatEpisodeCodec,
     ReplayCursor,
@@ -67,6 +68,8 @@ class SingleMemberAsyncSAC:
         checkpoint_dir: str | os.PathLike[str] | None = None,
         replay_actor: Any | None = None,
         member_checkpoint_state: RuntimeCheckpointState | None = None,
+        pbt_state: PBTModelState | None = None,
+        reward_window_episodes: int = 100,
     ) -> None:
         if not ray.is_initialized():
             raise RuntimeError("Ray must be initialized before SingleMemberAsyncSAC")
@@ -88,9 +91,24 @@ class SingleMemberAsyncSAC:
             raise ValueError("runtime restore accepts only one checkpoint source")
         if member_checkpoint_state is not None and replay_actor is None:
             raise ValueError("population member restore requires an external replay")
+        if pbt_state is not None and (
+            checkpoint_dir is not None or member_checkpoint_state is not None
+        ):
+            raise ValueError("PBT construction cannot restore a full checkpoint")
+        if pbt_state is not None and replay_actor is None:
+            raise ValueError("PBT construction requires an external replay")
+        if pbt_state is not None and not isinstance(pbt_state, PBTModelState):
+            raise TypeError("pbt_state must be PBTModelState")
+        if (
+            not isinstance(reward_window_episodes, int)
+            or isinstance(reward_window_episodes, bool)
+            or reward_window_episodes < 1
+        ):
+            raise ValueError("reward_window_episodes must be a positive integer")
 
         self._sac_config = sac_config.copy(copy_frozen=False)
         self._config = runtime_config
+        self._reward_window_episodes = reward_window_episodes
         self._owns_replay_actor = replay_actor is None
         restore_started = time.monotonic()
         checkpoint_state: RuntimeCheckpointState | None = None
@@ -112,6 +130,14 @@ class SingleMemberAsyncSAC:
         self._target_training_intensity = self._resolve_training_intensity(
             self._sac_config.training_intensity,
             batch_size=self._config.batch_size,
+        )
+        self._budget_sampled_origin = (
+            int(self._sac_config.num_steps_sampled_before_learning_starts)
+            if pbt_state is not None
+            else 0
+        )
+        self._budget_updates_origin = self._learner_update_budget_for_sampled(
+            self._budget_sampled_origin
         )
         self._codec = FlatEpisodeCodec()
         self._state = RuntimeState.CREATED
@@ -185,6 +211,8 @@ class SingleMemberAsyncSAC:
                 allow_replay_ahead_on_restore=(
                     checkpoint_state is not None and not self._owns_replay_actor
                 ),
+                pbt_state=pbt_state,
+                learning_starts_satisfied=pbt_state is not None,
             )
             initial_weights = ray.get(
                 self._learner_actor.get_published_weights.remote()
@@ -207,6 +235,7 @@ class SingleMemberAsyncSAC:
                     self._config.pending_commit_low_watermark
                 ),
                 num_cpus_per_runner=self._config.num_cpus_per_runner,
+                reward_window_episodes=self._reward_window_episodes,
                 checkpoint_state=(
                     checkpoint_state.rollout if checkpoint_state is not None else None
                 ),
@@ -301,6 +330,26 @@ class SingleMemberAsyncSAC:
             runtime_config,
             replay_actor=replay_actor,
             member_checkpoint_state=checkpoint_state,
+        )
+
+    @classmethod
+    def from_pbt_state(
+        cls,
+        sac_config: SACConfig,
+        runtime_config: AsyncSACRuntimeConfig,
+        pbt_state: PBTModelState,
+        *,
+        replay_actor: Any,
+        reward_window_episodes: int,
+    ) -> SingleMemberAsyncSAC:
+        """Create one fresh generation from model-only donor state."""
+
+        return cls(
+            sac_config,
+            runtime_config,
+            replay_actor=replay_actor,
+            pbt_state=pbt_state,
+            reward_window_episodes=reward_window_episodes,
         )
 
     def start(self) -> None:
@@ -475,6 +524,16 @@ class SingleMemberAsyncSAC:
         if replay_values is not None:
             result["authoritative_replay"] = self._metric_tree(replay_values)
         return result
+
+    def export_pbt_state(self) -> PBTModelState:
+        """Read model-only state from the serialized learner actor."""
+
+        self._require_not_stopped()
+        assert self._learner_actor is not None
+        state = ray.get(self._learner_actor.export_pbt_state.remote())
+        if not isinstance(state, PBTModelState):
+            raise RuntimeError("learner actor returned invalid PBT state")
+        return state
 
     def save_checkpoint(
         self,
@@ -846,6 +905,8 @@ class SingleMemberAsyncSAC:
                 learner_update_budget - self._learner_updates_completed,
                 0,
             ),
+            "budget_sampled_origin": self._budget_sampled_origin,
+            "budget_updates_origin": self._budget_updates_origin,
             "target_training_intensity": self._target_training_intensity,
             "effective_training_intensity": (self._effective_training_intensity()),
             "checkpoint_sequence": self._checkpoint_sequence,
@@ -872,6 +933,8 @@ class SingleMemberAsyncSAC:
             "reports": self._reports,
             "pending_rpc_high_watermark": self._pending_rpc_high_watermark,
             "learner_updates_completed": self._learner_updates_completed,
+            "budget_sampled_origin": self._budget_sampled_origin,
+            "budget_updates_origin": self._budget_updates_origin,
             "last_report_env_steps": self._last_report_env_steps,
             "last_report_episodes": self._last_report_episodes,
             "next_evaluation_env_steps": self._next_evaluation_env_steps,
@@ -927,6 +990,18 @@ class SingleMemberAsyncSAC:
             state,
             "learner_updates_completed",
         )
+        self._budget_sampled_origin = self._optional_checkpoint_counter(
+            state,
+            "budget_sampled_origin",
+        )
+        self._budget_updates_origin = self._optional_checkpoint_counter(
+            state,
+            "budget_updates_origin",
+        )
+        if self._budget_updates_origin != self._learner_update_budget_for_sampled(
+            self._budget_sampled_origin
+        ):
+            raise ValueError("controller checkpoint budget origin is invalid")
         self._last_report_env_steps = self._checkpoint_counter(
             state,
             "last_report_env_steps",
@@ -992,6 +1067,13 @@ class SingleMemberAsyncSAC:
             raise ValueError(f"controller checkpoint {name} is invalid")
         return value
 
+    @staticmethod
+    def _optional_checkpoint_counter(state: Mapping[str, Any], name: str) -> int:
+        value = state.get(name, 0)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"controller checkpoint {name} is invalid")
+        return value
+
     def _kill_components(self) -> None:
         if self._evaluation_group is not None:
             self._evaluation_group.stop()
@@ -1019,7 +1101,14 @@ class SingleMemberAsyncSAC:
         )
 
     def _learner_update_budget(self, rollout: object) -> int:
-        sampled_steps = self._sampled_steps(rollout)
+        sampled_steps = self._budget_sampled_origin + self._sampled_steps(rollout)
+        return max(
+            self._learner_update_budget_for_sampled(sampled_steps)
+            - self._budget_updates_origin,
+            0,
+        )
+
+    def _learner_update_budget_for_sampled(self, sampled_steps: int) -> int:
         learning_starts = int(self._sac_config.num_steps_sampled_before_learning_starts)
         if sampled_steps < learning_starts:
             return 0

@@ -10,11 +10,14 @@ import rllib_async.runtime.population as population_module
 from rllib_async.protocols import ReplayCursor, ReplayStats
 from rllib_async.runtime import (
     AsyncSACRuntimeConfig,
+    FloatMutation,
     PopulationAsyncSAC,
+    PopulationError,
     PopulationLauncher,
     PopulationMemberSpec,
     PopulationTrainable,
     RuntimeState,
+    SimplePBTConfig,
     SingleMemberAsyncSAC,
     make_runtime_member_id,
 )
@@ -42,6 +45,21 @@ def make_single_trial_specs(
         )
         for index in range(size)
     )
+
+
+def make_pbt_config(**overrides: object) -> SimplePBTConfig:
+    values = {
+        "perturbation_interval_reports": 2,
+        "min_episodes_after_restart": 2,
+        "seed": 20260729,
+        "mutations": {
+            "actor_lr": FloatMutation(1e-5, 1e-3),
+            "critic_lr": FloatMutation(1e-5, 1e-3),
+            "alpha_lr": FloatMutation(1e-5, 1e-3),
+        },
+    }
+    values.update(overrides)
+    return SimplePBTConfig(**values)
 
 
 def test_population_rejects_incompatible_observation_action_spaces(
@@ -102,6 +120,322 @@ def test_runtime_member_id_is_generation_specific_and_deterministic() -> None:
         make_runtime_member_id("run-test", "member-02", -1)
 
 
+def test_pbt_config_rejects_unknown_or_non_changing_mutations() -> None:
+    with pytest.raises(ValueError, match="unknown PBT mutation"):
+        SimplePBTConfig(
+            perturbation_interval_reports=1,
+            mutations={"gamma": FloatMutation(0.1, 0.9)},
+        )
+    with pytest.raises(ValueError, match="able to change"):
+        FloatMutation(1e-5, 1e-3, factors=(1.0,))
+
+    with pytest.raises(ValueError, match="unknown PBT mutation"):
+        PopulationTrainable._parse_config(
+            {
+                "members": make_single_trial_specs(),
+                "pbt": {
+                    "perturbation_interval_reports": 1,
+                    "mutations": {
+                        "batch_size": {
+                            "low": 1,
+                            "high": 2,
+                        }
+                    },
+                },
+            }
+        )
+
+
+def test_pbt_mutation_is_reproducible_bounded_and_changes_one_hparam() -> None:
+    config = make_pbt_config()
+    hparams = {
+        "actor_lr": 3e-4,
+        "critic_lr": 4e-4,
+        "alpha_lr": 1e-4,
+    }
+
+    first = PopulationAsyncSAC._mutate_hparams(
+        hparams,
+        config=config,
+        exploit_count=3,
+    )
+    second = PopulationAsyncSAC._mutate_hparams(
+        hparams,
+        config=config,
+        exploit_count=3,
+    )
+
+    assert first == second
+    mutated, parameter, parameter_index, _, old_value, new_value = first
+    assert parameter_index == tuple(sorted(config.mutations)).index(parameter)
+    assert old_value != new_value
+    assert {name for name in hparams if hparams[name] != mutated[name]} == {parameter}
+    bounds = config.mutations[parameter]
+    assert bounds.low <= new_value <= bounds.high
+
+
+def test_pbt_selection_has_deterministic_tie_breaking() -> None:
+    scores = {
+        "member-02": 3.0,
+        "member-01": 3.0,
+        "member-00": 1.0,
+    }
+
+    assert PopulationAsyncSAC._select_donor_and_target(
+        scores,
+        mode="max",
+    ) == ("member-01", "member-00")
+    assert PopulationAsyncSAC._select_donor_and_target(
+        scores,
+        mode="min",
+    ) == ("member-00", "member-01")
+
+
+def test_pbt_waits_for_fresh_episodes_without_resetting_due_interval() -> None:
+    class FakeMember:
+        state = RuntimeState.RUNNING
+
+    population = object.__new__(PopulationAsyncSAC)
+    population._pbt_config = make_pbt_config(
+        perturbation_interval_reports=1,
+        min_episodes_after_restart=2,
+    )
+    population._slot_ids = ("member-00", "member-01")
+    population._members = {slot_id: FakeMember() for slot_id in population._slot_ids}
+    population._restarting_slot = None
+    population._reports_since_perturbation = 1
+    population._exploit_count = 0
+    population._last_pbt_event = {}
+
+    reports = {
+        "member-00": {
+            "train": {
+                "episode_reward_mean": 3.0,
+                "episodes_since_metric_reset": 2,
+            }
+        },
+        "member-01": {
+            "train": {
+                "episode_reward_mean": 1.0,
+                "episodes_since_metric_reset": 1,
+            }
+        },
+    }
+
+    event = population._maybe_run_pbt_step(reports)
+
+    assert event["event_reason"] == "not_enough_eligible_members"
+    assert population._reports_since_perturbation == 1
+    assert population._exploit_count == 0
+
+
+def test_pbt_step_restarts_only_deterministic_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeMember:
+        state = RuntimeState.RUNNING
+
+        def __init__(self, slot_id: str) -> None:
+            self.slot_id = slot_id
+            self.exports = 0
+
+        def export_pbt_state(self) -> object:
+            self.exports += 1
+            return object()
+
+    population = object.__new__(PopulationAsyncSAC)
+    population._pbt_config = make_pbt_config(perturbation_interval_reports=1)
+    population._slot_ids = ("member-00", "member-01", "member-02")
+    population._members = {
+        slot_id: FakeMember(slot_id) for slot_id in population._slot_ids
+    }
+    population._restarting_slot = None
+    population._reports_since_perturbation = 1
+    population._exploit_count = 0
+    population._last_exploit_duration_s = 0.0
+    population._last_pbt_event = {}
+    population._generations = dict.fromkeys(population._slot_ids, 0)
+    population._current_hparams = {
+        slot_id: {
+            "actor_lr": 3e-4,
+            "critic_lr": 3e-4,
+            "alpha_lr": 1e-4,
+        }
+        for slot_id in population._slot_ids
+    }
+    replaced: list[tuple[str, dict[str, float], object]] = []
+
+    def replace_target(
+        target_slot: str,
+        *,
+        new_hparams,
+        donor_state: object,
+    ) -> str:
+        replaced.append((target_slot, dict(new_hparams), donor_state))
+        return "run-test-member-00-g0001"
+
+    monkeypatch.setattr(population, "_replace_target", replace_target)
+    reports = {
+        "member-00": {
+            "train": {
+                "episode_reward_mean": 1.0,
+                "episodes_since_metric_reset": 2,
+            }
+        },
+        "member-01": {
+            "train": {
+                "episode_reward_mean": 3.0,
+                "episodes_since_metric_reset": 2,
+            }
+        },
+        "member-02": {
+            "train": {
+                "episode_reward_mean": 2.0,
+                "episodes_since_metric_reset": 2,
+            }
+        },
+    }
+
+    event = population._maybe_run_pbt_step(reports)
+
+    assert event["event_happened"] == 1
+    assert event["donor_slot"] == "member-01"
+    assert event["target_slot"] == "member-00"
+    assert len(replaced) == 1
+    assert population._members["member-01"].exports == 1
+    assert population._members["member-00"].exports == 0
+    assert population._exploit_count == 1
+    assert population._reports_since_perturbation == 0
+
+
+def test_target_restart_uses_new_identity_shared_replay_and_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    spaces = {
+        "default_policy": (
+            gym.spaces.Box(-1.0, 1.0, shape=(3,)),
+            gym.spaces.Box(-1.0, 1.0, shape=(1,)),
+        )
+    }
+    monkeypatch.setattr(
+        SingleMemberAsyncSAC,
+        "_resolve_spaces",
+        staticmethod(lambda _: spaces),
+    )
+    population = PopulationAsyncSAC(
+        make_single_trial_specs(),
+        run_id="run-test",
+        pbt_config=make_pbt_config(),
+    )
+    replay = object()
+    population._replay_actor = replay
+
+    class OldMember:
+        state = RuntimeState.RUNNING
+
+        def __init__(self) -> None:
+            self.stops = 0
+
+        def stop(self, *, graceful: bool = True) -> None:
+            assert graceful
+            self.stops += 1
+
+    class Replacement:
+        def __init__(self) -> None:
+            self.starts = 0
+
+        def start(self) -> None:
+            self.starts += 1
+
+        def stop(self, *, graceful: bool = True) -> None:
+            raise AssertionError(f"unexpected replacement stop {graceful=}")
+
+    donor = OldMember()
+    target = OldMember()
+    population._members = {
+        "member-00": target,
+        "member-01": donor,
+    }
+    replacement = Replacement()
+    captured: dict[str, object] = {}
+
+    def from_pbt_state(
+        cls,
+        sac_config,
+        runtime_config,
+        pbt_state,
+        *,
+        replay_actor,
+        reward_window_episodes,
+    ):
+        del cls
+        captured.update(
+            {
+                "sac_config": sac_config,
+                "runtime_config": runtime_config,
+                "pbt_state": pbt_state,
+                "replay_actor": replay_actor,
+                "reward_window_episodes": reward_window_episodes,
+            }
+        )
+        return replacement
+
+    monkeypatch.setattr(
+        SingleMemberAsyncSAC,
+        "from_pbt_state",
+        classmethod(from_pbt_state),
+    )
+    donor_state = object()
+    new_hparams = {
+        "actor_lr": 2.4e-4,
+        "critic_lr": 3e-4,
+        "alpha_lr": 1e-4,
+    }
+
+    runtime_member_id = population._replace_target(
+        "member-00",
+        new_hparams=new_hparams,
+        donor_state=donor_state,
+    )
+
+    assert runtime_member_id == "run-test-member-00-g0001"
+    assert target.stops == 1
+    assert donor.stops == 0
+    assert replacement.starts == 1
+    assert population._members["member-00"] is replacement
+    assert population._members["member-01"] is donor
+    assert captured["pbt_state"] is donor_state
+    assert captured["replay_actor"] is replay
+    assert captured["reward_window_episodes"] == 100
+    runtime_config = captured["runtime_config"]
+    assert runtime_config.member_id == runtime_member_id
+    assert runtime_config.seed == 101
+    sac_config = captured["sac_config"]
+    assert sac_config.actor_lr == new_hparams["actor_lr"]
+    assert population._generations["member-00"] == 1
+    assert population._exploit_count_as_target["member-00"] == 1
+
+    def fail_from_pbt_state(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("constructor failed")
+
+    next_target = OldMember()
+    population._members["member-01"] = next_target
+    monkeypatch.setattr(
+        SingleMemberAsyncSAC,
+        "from_pbt_state",
+        fail_from_pbt_state,
+    )
+    with pytest.raises(PopulationError, match="failed to restart"):
+        population._replace_target(
+            "member-01",
+            new_hparams=new_hparams,
+            donor_state=donor_state,
+        )
+    assert next_target.stops == 1
+
+
 def test_slash_delimited_metric_extraction_is_strict() -> None:
     report = {"train": {"episode_reward_mean": 3.5}}
 
@@ -159,6 +493,7 @@ def test_population_report_namespaces_members_and_shared_replay(
         run_id="run-test",
     )
     population._report_index = 1
+    population._reports_since_perturbation = 1
 
     def member_report(score: float) -> dict[str, object]:
         return {
@@ -237,6 +572,17 @@ def test_population_report_namespaces_members_and_shared_replay(
         "committed_episodes": 4,
         "duplicate_commits": 0,
     }
+
+    population._pbt_config = make_pbt_config(mode="min")
+    minimized = population._format_report(
+        {
+            "member-00": member_report(1.0),
+            "member-01": member_report(3.0),
+        },
+        replay,
+    )
+    assert minimized["population"]["best_score"] == 1.0
+    assert minimized["population"]["worst_score"] == 3.0
 
 
 def test_population_report_preserves_scheduled_learning_rates(

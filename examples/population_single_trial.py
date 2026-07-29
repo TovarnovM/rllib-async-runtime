@@ -13,8 +13,10 @@ from ray.rllib.algorithms.sac import SACConfig
 from rllib_async.examples import SyntheticThroughputEnv
 from rllib_async.runtime import (
     AsyncSACRuntimeConfig,
+    FloatMutation,
     PopulationMemberSpec,
     PopulationTrainable,
+    SimplePBTConfig,
 )
 
 
@@ -23,6 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--population-size", type=int, default=2)
     parser.add_argument("--reports", type=int, default=10)
     parser.add_argument("--report-interval-s", type=float, default=1.0)
+    parser.add_argument("--pbt-interval-reports", type=int, default=5)
+    parser.add_argument("--min-episodes-after-restart", type=int, default=4)
     parser.add_argument("--runner-count", type=int, default=4)
     parser.add_argument("--episode-length", type=int, default=32)
     parser.add_argument("--num-gpus-per-member", type=int, choices=(0, 1), default=0)
@@ -33,6 +37,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--population-size must be at least 2")
     if args.reports < 1:
         parser.error("--reports must be positive")
+    if args.pbt_interval_reports < 1:
+        parser.error("--pbt-interval-reports must be positive")
+    if args.min_episodes_after_restart < 1:
+        parser.error("--min-episodes-after-restart must be positive")
     return args
 
 
@@ -102,6 +110,16 @@ def main() -> None:
             param_space={
                 "members": build_members(args),
                 "report_interval_s": args.report_interval_s,
+                "pbt": SimplePBTConfig(
+                    perturbation_interval_reports=args.pbt_interval_reports,
+                    min_episodes_after_restart=(args.min_episodes_after_restart),
+                    seed=args.seed,
+                    mutations={
+                        "actor_lr": FloatMutation(1e-5, 1e-3),
+                        "critic_lr": FloatMutation(1e-5, 1e-3),
+                        "alpha_lr": FloatMutation(1e-5, 1e-3),
+                    },
+                ),
             },
             run_config=RunConfig(
                 name="async-sac-single-trial-population",
@@ -123,6 +141,7 @@ def main() -> None:
         print(
             f"reports={population['report_index']}, "
             f"members={population['size']}, "
+            f"exploits={population['exploit_count']}, "
             f"replay_transitions={result.metrics['replay']['transitions']}"
         )
         print(f"TensorBoard log directory: {result.path}")

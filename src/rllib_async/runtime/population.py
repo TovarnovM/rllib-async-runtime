@@ -1,14 +1,17 @@
-"""Legacy and single-trial fixed SAC population runtimes."""
+"""Legacy fixed and single-trial PBT SAC population runtimes."""
 
 from __future__ import annotations
 
+import logging
 import math
+import random
 import time
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from contextlib import suppress
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import ray
 from ray import tune
@@ -17,7 +20,7 @@ from ray.rllib.algorithms.sac import SACConfig
 from ray.tune import ResultGrid, Trainable
 from ray.tune.execution.placement_groups import PlacementGroupFactory
 
-from rllib_async.learner import SACLearnerAdapter
+from rllib_async.learner import PBTModelState, SACLearnerAdapter
 from rllib_async.protocols import FlatEpisodeCodec, ReplayCursor, ReplayStats
 from rllib_async.replay import ReplayActor
 from rllib_async.replay.reference import EpisodeStoreState
@@ -43,6 +46,8 @@ class PopulationError(RuntimeError):
     """A population cannot satisfy its lifecycle contract."""
 
 
+_LOGGER = logging.getLogger(__name__)
+_MUTABLE_HPARAMS = ("actor_lr", "critic_lr", "alpha_lr")
 _SHARED_REPLAY_SETTINGS = (
     "replay_capacity_transitions",
     "replay_capacity_bytes",
@@ -75,6 +80,140 @@ _SAC_STRUCTURAL_SETTINGS = (
     "enable_rl_module_and_learner",
     "enable_env_runner_and_connector_v2",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class FloatMutation:
+    """Bounded multiplicative mutation for one learning rate."""
+
+    low: float
+    high: float
+    factors: tuple[float, ...] = (0.8, 1.2)
+
+    def __post_init__(self) -> None:
+        for name, value in (("low", self.low), ("high", self.high)):
+            if (
+                not isinstance(value, int | float)
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+            ):
+                raise ValueError(f"mutation {name} must be finite")
+        if self.low <= 0:
+            raise ValueError("mutation low must be positive")
+        if self.high <= self.low:
+            raise ValueError("mutation high must exceed low")
+        if not isinstance(self.factors, Sequence) or isinstance(
+            self.factors,
+            str | bytes,
+        ):
+            raise TypeError("mutation factors must be a sequence")
+        factors = tuple(self.factors)
+        if not factors:
+            raise ValueError("mutation factors must not be empty")
+        if any(
+            not isinstance(value, int | float)
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value <= 0
+            for value in factors
+        ):
+            raise ValueError("mutation factors must be finite and positive")
+        if all(float(value) == 1.0 for value in factors):
+            raise ValueError("mutation factors must be able to change a value")
+        object.__setattr__(self, "low", float(self.low))
+        object.__setattr__(self, "high", float(self.high))
+        object.__setattr__(
+            self,
+            "factors",
+            tuple(float(value) for value in factors),
+        )
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any] | FloatMutation,
+    ) -> FloatMutation:
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            raise TypeError("mutation must be FloatMutation or a mapping")
+        unknown = set(value) - {"low", "high", "factors"}
+        if unknown:
+            raise ValueError(f"unknown mutation settings {sorted(unknown)!r}")
+        try:
+            return cls(
+                low=value["low"],
+                high=value["high"],
+                factors=value.get("factors", (0.8, 1.2)),
+            )
+        except KeyError as error:
+            raise ValueError("mutation requires low and high") from error
+
+
+@dataclass(frozen=True, slots=True)
+class SimplePBTConfig:
+    """Fixed report-cadence configuration for best-to-worst PBT."""
+
+    perturbation_interval_reports: int
+    metric_key: str = "train/episode_reward_mean"
+    mode: Literal["max", "min"] = "max"
+    reward_window_episodes: int = 100
+    min_episodes_after_restart: int = 20
+    seed: int = 0
+    mutations: Mapping[str, FloatMutation] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("perturbation_interval_reports", self.perturbation_interval_reports),
+            ("reward_window_episodes", self.reward_window_episodes),
+            ("min_episodes_after_restart", self.min_episodes_after_restart),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            not isinstance(self.metric_key, str)
+            or not self.metric_key
+            or any(not part for part in self.metric_key.split("/"))
+        ):
+            raise ValueError("metric_key must be a slash-delimited non-empty key")
+        if self.mode not in {"max", "min"}:
+            raise ValueError("mode must be 'max' or 'min'")
+        if not isinstance(self.seed, int) or isinstance(self.seed, bool):
+            raise ValueError("PBT seed must be an integer")
+        mutations = self.mutations
+        if not isinstance(mutations, Mapping):
+            raise TypeError("mutations must be a mapping")
+        unknown = set(mutations) - set(_MUTABLE_HPARAMS)
+        if unknown:
+            raise ValueError(f"unknown PBT mutation keys {sorted(unknown)!r}")
+        resolved: dict[str, FloatMutation] = {}
+        for name, value in mutations.items():
+            resolved[name] = FloatMutation.from_mapping(value)
+        object.__setattr__(self, "mutations", resolved)
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any] | SimplePBTConfig | None,
+    ) -> SimplePBTConfig | None:
+        if value is None or isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            raise TypeError("PBT config must be SimplePBTConfig or a mapping")
+        unknown = set(value) - {
+            "perturbation_interval_reports",
+            "metric_key",
+            "mode",
+            "reward_window_episodes",
+            "min_episodes_after_restart",
+            "seed",
+            "mutations",
+        }
+        if unknown:
+            raise ValueError(f"unknown PBT settings {sorted(unknown)!r}")
+        if "perturbation_interval_reports" not in value:
+            raise ValueError("PBT config requires perturbation_interval_reports")
+        return cls(**value)
 
 
 def _member_id_from_trial(trial: Any) -> str:
@@ -474,6 +613,7 @@ class PopulationAsyncSAC:
         *,
         run_id: str | None = None,
         report_interval_s: float | None = None,
+        pbt_config: SimplePBTConfig | None = None,
     ) -> None:
         if not ray.is_initialized():
             raise RuntimeError("Ray must be initialized before PopulationAsyncSAC")
@@ -492,13 +632,29 @@ class PopulationAsyncSAC:
             templates,
             report_interval_s,
         )
+        if pbt_config is not None and not isinstance(
+            pbt_config,
+            SimplePBTConfig,
+        ):
+            raise TypeError("pbt_config must be SimplePBTConfig or None")
+        if pbt_config is not None and not pbt_config.mutations:
+            raise ValueError("enabled PBT requires at least one mutation")
+        self._pbt_config = pbt_config
         self._slot_ids = tuple(member.runtime_config.member_id for member in templates)
         self._member_specs: dict[str, PopulationMemberSpec] = {}
+        self._base_runtime_seeds: dict[str, int] = {}
+        self._base_sac_seeds: dict[str, int] = {}
         for slot_id, member in zip(self._slot_ids, templates, strict=True):
             runtime_member_id = make_runtime_member_id(
                 self._run_id,
                 slot_id,
                 0,
+            )
+            self._base_runtime_seeds[slot_id] = member.runtime_config.seed
+            self._base_sac_seeds[slot_id] = (
+                member.runtime_config.seed
+                if member.sac_config.seed is None
+                else int(member.sac_config.seed)
             )
             self._member_specs[slot_id] = PopulationMemberSpec(
                 member.sac_config.copy(copy_frozen=False),
@@ -508,11 +664,39 @@ class PopulationAsyncSAC:
                 ),
             )
 
+        self._generations = dict.fromkeys(self._slot_ids, 0)
+        self._exploit_count_as_target = dict.fromkeys(self._slot_ids, 0)
+        self._current_hparams = {
+            slot_id: {
+                name: getattr(self._member_specs[slot_id].sac_config, name)
+                for name in _MUTABLE_HPARAMS
+            }
+            for slot_id in self._slot_ids
+        }
+        if self._pbt_config is not None:
+            for slot_id, hparams in self._current_hparams.items():
+                for name, value in hparams.items():
+                    if (
+                        not isinstance(value, int | float)
+                        or isinstance(value, bool)
+                        or not math.isfinite(value)
+                        or value <= 0
+                    ):
+                        raise ValueError(
+                            f"PBT member {slot_id!r} {name} must be "
+                            "a finite positive scalar"
+                        )
+                    hparams[name] = float(value)
         self._state = RuntimeState.CREATED
         self._replay_actor: Any | None = None
         self._members: dict[str, SingleMemberAsyncSAC] = {}
         self._next_pump_index = 0
         self._report_index = 0
+        self._reports_since_perturbation = 0
+        self._exploit_count = 0
+        self._last_exploit_duration_s = 0.0
+        self._last_pbt_event = self._empty_pbt_event("not_started")
+        self._restarting_slot: str | None = None
 
     @property
     def state(self) -> RuntimeState:
@@ -570,6 +754,11 @@ class PopulationAsyncSAC:
                     member.sac_config,
                     member.runtime_config,
                     replay_actor=self._replay_actor,
+                    reward_window_episodes=(
+                        self._pbt_config.reward_window_episodes
+                        if self._pbt_config is not None
+                        else 100
+                    ),
                 )
             for member in self._members.values():
                 member.start()
@@ -624,11 +813,25 @@ class PopulationAsyncSAC:
             replay = ray.get(self.replay_actor.get_stats.remote())
             if not isinstance(replay, ReplayStats):
                 raise PopulationError("shared replay returned invalid statistics")
+            self._report_index += 1
+            if self._pbt_config is not None:
+                self._reports_since_perturbation += 1
+            else:
+                self._reports_since_perturbation = self._report_index
+            report = self._format_report(member_reports, replay)
+            event = self._maybe_run_pbt_step(member_reports)
+            report["pbt"] = event
+            report["population"].update(
+                {
+                    "exploit_count": self._exploit_count,
+                    "reports_since_perturbation": (self._reports_since_perturbation),
+                    "last_exploit_duration_s": self._last_exploit_duration_s,
+                }
+            )
+            return report
         except Exception:
             self._state = RuntimeState.FAILED
             raise
-        self._report_index += 1
-        return self._format_report(member_reports, replay)
 
     def stop(self, *, graceful: bool = True) -> None:
         if self._state is RuntimeState.STOPPED:
@@ -661,23 +864,17 @@ class PopulationAsyncSAC:
         replay: ReplayStats,
     ) -> dict[str, Any]:
         formatted_members: dict[str, dict[str, Any]] = {}
-        scores: dict[str, float] = {}
+        scores = self._eligible_member_scores(member_reports)
+        metric_key = (
+            self._pbt_config.metric_key
+            if self._pbt_config is not None
+            else self._TRAIN_METRIC_KEY
+        )
         for slot_id in self._slot_ids:
             report = member_reports[slot_id]
-            score = self._finite_metric(
-                self._extract_metric(report, self._TRAIN_METRIC_KEY)
-            )
+            score = self._finite_metric(self._extract_metric(report, metric_key))
             train = dict(report.get("train", {}))
-            episodes_since_reset = train.get("episodes_since_metric_reset", 0)
-            eligible = (
-                score is not None
-                and isinstance(episodes_since_reset, int)
-                and not isinstance(episodes_since_reset, bool)
-                and episodes_since_reset > 0
-            )
-            if eligible:
-                assert score is not None
-                scores[slot_id] = score
+            eligible = slot_id in scores
 
             learner = dict(report.get("learner", {}))
             learner.setdefault("updates", learner.get("learner_updates", 0))
@@ -686,23 +883,18 @@ class PopulationAsyncSAC:
                 "episodes",
                 rollout.get("episodes_collected", 0),
             )
-            sac_config = self._member_specs[slot_id].sac_config
             formatted_members[slot_id] = {
                 "runtime_member_id": self.runtime_member_ids[slot_id],
                 "timesteps_this_iter": report.get("timesteps_this_iter", 0),
                 "episodes_this_iter": report.get("episodes_this_iter", 0),
                 "train": train,
                 "pbt": {
-                    "generation": 0,
+                    "generation": self._generations[slot_id],
                     "eligible": int(eligible),
                     "current_score": score if score is not None else math.nan,
-                    "exploit_count_as_target": 0,
+                    "exploit_count_as_target": (self._exploit_count_as_target[slot_id]),
                 },
-                "hparams": {
-                    "actor_lr": sac_config.actor_lr,
-                    "critic_lr": sac_config.critic_lr,
-                    "alpha_lr": sac_config.alpha_lr,
-                },
+                "hparams": dict(self._current_hparams[slot_id]),
                 "controller": dict(report.get("controller", {})),
                 "rollout": rollout,
                 "fast_replay": dict(report.get("fast_replay", {})),
@@ -712,21 +904,30 @@ class PopulationAsyncSAC:
             }
 
         score_values = tuple(scores.values())
+        minimize = self._pbt_config is not None and self._pbt_config.mode == "min"
         population_metrics: dict[str, Any] = {
             "run_id": self._run_id,
             "report_index": self._report_index,
             "size": len(self._slot_ids),
             "eligible_members": len(score_values),
-            "best_score": max(score_values) if score_values else math.nan,
+            "best_score": (
+                (min(score_values) if minimize else max(score_values))
+                if score_values
+                else math.nan
+            ),
             "mean_score": (
                 math.fsum(score_values) / len(score_values)
                 if score_values
                 else math.nan
             ),
-            "worst_score": min(score_values) if score_values else math.nan,
-            "exploit_count": 0,
-            "reports_since_perturbation": self._report_index,
-            "last_exploit_duration_s": 0.0,
+            "worst_score": (
+                (max(score_values) if minimize else min(score_values))
+                if score_values
+                else math.nan
+            ),
+            "exploit_count": self._exploit_count,
+            "reports_since_perturbation": self._reports_since_perturbation,
+            "last_exploit_duration_s": self._last_exploit_duration_s,
         }
         replay_metrics = {
             "store_generation": replay.cursor.store_generation,
@@ -757,6 +958,281 @@ class PopulationAsyncSAC:
             "population": population_metrics,
             "members": formatted_members,
             "replay": replay_metrics,
+        }
+
+    def _eligible_member_scores(
+        self,
+        member_reports: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, float]:
+        metric_key = (
+            self._pbt_config.metric_key
+            if self._pbt_config is not None
+            else self._TRAIN_METRIC_KEY
+        )
+        minimum_episodes = (
+            self._pbt_config.min_episodes_after_restart
+            if self._pbt_config is not None
+            else 1
+        )
+        scores: dict[str, float] = {}
+        for slot_id in self._slot_ids:
+            member = self._members.get(slot_id)
+            if (
+                member is not None and member.state is not RuntimeState.RUNNING
+            ) or slot_id == self._restarting_slot:
+                continue
+            report = member_reports[slot_id]
+            score = self._finite_metric(self._extract_metric(report, metric_key))
+            episodes_since_reset = report.get("train", {}).get(
+                "episodes_since_metric_reset",
+                0,
+            )
+            if (
+                score is not None
+                and isinstance(episodes_since_reset, int)
+                and not isinstance(episodes_since_reset, bool)
+                and episodes_since_reset >= minimum_episodes
+            ):
+                scores[slot_id] = score
+        return scores
+
+    def _maybe_run_pbt_step(
+        self,
+        member_reports: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        config = self._pbt_config
+        if config is None:
+            return self._record_skipped_pbt_event("disabled")
+        if self._reports_since_perturbation < config.perturbation_interval_reports:
+            return self._record_skipped_pbt_event("interval_not_reached")
+
+        scores = self._eligible_member_scores(member_reports)
+        if len(scores) < 2:
+            return self._record_skipped_pbt_event("not_enough_eligible_members")
+        donor_slot, target_slot = self._select_donor_and_target(
+            scores,
+            mode=config.mode,
+        )
+        donor_score = scores[donor_slot]
+        target_score = scores[target_slot]
+        if donor_score == target_score:
+            return self._record_skipped_pbt_event("equal_scores")
+
+        started = time.monotonic()
+        donor_state = self._members[donor_slot].export_pbt_state()
+        (
+            new_hparams,
+            mutated_parameter,
+            parameter_index,
+            factor,
+            old_value,
+            new_value,
+        ) = self._mutate_hparams(
+            self._current_hparams[donor_slot],
+            config=config,
+            exploit_count=self._exploit_count,
+        )
+        runtime_member_id = self._replace_target(
+            target_slot,
+            new_hparams=new_hparams,
+            donor_state=donor_state,
+        )
+        self._exploit_count += 1
+        self._reports_since_perturbation = 0
+        self._last_exploit_duration_s = time.monotonic() - started
+        event = {
+            "exploit_count": self._exploit_count,
+            "event_happened": 1,
+            "event_reason": "exploit",
+            "mutated_parameter_index": parameter_index,
+            "mutation_factor": factor,
+            "old_value": old_value,
+            "new_value": new_value,
+            "donor_score": donor_score,
+            "target_score": target_score,
+            "donor_slot": donor_slot,
+            "target_slot": target_slot,
+            "mutated_parameter": mutated_parameter,
+            "new_runtime_member_id": runtime_member_id,
+            "duration_s": self._last_exploit_duration_s,
+        }
+        self._last_pbt_event = event
+        _LOGGER.info(
+            "PBT exploit donor=%s target=%s parameter=%s old=%s new=%s "
+            "generation=%s runtime_member_id=%s",
+            donor_slot,
+            target_slot,
+            mutated_parameter,
+            old_value,
+            new_value,
+            self._generations[target_slot],
+            runtime_member_id,
+        )
+        return dict(event)
+
+    @staticmethod
+    def _select_donor_and_target(
+        scores: Mapping[str, float],
+        *,
+        mode: Literal["max", "min"],
+    ) -> tuple[str, str]:
+        if mode not in {"max", "min"}:
+            raise ValueError("mode must be 'max' or 'min'")
+        if len(scores) < 2:
+            raise ValueError("selection requires at least two scores")
+        for slot_id, score in scores.items():
+            if not isinstance(slot_id, str) or not slot_id:
+                raise ValueError("selection slot IDs must be non-empty strings")
+            if not math.isfinite(score):
+                raise ValueError("selection scores must be finite")
+        if mode == "max":
+            donor_slot = min(scores, key=lambda slot_id: (-scores[slot_id], slot_id))
+            target_slot = min(scores, key=lambda slot_id: (scores[slot_id], slot_id))
+        else:
+            donor_slot = min(scores, key=lambda slot_id: (scores[slot_id], slot_id))
+            target_slot = min(scores, key=lambda slot_id: (-scores[slot_id], slot_id))
+        return donor_slot, target_slot
+
+    @staticmethod
+    def _mutate_hparams(
+        hparams: Mapping[str, Any],
+        *,
+        config: SimplePBTConfig,
+        exploit_count: int,
+    ) -> tuple[dict[str, float], str, int, float, float, float]:
+        if (
+            not isinstance(exploit_count, int)
+            or isinstance(exploit_count, bool)
+            or exploit_count < 0
+        ):
+            raise ValueError("exploit_count must be a non-negative integer")
+        missing = set(_MUTABLE_HPARAMS) - set(hparams)
+        if missing:
+            raise ValueError(f"mutable hparams are missing {sorted(missing)!r}")
+
+        candidates: dict[str, tuple[tuple[float, float], ...]] = {}
+        for name in sorted(config.mutations):
+            value = hparams[name]
+            if (
+                not isinstance(value, int | float)
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"mutable hparam {name!r} must be positive")
+            old_value = float(value)
+            mutation = config.mutations[name]
+            changed = tuple(
+                (factor, min(max(old_value * factor, mutation.low), mutation.high))
+                for factor in mutation.factors
+                if min(
+                    max(old_value * factor, mutation.low),
+                    mutation.high,
+                )
+                != old_value
+            )
+            if changed:
+                candidates[name] = changed
+        if not candidates:
+            raise PopulationError("no configured PBT mutation can change donor hparams")
+
+        rng = random.Random(config.seed + exploit_count)
+        parameter = rng.choice(tuple(sorted(candidates)))
+        factor, new_value = rng.choice(candidates[parameter])
+        old_value = float(hparams[parameter])
+        mutated = {name: float(hparams[name]) for name in _MUTABLE_HPARAMS}
+        mutated[parameter] = new_value
+        parameter_index = tuple(sorted(config.mutations)).index(parameter)
+        return (
+            mutated,
+            parameter,
+            parameter_index,
+            factor,
+            old_value,
+            new_value,
+        )
+
+    def _replace_target(
+        self,
+        target_slot: str,
+        *,
+        new_hparams: Mapping[str, float],
+        donor_state: PBTModelState,
+    ) -> str:
+        if self._pbt_config is None:
+            raise PopulationError("target replacement requires enabled PBT")
+        old_target = self._members[target_slot]
+        old_spec = self._member_specs[target_slot]
+        generation = self._generations[target_slot] + 1
+        runtime_member_id = make_runtime_member_id(
+            self._run_id,
+            target_slot,
+            generation,
+        )
+        runtime_seed = self._base_runtime_seeds[target_slot] + generation
+        sac_seed = self._base_sac_seeds[target_slot] + generation
+        sac_config = old_spec.sac_config.copy(copy_frozen=False)
+        sac_config.training(**dict(new_hparams))
+        sac_config.debugging(seed=sac_seed)
+        runtime_config = replace(
+            old_spec.runtime_config,
+            member_id=runtime_member_id,
+            seed=runtime_seed,
+        )
+
+        self._restarting_slot = target_slot
+        replacement: SingleMemberAsyncSAC | None = None
+        try:
+            old_target.stop()
+            replacement = SingleMemberAsyncSAC.from_pbt_state(
+                sac_config,
+                runtime_config,
+                donor_state,
+                replay_actor=self.replay_actor,
+                reward_window_episodes=self._pbt_config.reward_window_episodes,
+            )
+            replacement.start()
+        except Exception as error:
+            if replacement is not None:
+                with suppress(BaseException):
+                    replacement.stop(graceful=False)
+            raise PopulationError(
+                f"failed to restart PBT target {target_slot!r}"
+            ) from error
+        finally:
+            self._restarting_slot = None
+
+        self._members[target_slot] = replacement
+        self._member_specs[target_slot] = PopulationMemberSpec(
+            sac_config,
+            runtime_config,
+        )
+        self._generations[target_slot] = generation
+        self._exploit_count_as_target[target_slot] += 1
+        self._current_hparams[target_slot] = dict(new_hparams)
+        return runtime_member_id
+
+    def _record_skipped_pbt_event(self, reason: str) -> dict[str, Any]:
+        event = self._empty_pbt_event(reason)
+        self._last_pbt_event = event
+        return dict(event)
+
+    def _empty_pbt_event(self, reason: str) -> dict[str, Any]:
+        return {
+            "exploit_count": self._exploit_count,
+            "event_happened": 0,
+            "event_reason": reason,
+            "mutated_parameter_index": -1,
+            "mutation_factor": math.nan,
+            "old_value": math.nan,
+            "new_value": math.nan,
+            "donor_score": math.nan,
+            "target_score": math.nan,
+            "donor_slot": "",
+            "target_slot": "",
+            "mutated_parameter": "",
+            "new_runtime_member_id": "",
+            "duration_s": 0.0,
         }
 
     @staticmethod
@@ -810,14 +1286,14 @@ class PopulationAsyncSAC:
 
 
 class PopulationTrainable(Trainable):
-    """One Tune trial owning a complete fixed SAC population."""
+    """One Tune trial owning a complete SAC population."""
 
     @classmethod
     def default_resource_request(
         cls,
         config: dict[str, Any],
     ) -> PlacementGroupFactory:
-        members, _, _ = cls._parse_config(config)
+        members, _, _, _ = cls._parse_config(config)
         bundles: list[dict[str, float]] = [{"CPU": 1.0}]
         replay_cpu = members[0].runtime_config.num_cpus_per_replay
         if replay_cpu:
@@ -832,11 +1308,12 @@ class PopulationTrainable(Trainable):
         return PlacementGroupFactory(bundles, strategy="PACK")
 
     def setup(self, config: dict[str, Any]) -> None:
-        members, run_id, report_interval_s = self._parse_config(config)
+        members, run_id, report_interval_s, pbt_config = self._parse_config(config)
         self._population = PopulationAsyncSAC(
             members,
             run_id=run_id,
             report_interval_s=report_interval_s,
+            pbt_config=pbt_config,
         )
         self._population.start()
 
@@ -851,11 +1328,17 @@ class PopulationTrainable(Trainable):
     @staticmethod
     def _parse_config(
         config: Mapping[str, Any],
-    ) -> tuple[tuple[PopulationMemberSpec, ...], str | None, float]:
+    ) -> tuple[
+        tuple[PopulationMemberSpec, ...],
+        str | None,
+        float,
+        SimplePBTConfig | None,
+    ]:
         if not isinstance(config, Mapping):
             raise TypeError("PopulationTrainable config must be a mapping")
         unknown = set(config) - {
             "members",
+            "pbt",
             "run_id",
             "report_interval_s",
         }
@@ -909,4 +1392,5 @@ class PopulationTrainable(Trainable):
             resolved_members,
             config.get("report_interval_s"),
         )
-        return resolved_members, run_id, report_interval_s
+        pbt_config = SimplePBTConfig.from_mapping(config.get("pbt"))
+        return resolved_members, run_id, report_interval_s, pbt_config
