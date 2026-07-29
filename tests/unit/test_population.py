@@ -239,6 +239,65 @@ def test_population_report_namespaces_members_and_shared_replay(
     }
 
 
+def test_population_report_preserves_scheduled_learning_rates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    spaces = {
+        "default_policy": (
+            gym.spaces.Box(-1.0, 1.0, shape=(3,)),
+            gym.spaces.Box(-1.0, 1.0, shape=(1,)),
+        )
+    }
+    monkeypatch.setattr(
+        SingleMemberAsyncSAC,
+        "_resolve_spaces",
+        staticmethod(lambda _: spaces),
+    )
+    schedules = {
+        "actor_lr": [[0, 3e-4], [100, 1e-4]],
+        "critic_lr": [[0, 4e-4], [100, 2e-4]],
+        "alpha_lr": [[0, 5e-4], [100, 3e-4]],
+    }
+    members = tuple(
+        PopulationMemberSpec(
+            make_sac_config().training(**schedules).debugging(seed=100 + index),
+            spec.runtime_config,
+        )
+        for index, spec in enumerate(make_single_trial_specs())
+    )
+    population = PopulationAsyncSAC(members, run_id="run-test")
+
+    report = {
+        "train": {},
+        "learner": {},
+        "rollout": {},
+    }
+    replay = ReplayStats(
+        cursor=ReplayCursor("shared", 0),
+        episode_count=0,
+        total_transitions=0,
+        total_estimated_bytes=0,
+        producer_episode_counts=(),
+        producer_transition_counts=(),
+        oldest_available_mutation_seq=1,
+        journal_entries=0,
+        deduplication_entries=0,
+        commit_attempts=0,
+        committed_episodes=0,
+        duplicate_commits=0,
+        rejected_commits=0,
+        conflicting_commits=0,
+        evicted_episodes=0,
+    )
+
+    result = population._format_report(
+        {slot_id: report for slot_id in population.slot_ids}, replay
+    )
+
+    assert result["members"]["member-00"]["hparams"] == schedules
+
+
 def test_population_pump_rotates_first_member_without_blocking() -> None:
     calls: list[tuple[str, float]] = []
 

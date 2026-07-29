@@ -699,9 +699,9 @@ class PopulationAsyncSAC:
                     "exploit_count_as_target": 0,
                 },
                 "hparams": {
-                    "actor_lr": float(sac_config.actor_lr),
-                    "critic_lr": float(sac_config.critic_lr),
-                    "alpha_lr": float(sac_config.alpha_lr),
+                    "actor_lr": sac_config.actor_lr,
+                    "critic_lr": sac_config.critic_lr,
+                    "alpha_lr": sac_config.alpha_lr,
                 },
                 "controller": dict(report.get("controller", {})),
                 "rollout": rollout,
