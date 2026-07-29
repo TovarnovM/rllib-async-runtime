@@ -7,7 +7,7 @@ from pathlib import Path
 
 import ray
 from ray import tune
-from ray.air import RunConfig
+from ray.air import CheckpointConfig, RunConfig
 from ray.rllib.algorithms.sac import SACConfig
 
 from rllib_async.examples import SyntheticThroughputEnv
@@ -111,6 +111,7 @@ def main() -> None:
                     else None
                 ),
                 stop={"training_iteration": args.reports},
+                checkpoint_config=CheckpointConfig(checkpoint_at_end=False),
             ),
         ).fit()
         if len(results) != 1:
