@@ -569,11 +569,15 @@ def test_population_checkpoint_exact_resume_and_warm_start(
             slot_id: member.get_report(include_authoritative_replay=False)
             for slot_id, member in resumed.members.items()
         }
+        # The first report delta may also include episodes drained after the
+        # source's last report but before its checkpoint. The reset metric
+        # window intentionally contains only episodes completed after restore.
         assert all(
             report["controller"]["restore_count"] == 1
             and report["learner"]["learner_updates"] >= checkpoint_updates[slot_id]
-            and report["train"]["episodes_since_metric_reset"]
-            == report["episodes_this_iter"]
+            and 0
+            <= report["train"]["episodes_since_metric_reset"]
+            <= report["episodes_this_iter"]
             for slot_id, report in immediate.items()
         )
 
