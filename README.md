@@ -362,6 +362,10 @@ uv run --locked --extra cu118 --group dev \
 
 This stage does not yet implement exploit/explore, target replacement, or a
 live single-trial population checkpoint. Those belong to the next PBT stages.
+Until the stop-the-world population checkpoint is implemented, every
+`PopulationTrainable` run must set
+`CheckpointConfig(checkpoint_at_end=False)` explicitly; otherwise Tune asks the
+class-based Trainable for its not-yet-supported final checkpoint.
 `PopulationLauncher` and `examples/population_two_members.py` remain the
 Phase 8 compatibility path.
 

@@ -315,6 +315,7 @@ def test_single_trial_population_writes_expected_tensorboard_tags(
             name="single-trial-population-tensorboard",
             storage_path=str(tmp_path),
             stop=SingleTrialPopulationReadyStopper(),
+            checkpoint_config=CheckpointConfig(checkpoint_at_end=False),
             verbose=0,
         ),
     ).fit()
