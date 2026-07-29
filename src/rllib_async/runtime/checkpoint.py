@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import pickle
 import tempfile
@@ -25,6 +26,7 @@ RUNTIME_REPLAY_FILENAME = "replay.snapshot"
 POPULATION_CHECKPOINT_STATE_VERSION = 1
 POPULATION_CHECKPOINT_FILENAME = "population.snapshot"
 POPULATION_MEMBERS_DIRECTORY = "members"
+PBT_STATE_FILENAME = "pbt_state.json"
 
 _CHECKPOINT_MAGIC = b"RLLIB_ASYNC_MEMBER\x00\x01"
 _POPULATION_CHECKPOINT_MAGIC = b"RLLIB_ASYNC_POPULATION\x00\x01"
@@ -150,6 +152,7 @@ def write_population_checkpoint(
     *,
     replay_state: EpisodeStoreState,
     members: Mapping[str, RuntimeCheckpointState],
+    pbt_metadata: Mapping[str, Any] | None = None,
 ) -> PopulationCheckpoint:
     """Publish one replay snapshot plus independent member state files."""
 
@@ -184,6 +187,10 @@ def write_population_checkpoint(
         destination_dir / RUNTIME_REPLAY_FILENAME,
         members_directory,
     )
+    if pbt_metadata is not None:
+        if not isinstance(pbt_metadata, Mapping):
+            raise TypeError("PBT checkpoint metadata must be a mapping")
+        reserved = (*reserved, destination_dir / PBT_STATE_FILENAME)
     if any(path.exists() for path in reserved):
         raise FileExistsError(
             "checkpoint directory already contains a population checkpoint"
@@ -214,6 +221,12 @@ def write_population_checkpoint(
                 size_bytes=checkpoint.size_bytes,
                 sha256=checkpoint.sha256,
             )
+        )
+
+    if pbt_metadata is not None:
+        _write_atomic_json(
+            destination_dir / PBT_STATE_FILENAME,
+            dict(pbt_metadata),
         )
 
     manifest = PopulationCheckpointState(
@@ -339,6 +352,25 @@ def read_population_checkpoint_bundle(
     return manifest, replay_state, members
 
 
+def read_pbt_checkpoint_metadata(
+    directory: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """Read required single-trial PBT metadata from a population checkpoint."""
+
+    source = Path(directory) / PBT_STATE_FILENAME
+    try:
+        value = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise InvalidPopulationCheckpointError(
+            f"{source} is not valid PBT checkpoint metadata"
+        ) from error
+    if not isinstance(value, Mapping):
+        raise InvalidPopulationCheckpointError(
+            "PBT checkpoint metadata must be a JSON object"
+        )
+    return dict(value)
+
+
 def _validate_state(state: object) -> None:
     if not isinstance(state, RuntimeCheckpointState):
         raise InvalidRuntimeCheckpointError(
@@ -435,6 +467,40 @@ def _write_checksummed_pickle(
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
     return len(encoded), digest.hex()
+
+
+def _write_atomic_json(destination: Path, value: Mapping[str, Any]) -> None:
+    temporary_path: Path | None = None
+    try:
+        encoded = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8")
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=destination.parent,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as file:
+            temporary_path = Path(file.name)
+            file.write(encoded)
+            file.write(b"\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, destination)
+        temporary_path = None
+        directory_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _read_checksummed_pickle(

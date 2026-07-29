@@ -22,6 +22,13 @@ from rllib_async.runtime import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=("new", "resume", "warm_start"),
+        default="new",
+    )
+    parser.add_argument("--checkpoint-path", type=Path)
+    parser.add_argument("--run-id")
     parser.add_argument("--population-size", type=int, default=2)
     parser.add_argument("--reports", type=int, default=10)
     parser.add_argument("--report-interval-s", type=float, default=1.0)
@@ -41,6 +48,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--pbt-interval-reports must be positive")
     if args.min_episodes_after_restart < 1:
         parser.error("--min-episodes-after-restart must be positive")
+    if args.mode == "new" and args.checkpoint_path is not None:
+        parser.error("--checkpoint-path is only valid for resume or warm_start")
+    if args.mode != "new" and args.checkpoint_path is None:
+        parser.error(f"--mode {args.mode} requires --checkpoint-path")
     return args
 
 
@@ -105,31 +116,39 @@ def main() -> None:
     args = parse_args()
     ray.init()
     try:
+        param_space = {
+            "members": build_members(args),
+            "run_id": args.run_id,
+            "report_interval_s": args.report_interval_s,
+            "run_mode": args.mode,
+            "pbt": SimplePBTConfig(
+                perturbation_interval_reports=args.pbt_interval_reports,
+                min_episodes_after_restart=(args.min_episodes_after_restart),
+                seed=args.seed,
+                mutations={
+                    "actor_lr": FloatMutation(1e-5, 1e-3),
+                    "critic_lr": FloatMutation(1e-5, 1e-3),
+                    "alpha_lr": FloatMutation(1e-5, 1e-3),
+                },
+            ),
+        }
+        if args.checkpoint_path is not None:
+            param_space["checkpoint_path"] = str(args.checkpoint_path.resolve())
         results = tune.Tuner(
             PopulationTrainable,
-            param_space={
-                "members": build_members(args),
-                "report_interval_s": args.report_interval_s,
-                "pbt": SimplePBTConfig(
-                    perturbation_interval_reports=args.pbt_interval_reports,
-                    min_episodes_after_restart=(args.min_episodes_after_restart),
-                    seed=args.seed,
-                    mutations={
-                        "actor_lr": FloatMutation(1e-5, 1e-3),
-                        "critic_lr": FloatMutation(1e-5, 1e-3),
-                        "alpha_lr": FloatMutation(1e-5, 1e-3),
-                    },
-                ),
-            },
+            param_space=param_space,
             run_config=RunConfig(
-                name="async-sac-single-trial-population",
+                name=f"async-sac-single-trial-population-{args.mode}",
                 storage_path=(
                     str(args.storage_path.resolve())
                     if args.storage_path is not None
                     else None
                 ),
                 stop={"training_iteration": args.reports},
-                checkpoint_config=CheckpointConfig(checkpoint_at_end=False),
+                checkpoint_config=CheckpointConfig(
+                    num_to_keep=1,
+                    checkpoint_at_end=True,
+                ),
             ),
         ).fit()
         if len(results) != 1:

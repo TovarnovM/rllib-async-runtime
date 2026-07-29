@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import replace
+import json
+from dataclasses import asdict, replace
 
 import gymnasium as gym
 import pytest
@@ -8,19 +9,23 @@ import ray
 
 import rllib_async.runtime.population as population_module
 from rllib_async.protocols import ReplayCursor, ReplayStats
+from rllib_async.replay.reference import EpisodeStore
 from rllib_async.runtime import (
     AsyncSACRuntimeConfig,
     FloatMutation,
+    InvalidPopulationCheckpointError,
     PopulationAsyncSAC,
     PopulationError,
     PopulationLauncher,
     PopulationMemberSpec,
     PopulationTrainable,
+    RuntimeCheckpointState,
     RuntimeState,
     SimplePBTConfig,
     SingleMemberAsyncSAC,
     make_runtime_member_id,
 )
+from rllib_async.runtime.checkpoint import write_population_checkpoint
 from tests.helpers import make_sac_config
 
 
@@ -60,6 +65,71 @@ def make_pbt_config(**overrides: object) -> SimplePBTConfig:
     }
     values.update(overrides)
     return SimplePBTConfig(**values)
+
+
+def write_single_trial_checkpoint(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[
+    object,
+    tuple[PopulationMemberSpec, ...],
+    SimplePBTConfig,
+    PopulationAsyncSAC,
+]:
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    spaces = {
+        "default_policy": (
+            gym.spaces.Box(-1.0, 1.0, shape=(3,)),
+            gym.spaces.Box(-1.0, 1.0, shape=(1,)),
+        )
+    }
+    monkeypatch.setattr(
+        SingleMemberAsyncSAC,
+        "_resolve_spaces",
+        staticmethod(lambda _: spaces),
+    )
+    specs = make_single_trial_specs()
+    pbt_config = make_pbt_config()
+    population = PopulationAsyncSAC(
+        specs,
+        run_id="run-checkpoint",
+        report_interval_s=0.1,
+        pbt_config=pbt_config,
+    )
+    population._report_index = 7
+    population._reports_since_perturbation = 1
+
+    runtime = population._member_specs["member-00"].runtime_config
+    store = EpisodeStore(
+        population_module.FlatEpisodeCodec(),
+        capacity_transitions=runtime.replay_capacity_transitions,
+        capacity_bytes=runtime.replay_capacity_bytes,
+        journal_capacity=runtime.replay_journal_capacity,
+        store_generation="pbt-checkpoint",
+    )
+    states = {
+        spec.runtime_config.member_id: RuntimeCheckpointState(
+            state_version=1,
+            member_id=spec.runtime_config.member_id,
+            runtime_config=asdict(spec.runtime_config),
+            replay_file="replay.snapshot",
+            replay_cursor=store.cursor,
+            learner=f"learner-{slot_id}".encode(),
+            rollout={},
+            evaluation=None,
+            controller={},
+        )
+        for slot_id, spec in population._member_specs.items()
+    }
+    checkpoint_dir = tmp_path / "population"
+    checkpoint_dir.mkdir()
+    write_population_checkpoint(
+        checkpoint_dir,
+        replay_state=store.export_state(),
+        members=states,
+        pbt_metadata=population._checkpoint_metadata().to_mapping(),
+    )
+    return checkpoint_dir, specs, pbt_config, population
 
 
 def test_population_rejects_incompatible_observation_action_spaces(
@@ -107,6 +177,171 @@ def test_single_trial_population_rejects_different_runtime_topology() -> None:
 
     with pytest.raises(ValueError, match="runtime topology"):
         PopulationTrainable._parse_config({"members": (first, incompatible)})
+
+
+def test_population_run_modes_require_an_explicit_checkpoint_path() -> None:
+    members = make_single_trial_specs()
+
+    with pytest.raises(ValueError, match="run_mode"):
+        PopulationTrainable._parse_config(
+            {
+                "members": members,
+                "run_mode": "restore",
+            }
+        )
+    with pytest.raises(ValueError, match="requires checkpoint_path"):
+        PopulationTrainable._parse_config(
+            {
+                "members": members,
+                "run_mode": "resume",
+            }
+        )
+    with pytest.raises(ValueError, match="does not accept checkpoint_path"):
+        PopulationTrainable._parse_config(
+            {
+                "members": members,
+                "checkpoint_path": "/tmp/checkpoint",
+            }
+        )
+
+    parsed = PopulationTrainable._parse_config(
+        {
+            "members": members,
+            "run_mode": "warm_start",
+            "checkpoint_path": "/tmp/checkpoint",
+        }
+    )
+    assert parsed[-2:] == ("warm_start", "/tmp/checkpoint")
+
+
+def test_exact_resume_restores_pbt_metadata_before_actor_creation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir, specs, pbt_config, source = write_single_trial_checkpoint(
+        tmp_path,
+        monkeypatch,
+    )
+
+    restored = PopulationAsyncSAC.from_checkpoint(
+        specs,
+        checkpoint_dir,
+        pbt_config=pbt_config,
+    )
+
+    assert restored.run_id == source.run_id
+    assert restored.runtime_member_ids == source.runtime_member_ids
+    assert restored._report_index == 7
+    assert restored._reports_since_perturbation == 1
+    assert restored._exploit_count == 0
+    assert restored._current_hparams == source._current_hparams
+    assert restored._checkpoint_replay_state is not None
+    assert set(restored._checkpoint_member_states or {}) == {
+        "member-00",
+        "member-01",
+    }
+
+    incompatible = make_pbt_config(seed=pbt_config.seed + 1)
+    with pytest.raises(ValueError, match="PBT config"):
+        PopulationAsyncSAC.from_checkpoint(
+            specs,
+            checkpoint_dir,
+            pbt_config=incompatible,
+        )
+
+
+def test_exact_resume_rejects_hparam_outside_checkpoint_bounds(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir, specs, pbt_config, _ = write_single_trial_checkpoint(
+        tmp_path,
+        monkeypatch,
+    )
+    metadata_path = checkpoint_dir / "pbt_state.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["members"]["member-00"]["actor_lr"] = 2e-3
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(InvalidPopulationCheckpointError, match="outside"):
+        PopulationAsyncSAC.from_checkpoint(
+            specs,
+            checkpoint_dir,
+            pbt_config=pbt_config,
+        )
+
+
+def test_warm_start_resets_identity_and_rejects_ambiguous_hparams(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir, specs, _, source = write_single_trial_checkpoint(
+        tmp_path,
+        monkeypatch,
+    )
+    warm_config = make_pbt_config(
+        seed=1,
+        mutations={"actor_lr": FloatMutation(1e-5, 1e-3)},
+    )
+
+    warm = PopulationAsyncSAC.from_warm_start_checkpoint(
+        specs,
+        checkpoint_dir,
+        run_id="run-warm",
+        pbt_config=warm_config,
+    )
+
+    assert warm.run_id == "run-warm"
+    assert warm.run_id != source.run_id
+    assert warm._generations == {"member-00": 0, "member-01": 0}
+    assert warm._exploit_count == 0
+    assert warm._report_index == 0
+    assert warm._reports_since_perturbation == 0
+    assert all(
+        runtime_id.startswith("run-warm-")
+        for runtime_id in warm.runtime_member_ids.values()
+    )
+    assert set(warm._warm_start_source_states or {}) == {
+        "member-00",
+        "member-01",
+    }
+
+    out_of_bounds = make_pbt_config(
+        mutations={"actor_lr": FloatMutation(5e-4, 1e-3)},
+    )
+    with pytest.raises(ValueError, match="outside"):
+        PopulationAsyncSAC.from_warm_start_checkpoint(
+            specs,
+            checkpoint_dir,
+            run_id="run-invalid",
+            pbt_config=out_of_bounds,
+        )
+
+    with pytest.raises(ValueError, match="slots"):
+        PopulationAsyncSAC.from_warm_start_checkpoint(
+            make_single_trial_specs(size=3),
+            checkpoint_dir,
+            run_id="run-resized",
+            pbt_config=warm_config,
+        )
+
+
+def test_exact_resume_requires_pbt_metadata(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_dir, specs, pbt_config, _ = write_single_trial_checkpoint(
+        tmp_path,
+        monkeypatch,
+    )
+    (checkpoint_dir / "pbt_state.json").unlink()
+
+    with pytest.raises(InvalidPopulationCheckpointError, match="PBT checkpoint"):
+        PopulationAsyncSAC.from_checkpoint(
+            specs,
+            checkpoint_dir,
+            pbt_config=pbt_config,
+        )
 
 
 def test_runtime_member_id_is_generation_specific_and_deterministic() -> None:
@@ -704,6 +939,138 @@ def test_population_pump_rotates_first_member_without_blocking() -> None:
         ("member-02", 0.0),
         ("member-00", 0.0),
     ]
+
+
+@pytest.mark.parametrize("failure_stage", ("member", "replay", "writer"))
+def test_population_checkpoint_resumes_paused_members_after_failure(
+    failure_stage: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    spaces = {
+        "default_policy": (
+            gym.spaces.Box(-1.0, 1.0, shape=(3,)),
+            gym.spaces.Box(-1.0, 1.0, shape=(1,)),
+        )
+    }
+    monkeypatch.setattr(
+        SingleMemberAsyncSAC,
+        "_resolve_spaces",
+        staticmethod(lambda _: spaces),
+    )
+    population = PopulationAsyncSAC(
+        make_single_trial_specs(),
+        run_id="run-checkpoint-failure",
+        pbt_config=make_pbt_config(),
+    )
+    population._state = RuntimeState.RUNNING
+    runtime = population._member_specs["member-00"].runtime_config
+    store = EpisodeStore(
+        population_module.FlatEpisodeCodec(),
+        capacity_transitions=runtime.replay_capacity_transitions,
+        capacity_bytes=runtime.replay_capacity_bytes,
+        journal_capacity=runtime.replay_journal_capacity,
+        store_generation="checkpoint-failure",
+    )
+    calls: list[tuple[str, str]] = []
+
+    class FakeMember:
+        def __init__(self, slot_id: str) -> None:
+            self.slot_id = slot_id
+            self.state = RuntimeState.RUNNING
+
+        def pause(self, *, timeout_s: float) -> None:
+            assert timeout_s > 0
+            calls.append(("pause", self.slot_id))
+            self.state = RuntimeState.PAUSED
+
+        def drain(self, *, timeout_s: float) -> None:
+            assert timeout_s > 0
+            calls.append(("drain", self.slot_id))
+
+        def get_member_checkpoint_state(
+            self,
+            *,
+            timeout_s: float,
+        ) -> RuntimeCheckpointState:
+            assert timeout_s > 0
+            calls.append(("snapshot", self.slot_id))
+            if failure_stage == "member" and self.slot_id == "member-01":
+                raise RuntimeError("member snapshot failed")
+            spec = population._member_specs[self.slot_id]
+            return RuntimeCheckpointState(
+                state_version=1,
+                member_id=spec.runtime_config.member_id,
+                runtime_config=asdict(spec.runtime_config),
+                replay_file="replay.snapshot",
+                replay_cursor=store.cursor,
+                learner=b"learner",
+                rollout={},
+                evaluation=None,
+                controller={},
+            )
+
+        def resume(self) -> None:
+            calls.append(("resume", self.slot_id))
+            self.state = RuntimeState.RUNNING
+
+    replay_ref = object()
+
+    class RemoteMethod:
+        @staticmethod
+        def remote() -> object:
+            calls.append(("snapshot", "replay"))
+            return replay_ref
+
+    class FakeReplay:
+        get_checkpoint_state = RemoteMethod()
+
+    def fake_ray_get(ref: object, *, timeout: float):
+        assert ref is replay_ref
+        assert timeout > 0
+        if failure_stage == "replay":
+            raise RuntimeError("replay snapshot failed")
+        return store.export_state()
+
+    def fake_writer(*args, **kwargs):
+        del args, kwargs
+        calls.append(("write", "population"))
+        if failure_stage == "writer":
+            raise RuntimeError("writer failed")
+        raise AssertionError("writer must only be reached in its failure case")
+
+    population._members = {
+        slot_id: FakeMember(slot_id) for slot_id in population.slot_ids
+    }
+    population._replay_actor = FakeReplay()
+    monkeypatch.setattr(population_module.ray, "get", fake_ray_get)
+    monkeypatch.setattr(
+        population_module,
+        "write_population_checkpoint",
+        fake_writer,
+    )
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+
+    with pytest.raises(RuntimeError, match="failed"):
+        population.save_checkpoint(checkpoint_dir)
+
+    assert calls[:2] == [
+        ("pause", "member-00"),
+        ("pause", "member-01"),
+    ]
+    assert calls[2:4] == [
+        ("drain", "member-00"),
+        ("drain", "member-01"),
+    ]
+    assert calls[-2:] == [
+        ("resume", "member-00"),
+        ("resume", "member-01"),
+    ]
+    assert all(
+        member.state is RuntimeState.RUNNING for member in population._members.values()
+    )
 
 
 def test_partial_population_setup_stops_created_members_and_replay(

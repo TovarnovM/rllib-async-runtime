@@ -17,6 +17,7 @@ from tensorboardX.proto.event_pb2 import Event
 
 from rllib_async.examples import SyntheticThroughputEnv
 from rllib_async.runtime import (
+    PBT_STATE_FILENAME,
     AsyncSACRuntimeConfig,
     FloatMutation,
     PopulationAsyncSAC,
@@ -452,6 +453,238 @@ def test_pbt_restarts_only_target_and_resumes_learning_on_shared_replay(
 
 
 @pytest.mark.integration
+def test_population_checkpoint_exact_resume_and_warm_start(
+    ray_runtime: None,
+    tmp_path: Path,
+) -> None:
+    specs = make_single_trial_population_specs()
+    pbt_config = make_test_pbt_config()
+    source = PopulationAsyncSAC(
+        specs,
+        run_id="run-stage3-source",
+        report_interval_s=0.1,
+        pbt_config=pbt_config,
+    )
+    checkpoint_dir = tmp_path / "stage3-checkpoint"
+    checkpoint_dir.mkdir()
+    source_runtime_ids: dict[str, str] = {}
+    source_hparams: dict[str, dict[str, float]] = {}
+    source_generations: dict[str, int] = {}
+    source_report_index = 0
+    source_exploit_count = 0
+    replay_cursor = None
+    try:
+        source.start()
+        deadline = time.monotonic() + 30
+        report = None
+        while time.monotonic() < deadline:
+            report = source.run_for_report_interval(0.1)
+            if all(
+                member["learner"]["learner_updates"] >= 1
+                and member["train"]["episodes_since_metric_reset"] >= 1
+                for member in report["members"].values()
+            ):
+                break
+        assert report is not None
+        assert all(
+            member["learner"]["learner_updates"] >= 1
+            for member in report["members"].values()
+        )
+
+        source._reports_since_perturbation = 10_000
+        event = source._maybe_run_pbt_step(
+            {
+                "member-00": {
+                    "train": {
+                        "episode_reward_mean": 1.0,
+                        "episodes_since_metric_reset": 1,
+                    }
+                },
+                "member-01": {
+                    "train": {
+                        "episode_reward_mean": 3.0,
+                        "episodes_since_metric_reset": 1,
+                    }
+                },
+            }
+        )
+        assert event["event_happened"] == 1
+
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            report = source.run_for_report_interval(0.1)
+            if all(
+                member["learner"]["learner_updates"] >= 1
+                and member["train"]["episodes_since_metric_reset"] >= 1
+                for member in report["members"].values()
+            ):
+                break
+        assert all(
+            member["learner"]["learner_updates"] >= 1
+            for member in report["members"].values()
+        )
+
+        source_runtime_ids = source.runtime_member_ids
+        source_hparams = {
+            slot_id: dict(values) for slot_id, values in source._current_hparams.items()
+        }
+        source_generations = dict(source._generations)
+        source_report_index = source._report_index
+        source_exploit_count = source._exploit_count
+        replay_cursor = ray.get(source.replay_actor.get_stats.remote()).cursor
+
+        source.save_checkpoint(checkpoint_dir)
+        assert all(
+            member.state.value == "running" for member in source.members.values()
+        )
+    finally:
+        source.stop(graceful=False)
+
+    _, replay_state, checkpoint_members = read_population_checkpoint_bundle(
+        checkpoint_dir
+    )
+    assert replay_cursor is not None
+    assert replay_state.mutation_seq >= replay_cursor.mutation_seq
+    checkpoint_updates = {
+        slot_id: checkpoint_members[runtime_id].controller["learner_updates_completed"]
+        for slot_id, runtime_id in source_runtime_ids.items()
+    }
+
+    resumed = PopulationAsyncSAC.from_checkpoint(
+        specs,
+        checkpoint_dir,
+        pbt_config=pbt_config,
+    )
+    assert resumed.run_id == "run-stage3-source"
+    assert resumed.runtime_member_ids == source_runtime_ids
+    assert resumed._generations == source_generations
+    assert resumed._current_hparams == source_hparams
+    assert resumed._report_index == source_report_index
+    assert resumed._exploit_count == source_exploit_count
+    try:
+        resumed.start()
+        restored_replay = ray.get(resumed.replay_actor.get_stats.remote())
+        assert restored_replay.cursor.mutation_seq == replay_state.mutation_seq
+        immediate = {
+            slot_id: member.get_report(include_authoritative_replay=False)
+            for slot_id, member in resumed.members.items()
+        }
+        assert all(
+            report["controller"]["restore_count"] == 1
+            and report["learner"]["learner_updates"] >= checkpoint_updates[slot_id]
+            and report["train"]["episodes_since_metric_reset"]
+            == report["episodes_this_iter"]
+            for slot_id, report in immediate.items()
+        )
+
+        deadline = time.monotonic() + 30
+        resumed_report = None
+        while time.monotonic() < deadline:
+            resumed_report = resumed.run_for_report_interval(0.1)
+            if all(
+                member["train"]["episodes_since_metric_reset"] >= 1
+                and member["learner"]["learner_updates"] > checkpoint_updates[slot_id]
+                for slot_id, member in resumed_report["members"].items()
+            ):
+                break
+        assert resumed_report is not None
+        assert all(
+            member["train"]["episodes_since_metric_reset"] >= 1
+            for member in resumed_report["members"].values()
+        )
+    finally:
+        resumed.stop(graceful=False)
+
+    warm_specs = tuple(
+        PopulationMemberSpec(
+            member.sac_config.copy(copy_frozen=False).training(
+                actor_lr=2e-4,
+                critic_lr=2.5e-4,
+                alpha_lr=8e-5,
+            ),
+            member.runtime_config,
+        )
+        for member in specs
+    )
+    warm_pbt_config = SimplePBTConfig(
+        perturbation_interval_reports=10_000,
+        reward_window_episodes=4,
+        min_episodes_after_restart=1,
+        seed=7,
+        mutations={
+            "actor_lr": FloatMutation(
+                low=1e-4,
+                high=4e-4,
+                factors=(1.2,),
+            )
+        },
+    )
+    warm = PopulationAsyncSAC.from_warm_start_checkpoint(
+        warm_specs,
+        checkpoint_dir,
+        run_id="run-stage3-warm",
+        pbt_config=warm_pbt_config,
+    )
+    assert warm.run_id == "run-stage3-warm"
+    assert warm._generations == {"member-00": 0, "member-01": 0}
+    assert warm._exploit_count == 0
+    assert warm._report_index == 0
+    assert all(
+        runtime_id.startswith("run-stage3-warm-")
+        for runtime_id in warm.runtime_member_ids.values()
+    )
+    try:
+        warm.start()
+        warm_replay = ray.get(warm.replay_actor.get_stats.remote())
+        assert warm_replay.cursor.mutation_seq == replay_state.mutation_seq
+        deadline = time.monotonic() + 30
+        warm_report = None
+        while time.monotonic() < deadline:
+            warm_report = warm.run_for_report_interval(0.1)
+            if all(
+                member["train"]["episodes_since_metric_reset"] >= 1
+                and member["learner"]["learner_updates"] >= 1
+                for member in warm_report["members"].values()
+            ):
+                break
+        assert warm_report is not None
+        assert all(
+            member["controller"]["restore_count"] == 0
+            and member["controller"]["budget_sampled_origin"] > 0
+            and member["learner"]["learner_updates"] >= 1
+            for member in warm_report["members"].values()
+        )
+        assert warm_report["members"]["member-00"]["hparams"] == {
+            "actor_lr": 2e-4,
+            "critic_lr": 2.5e-4,
+            "alpha_lr": 8e-5,
+        }
+
+        warm._reports_since_perturbation = 10_000
+        event = warm._maybe_run_pbt_step(
+            {
+                "member-00": {
+                    "train": {
+                        "episode_reward_mean": 1.0,
+                        "episodes_since_metric_reset": 1,
+                    }
+                },
+                "member-01": {
+                    "train": {
+                        "episode_reward_mean": 3.0,
+                        "episodes_since_metric_reset": 1,
+                    }
+                },
+            }
+        )
+        assert event["event_happened"] == 1
+        assert event["new_value"] == pytest.approx(2e-4 * 1.2)
+        assert 1e-4 <= event["new_value"] <= 4e-4
+    finally:
+        warm.stop(graceful=False)
+
+
+@pytest.mark.integration
 def test_single_trial_population_writes_expected_tensorboard_tags(
     ray_runtime: None,
     tmp_path: Path,
@@ -467,7 +700,10 @@ def test_single_trial_population_writes_expected_tensorboard_tags(
             name="single-trial-population-tensorboard",
             storage_path=str(tmp_path),
             stop=SingleTrialPopulationReadyStopper(),
-            checkpoint_config=CheckpointConfig(checkpoint_at_end=False),
+            checkpoint_config=CheckpointConfig(
+                num_to_keep=1,
+                checkpoint_at_end=True,
+            ),
             verbose=0,
         ),
     ).fit()
@@ -476,7 +712,14 @@ def test_single_trial_population_writes_expected_tensorboard_tags(
     assert len(result_list) == 1
     result = result_list[0]
     assert result.error is None
+    assert result.checkpoint is not None
     assert result.metrics["population"]["size"] == 2
+    with result.checkpoint.as_directory() as checkpoint_directory:
+        checkpoint_path = Path(checkpoint_directory)
+        assert (checkpoint_path / "population.snapshot").is_file()
+        assert (checkpoint_path / "replay.snapshot").is_file()
+        assert (checkpoint_path / PBT_STATE_FILENAME).is_file()
+        assert len(tuple((checkpoint_path / "members").glob("*/member.snapshot"))) == 2
     event_files = tuple(Path(result.path).glob("events.out.tfevents.*"))
     assert event_files
     tags = set().union(*(read_tensorboard_tags(path) for path in event_files))

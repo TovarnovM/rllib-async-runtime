@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import random
 import time
 import uuid
@@ -25,8 +26,10 @@ from rllib_async.protocols import FlatEpisodeCodec, ReplayCursor, ReplayStats
 from rllib_async.replay import ReplayActor
 from rllib_async.replay.reference import EpisodeStoreState
 from rllib_async.runtime.checkpoint import (
+    InvalidPopulationCheckpointError,
     PopulationCheckpoint,
     RuntimeCheckpointState,
+    read_pbt_checkpoint_metadata,
     read_population_checkpoint_bundle,
     read_runtime_member_checkpoint,
     write_population_checkpoint,
@@ -48,6 +51,8 @@ class PopulationError(RuntimeError):
 
 _LOGGER = logging.getLogger(__name__)
 _MUTABLE_HPARAMS = ("actor_lr", "critic_lr", "alpha_lr")
+_PBT_CHECKPOINT_SCHEMA_VERSION = 1
+_POPULATION_RUN_MODES = frozenset({"new", "resume", "warm_start"})
 _SHARED_REPLAY_SETTINGS = (
     "replay_capacity_transitions",
     "replay_capacity_bytes",
@@ -214,6 +219,225 @@ class SimplePBTConfig:
         if "perturbation_interval_reports" not in value:
             raise ValueError("PBT config requires perturbation_interval_reports")
         return cls(**value)
+
+
+@dataclass(frozen=True, slots=True)
+class _PBTMemberCheckpointMetadata:
+    generation: int
+    runtime_member_id: str
+    hparams: Mapping[str, Any]
+    exploit_count_as_target: int
+
+    @classmethod
+    def from_mapping(
+        cls,
+        slot_id: str,
+        value: object,
+    ) -> _PBTMemberCheckpointMetadata:
+        if not isinstance(value, Mapping):
+            raise ValueError(f"PBT member {slot_id!r} metadata must be a mapping")
+        expected = {
+            "generation",
+            "runtime_member_id",
+            "exploit_count_as_target",
+            *_MUTABLE_HPARAMS,
+        }
+        if set(value) != expected:
+            raise ValueError(f"PBT member {slot_id!r} metadata fields do not match")
+        generation = value["generation"]
+        exploit_count = value["exploit_count_as_target"]
+        for name, counter in (
+            ("generation", generation),
+            ("exploit_count_as_target", exploit_count),
+        ):
+            if not isinstance(counter, int) or isinstance(counter, bool) or counter < 0:
+                raise ValueError(f"PBT member {slot_id!r} {name} is invalid")
+        if exploit_count != generation:
+            raise ValueError(
+                f"PBT member {slot_id!r} exploit count does not match generation"
+            )
+        runtime_member_id = _validate_id_segment(
+            value["runtime_member_id"],
+            name=f"PBT member {slot_id!r} runtime_member_id",
+        )
+        hparams = {name: value[name] for name in _MUTABLE_HPARAMS}
+        return cls(
+            generation=generation,
+            runtime_member_id=runtime_member_id,
+            hparams=hparams,
+            exploit_count_as_target=exploit_count,
+        )
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "generation": self.generation,
+            "runtime_member_id": self.runtime_member_id,
+            **dict(self.hparams),
+            "exploit_count_as_target": self.exploit_count_as_target,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _PBTCheckpointMetadata:
+    run_id: str
+    population_report_index: int
+    reports_since_perturbation: int
+    exploit_count: int
+    population_size: int
+    report_interval_s: float
+    pbt_config: SimplePBTConfig | None
+    members: Mapping[str, _PBTMemberCheckpointMetadata]
+
+    @classmethod
+    def from_mapping(cls, value: object) -> _PBTCheckpointMetadata:
+        try:
+            if not isinstance(value, Mapping):
+                raise ValueError("PBT checkpoint metadata must be a mapping")
+            expected = {
+                "schema_version",
+                "run_id",
+                "population_report_index",
+                "reports_since_perturbation",
+                "exploit_count",
+                "population_size",
+                "report_interval_s",
+                "pbt_config",
+                "members",
+            }
+            if set(value) != expected:
+                raise ValueError("PBT checkpoint metadata fields do not match")
+            if value["schema_version"] != _PBT_CHECKPOINT_SCHEMA_VERSION:
+                raise ValueError("unsupported PBT checkpoint schema version")
+            run_id = _validate_id_segment(value["run_id"], name="PBT run_id")
+            counters: dict[str, int] = {}
+            for name in (
+                "population_report_index",
+                "reports_since_perturbation",
+                "exploit_count",
+                "population_size",
+            ):
+                item = value[name]
+                if (
+                    not isinstance(item, int)
+                    or isinstance(item, bool)
+                    or item < (2 if name == "population_size" else 0)
+                ):
+                    raise ValueError(f"PBT checkpoint {name} is invalid")
+                counters[name] = item
+            if (
+                counters["reports_since_perturbation"]
+                > counters["population_report_index"]
+            ):
+                raise ValueError("PBT report counters are inconsistent")
+            report_interval_s = value["report_interval_s"]
+            if (
+                not isinstance(report_interval_s, int | float)
+                or isinstance(report_interval_s, bool)
+                or not math.isfinite(report_interval_s)
+                or report_interval_s <= 0
+            ):
+                raise ValueError("PBT checkpoint report interval is invalid")
+            pbt_config = SimplePBTConfig.from_mapping(value["pbt_config"])
+            raw_members = value["members"]
+            if not isinstance(raw_members, Mapping):
+                raise ValueError("PBT checkpoint members must be a mapping")
+            members = {
+                _validate_id_segment(slot_id, name="PBT slot_id"): (
+                    _PBTMemberCheckpointMetadata.from_mapping(slot_id, item)
+                )
+                for slot_id, item in raw_members.items()
+            }
+            if len(members) != counters["population_size"]:
+                raise ValueError(
+                    "PBT checkpoint population size does not match members"
+                )
+            if pbt_config is not None:
+                for slot_id, member in members.items():
+                    for name, item in member.hparams.items():
+                        if (
+                            not isinstance(item, int | float)
+                            or isinstance(item, bool)
+                            or not math.isfinite(item)
+                            or item <= 0
+                        ):
+                            raise ValueError(
+                                f"PBT member {slot_id!r} {name} is invalid"
+                            )
+                    for name, mutation in pbt_config.mutations.items():
+                        item = float(member.hparams[name])
+                        if not mutation.low <= item <= mutation.high:
+                            raise ValueError(
+                                f"PBT member {slot_id!r} {name}={item} is outside "
+                                f"[{mutation.low}, {mutation.high}]"
+                            )
+            if (
+                sum(member.exploit_count_as_target for member in members.values())
+                != counters["exploit_count"]
+            ):
+                raise ValueError("PBT checkpoint exploit counters are inconsistent")
+            for slot_id, member in members.items():
+                if member.runtime_member_id != make_runtime_member_id(
+                    run_id,
+                    slot_id,
+                    member.generation,
+                ):
+                    raise ValueError(
+                        f"PBT member {slot_id!r} runtime ID does not match generation"
+                    )
+            return cls(
+                run_id=run_id,
+                population_report_index=counters["population_report_index"],
+                reports_since_perturbation=counters["reports_since_perturbation"],
+                exploit_count=counters["exploit_count"],
+                population_size=counters["population_size"],
+                report_interval_s=float(report_interval_s),
+                pbt_config=pbt_config,
+                members=members,
+            )
+        except InvalidPopulationCheckpointError:
+            raise
+        except (KeyError, TypeError, ValueError) as error:
+            raise InvalidPopulationCheckpointError(
+                f"invalid PBT checkpoint metadata: {error}"
+            ) from error
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema_version": _PBT_CHECKPOINT_SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "population_report_index": self.population_report_index,
+            "reports_since_perturbation": self.reports_since_perturbation,
+            "exploit_count": self.exploit_count,
+            "population_size": self.population_size,
+            "report_interval_s": self.report_interval_s,
+            "pbt_config": (
+                None
+                if self.pbt_config is None
+                else {
+                    "perturbation_interval_reports": (
+                        self.pbt_config.perturbation_interval_reports
+                    ),
+                    "metric_key": self.pbt_config.metric_key,
+                    "mode": self.pbt_config.mode,
+                    "reward_window_episodes": (self.pbt_config.reward_window_episodes),
+                    "min_episodes_after_restart": (
+                        self.pbt_config.min_episodes_after_restart
+                    ),
+                    "seed": self.pbt_config.seed,
+                    "mutations": {
+                        name: {
+                            "low": mutation.low,
+                            "high": mutation.high,
+                            "factors": list(mutation.factors),
+                        }
+                        for name, mutation in self.pbt_config.mutations.items()
+                    },
+                }
+            ),
+            "members": {
+                slot_id: member.to_mapping() for slot_id, member in self.members.items()
+            },
+        }
 
 
 def _member_id_from_trial(trial: Any) -> str:
@@ -697,6 +921,28 @@ class PopulationAsyncSAC:
         self._last_exploit_duration_s = 0.0
         self._last_pbt_event = self._empty_pbt_event("not_started")
         self._restarting_slot: str | None = None
+        self._checkpoint_replay_state: EpisodeStoreState | None = None
+        self._checkpoint_member_states: (
+            dict[
+                str,
+                RuntimeCheckpointState,
+            ]
+            | None
+        ) = None
+        self._warm_start_source_states: (
+            dict[
+                str,
+                RuntimeCheckpointState,
+            ]
+            | None
+        ) = None
+        self._warm_start_source_specs: (
+            dict[
+                str,
+                PopulationMemberSpec,
+            ]
+            | None
+        ) = None
 
     @property
     def state(self) -> RuntimeState:
@@ -731,6 +977,230 @@ class PopulationAsyncSAC:
     def members(self) -> dict[str, SingleMemberAsyncSAC]:
         return dict(self._members)
 
+    @classmethod
+    def from_checkpoint(
+        cls,
+        members: Sequence[PopulationMemberSpec],
+        directory: str | Path,
+        *,
+        run_id: str | None = None,
+        report_interval_s: float | None = None,
+        pbt_config: SimplePBTConfig | None = None,
+    ) -> PopulationAsyncSAC:
+        """Build an exact population continuation from one coordinated snapshot."""
+
+        metadata = _PBTCheckpointMetadata.from_mapping(
+            read_pbt_checkpoint_metadata(directory)
+        )
+        _, replay_state, member_states = read_population_checkpoint_bundle(directory)
+        if run_id is not None and run_id != metadata.run_id:
+            raise ValueError("exact resume run_id does not match checkpoint")
+        if pbt_config is not None and pbt_config != metadata.pbt_config:
+            raise ValueError("exact resume PBT config does not match checkpoint")
+        population = cls(
+            members,
+            run_id=metadata.run_id,
+            report_interval_s=(
+                metadata.report_interval_s
+                if report_interval_s is None
+                else report_interval_s
+            ),
+            pbt_config=metadata.pbt_config,
+        )
+        population._prepare_exact_restore(
+            metadata,
+            replay_state,
+            member_states,
+        )
+        return population
+
+    @classmethod
+    def from_warm_start_checkpoint(
+        cls,
+        members: Sequence[PopulationMemberSpec],
+        directory: str | Path,
+        *,
+        run_id: str | None = None,
+        report_interval_s: float | None = None,
+        pbt_config: SimplePBTConfig | None = None,
+    ) -> PopulationAsyncSAC:
+        """Build a fresh PBT run from checkpoint models and shared replay."""
+
+        metadata = _PBTCheckpointMetadata.from_mapping(
+            read_pbt_checkpoint_metadata(directory)
+        )
+        _, replay_state, member_states = read_population_checkpoint_bundle(directory)
+        population = cls(
+            members,
+            run_id=run_id,
+            report_interval_s=report_interval_s,
+            pbt_config=pbt_config,
+        )
+        if population.run_id == metadata.run_id:
+            raise ValueError("warm start requires a new run_id")
+        population._prepare_warm_start(
+            metadata,
+            replay_state,
+            member_states,
+        )
+        return population
+
+    def _prepare_exact_restore(
+        self,
+        metadata: _PBTCheckpointMetadata,
+        replay_state: EpisodeStoreState,
+        member_states: Mapping[str, RuntimeCheckpointState],
+    ) -> None:
+        if metadata.run_id != self._run_id:
+            raise InvalidPopulationCheckpointError(
+                "PBT checkpoint run_id does not match population"
+            )
+        if metadata.report_interval_s != self._report_interval_s:
+            raise ValueError("exact resume report interval does not match checkpoint")
+        if metadata.pbt_config != self._pbt_config:
+            raise ValueError("exact resume PBT config does not match checkpoint")
+        if set(metadata.members) != set(self._slot_ids):
+            raise ValueError("exact resume population slots do not match checkpoint")
+        self._validate_replay_checkpoint_config(replay_state)
+
+        restored_specs: dict[str, PopulationMemberSpec] = {}
+        restored_states: dict[str, RuntimeCheckpointState] = {}
+        expected_runtime_ids: set[str] = set()
+        for slot_id in self._slot_ids:
+            member_metadata = metadata.members[slot_id]
+            template = self._member_specs[slot_id]
+            sac_config = template.sac_config.copy(copy_frozen=False)
+            sac_config.training(**dict(member_metadata.hparams))
+            sac_config.debugging(
+                seed=self._base_sac_seeds[slot_id] + member_metadata.generation
+            )
+            runtime_config = replace(
+                template.runtime_config,
+                member_id=member_metadata.runtime_member_id,
+                seed=(self._base_runtime_seeds[slot_id] + member_metadata.generation),
+            )
+            checkpoint_state = member_states.get(member_metadata.runtime_member_id)
+            if checkpoint_state is None:
+                raise InvalidPopulationCheckpointError(
+                    f"PBT checkpoint is missing member {slot_id!r}"
+                )
+            if checkpoint_state.runtime_config != asdict(runtime_config):
+                raise ValueError(
+                    f"exact resume runtime config for {slot_id!r} does not match"
+                )
+            restored_specs[slot_id] = PopulationMemberSpec(
+                sac_config,
+                runtime_config,
+            )
+            restored_states[slot_id] = checkpoint_state
+            expected_runtime_ids.add(member_metadata.runtime_member_id)
+        if set(member_states) != expected_runtime_ids:
+            raise InvalidPopulationCheckpointError(
+                "PBT checkpoint contains foreign member states"
+            )
+
+        self._member_specs = restored_specs
+        self._generations = {
+            slot_id: metadata.members[slot_id].generation for slot_id in self._slot_ids
+        }
+        self._exploit_count_as_target = {
+            slot_id: metadata.members[slot_id].exploit_count_as_target
+            for slot_id in self._slot_ids
+        }
+        self._current_hparams = {
+            slot_id: dict(metadata.members[slot_id].hparams)
+            for slot_id in self._slot_ids
+        }
+        self._report_index = metadata.population_report_index
+        self._reports_since_perturbation = metadata.reports_since_perturbation
+        self._exploit_count = metadata.exploit_count
+        self._last_pbt_event = self._empty_pbt_event("resumed")
+        self._checkpoint_replay_state = replay_state
+        self._checkpoint_member_states = restored_states
+
+    def _prepare_warm_start(
+        self,
+        metadata: _PBTCheckpointMetadata,
+        replay_state: EpisodeStoreState,
+        member_states: Mapping[str, RuntimeCheckpointState],
+    ) -> None:
+        if set(metadata.members) != set(self._slot_ids):
+            raise ValueError("warm start population slots do not match checkpoint")
+        self._validate_replay_checkpoint_config(replay_state)
+        self._validate_hparams_in_mutation_bounds()
+
+        source_states: dict[str, RuntimeCheckpointState] = {}
+        source_specs: dict[str, PopulationMemberSpec] = {}
+        expected_runtime_ids: set[str] = set()
+        for slot_id in self._slot_ids:
+            member_metadata = metadata.members[slot_id]
+            checkpoint_state = member_states.get(member_metadata.runtime_member_id)
+            if checkpoint_state is None:
+                raise InvalidPopulationCheckpointError(
+                    f"PBT checkpoint is missing member {slot_id!r}"
+                )
+            target_template = self._member_specs[slot_id]
+            source_sac_config = target_template.sac_config.copy(copy_frozen=False)
+            source_sac_config.training(**dict(member_metadata.hparams))
+            source_runtime_config = AsyncSACRuntimeConfig.from_mapping(
+                checkpoint_state.runtime_config,
+                sac_config=source_sac_config,
+            )
+            requested_runtime = asdict(target_template.runtime_config)
+            source_runtime = asdict(source_runtime_config)
+            for name in ("member_id", "seed"):
+                requested_runtime.pop(name)
+                source_runtime.pop(name)
+            if requested_runtime != source_runtime:
+                raise ValueError(
+                    f"warm start runtime topology for {slot_id!r} does not match"
+                )
+            source_states[slot_id] = checkpoint_state
+            source_specs[slot_id] = PopulationMemberSpec(
+                source_sac_config,
+                source_runtime_config,
+            )
+            expected_runtime_ids.add(member_metadata.runtime_member_id)
+        if set(member_states) != expected_runtime_ids:
+            raise InvalidPopulationCheckpointError(
+                "PBT checkpoint contains foreign member states"
+            )
+
+        self._checkpoint_replay_state = replay_state
+        self._warm_start_source_states = source_states
+        self._warm_start_source_specs = source_specs
+        self._last_pbt_event = self._empty_pbt_event("warm_started")
+
+    def _validate_replay_checkpoint_config(
+        self,
+        replay_state: EpisodeStoreState,
+    ) -> None:
+        runtime = self._member_specs[self._slot_ids[0]].runtime_config
+        expected = (
+            runtime.replay_capacity_transitions,
+            runtime.replay_capacity_bytes,
+            runtime.replay_journal_capacity,
+        )
+        observed = (
+            replay_state.capacity_transitions,
+            replay_state.capacity_bytes,
+            replay_state.journal_capacity,
+        )
+        if observed != expected:
+            raise ValueError("population replay config does not match checkpoint")
+
+    def _validate_hparams_in_mutation_bounds(self) -> None:
+        if self._pbt_config is None:
+            return
+        for slot_id, hparams in self._current_hparams.items():
+            for name, mutation in self._pbt_config.mutations.items():
+                value = hparams[name]
+                if not mutation.low <= value <= mutation.high:
+                    raise ValueError(
+                        f"warm start {slot_id!r} {name}={value} is outside "
+                        f"[{mutation.low}, {mutation.high}]"
+                    )
+
     def start(self) -> None:
         if self._state is RuntimeState.RUNNING:
             return
@@ -748,18 +1218,71 @@ class PopulationAsyncSAC:
                 capacity_bytes=replay_config.replay_capacity_bytes,
                 journal_capacity=replay_config.replay_journal_capacity,
             )
+            if self._checkpoint_replay_state is not None:
+                expected_cursor = ReplayCursor(
+                    self._checkpoint_replay_state.store_generation,
+                    self._checkpoint_replay_state.mutation_seq,
+                )
+                restored_replay = ray.get(
+                    self._replay_actor.load_checkpoint_state.remote(
+                        self._checkpoint_replay_state
+                    )
+                )
+                if (
+                    not isinstance(restored_replay, ReplayStats)
+                    or restored_replay.cursor != expected_cursor
+                ):
+                    raise PopulationError(
+                        "shared replay returned invalid restore statistics"
+                    )
+                self._checkpoint_replay_state = None
             for slot_id in self._slot_ids:
                 member = self._member_specs[slot_id]
-                self._members[slot_id] = SingleMemberAsyncSAC(
-                    member.sac_config,
-                    member.runtime_config,
-                    replay_actor=self._replay_actor,
-                    reward_window_episodes=(
-                        self._pbt_config.reward_window_episodes
-                        if self._pbt_config is not None
-                        else 100
-                    ),
+                reward_window_episodes = (
+                    self._pbt_config.reward_window_episodes
+                    if self._pbt_config is not None
+                    else 100
                 )
+                if self._checkpoint_member_states is not None:
+                    self._members[slot_id] = (
+                        SingleMemberAsyncSAC.from_member_checkpoint_state(
+                            member.sac_config,
+                            member.runtime_config,
+                            self._checkpoint_member_states[slot_id],
+                            replay_actor=self._replay_actor,
+                            reward_window_episodes=reward_window_episodes,
+                        )
+                    )
+                elif (
+                    self._warm_start_source_states is not None
+                    and self._warm_start_source_specs is not None
+                ):
+                    source = self._warm_start_source_specs[slot_id]
+                    pbt_state = (
+                        SingleMemberAsyncSAC.pbt_state_from_member_checkpoint_state(
+                            source.sac_config,
+                            source.runtime_config,
+                            self._warm_start_source_states[slot_id],
+                            replay_actor=self._replay_actor,
+                        )
+                    )
+                    self._members[slot_id] = SingleMemberAsyncSAC.from_pbt_state(
+                        member.sac_config,
+                        member.runtime_config,
+                        pbt_state,
+                        replay_actor=self._replay_actor,
+                        reward_window_episodes=reward_window_episodes,
+                    )
+                else:
+                    self._members[slot_id] = SingleMemberAsyncSAC(
+                        member.sac_config,
+                        member.runtime_config,
+                        replay_actor=self._replay_actor,
+                        reward_window_episodes=reward_window_episodes,
+                    )
+            self._checkpoint_member_states = None
+            self._warm_start_source_states = None
+            self._warm_start_source_specs = None
             for member in self._members.values():
                 member.start()
         except Exception:
@@ -832,6 +1355,109 @@ class PopulationAsyncSAC:
         except Exception:
             self._state = RuntimeState.FAILED
             raise
+
+    def save_checkpoint(
+        self,
+        directory: str | Path,
+        *,
+        timeout_s: float | None = None,
+    ) -> PopulationCheckpoint:
+        """Pause every member and publish one coordinated population snapshot."""
+
+        self._require_running()
+        runtime = self._member_specs[self._slot_ids[0]].runtime_config
+        timeout_s = runtime.shutdown_timeout_s if timeout_s is None else timeout_s
+        if (
+            not isinstance(timeout_s, int | float)
+            or isinstance(timeout_s, bool)
+            or not math.isfinite(timeout_s)
+            or timeout_s <= 0
+        ):
+            raise ValueError("timeout_s must be finite and positive")
+        destination = Path(directory)
+        if not destination.is_dir():
+            raise FileNotFoundError(
+                f"checkpoint directory does not exist: {destination}"
+            )
+
+        deadline = time.monotonic() + timeout_s
+        checkpoint_error: BaseException | None = None
+        try:
+            for slot_id in self._slot_ids:
+                self._members[slot_id].pause(
+                    timeout_s=self._checkpoint_remaining(deadline)
+                )
+            for slot_id in self._slot_ids:
+                self._members[slot_id].drain(
+                    timeout_s=self._checkpoint_remaining(deadline)
+                )
+
+            member_states: dict[str, RuntimeCheckpointState] = {}
+            for slot_id in self._slot_ids:
+                state = self._members[slot_id].get_member_checkpoint_state(
+                    timeout_s=self._checkpoint_remaining(deadline)
+                )
+                member_states[state.member_id] = state
+            replay_state = ray.get(
+                self.replay_actor.get_checkpoint_state.remote(),
+                timeout=self._checkpoint_remaining(deadline),
+            )
+            if not isinstance(replay_state, EpisodeStoreState):
+                raise PopulationError("shared replay returned invalid checkpoint state")
+            return write_population_checkpoint(
+                destination,
+                replay_state=replay_state,
+                members=member_states,
+                pbt_metadata=self._checkpoint_metadata().to_mapping(),
+            )
+        except BaseException as error:
+            checkpoint_error = error
+            raise
+        finally:
+            resume_errors: list[BaseException] = []
+            for slot_id in self._slot_ids:
+                member = self._members.get(slot_id)
+                if member is None or member.state is not RuntimeState.PAUSED:
+                    continue
+                try:
+                    member.resume()
+                except BaseException as error:
+                    resume_errors.append(error)
+            if resume_errors:
+                self._state = RuntimeState.FAILED
+                if checkpoint_error is None:
+                    raise PopulationError(
+                        f"population checkpoint resume failed: {resume_errors[0]}"
+                    ) from resume_errors[0]
+
+    def _checkpoint_metadata(self) -> _PBTCheckpointMetadata:
+        members = {
+            slot_id: _PBTMemberCheckpointMetadata(
+                generation=self._generations[slot_id],
+                runtime_member_id=self.runtime_member_ids[slot_id],
+                hparams=dict(self._current_hparams[slot_id]),
+                exploit_count_as_target=(self._exploit_count_as_target[slot_id]),
+            )
+            for slot_id in self._slot_ids
+        }
+        metadata = _PBTCheckpointMetadata(
+            run_id=self._run_id,
+            population_report_index=self._report_index,
+            reports_since_perturbation=self._reports_since_perturbation,
+            exploit_count=self._exploit_count,
+            population_size=len(self._slot_ids),
+            report_interval_s=self._report_interval_s,
+            pbt_config=self._pbt_config,
+            members=members,
+        )
+        return _PBTCheckpointMetadata.from_mapping(metadata.to_mapping())
+
+    @staticmethod
+    def _checkpoint_remaining(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("population checkpoint timed out")
+        return remaining
 
     def stop(self, *, graceful: bool = True) -> None:
         if self._state is RuntimeState.STOPPED:
@@ -1305,7 +1931,7 @@ class PopulationTrainable(Trainable):
         cls,
         config: dict[str, Any],
     ) -> PlacementGroupFactory:
-        members, _, _, _ = cls._parse_config(config)
+        members, _, _, _, _, _ = cls._parse_config(config)
         bundles: list[dict[str, float]] = [{"CPU": 1.0}]
         replay_cpu = members[0].runtime_config.num_cpus_per_replay
         if replay_cpu:
@@ -1320,17 +1946,67 @@ class PopulationTrainable(Trainable):
         return PlacementGroupFactory(bundles, strategy="PACK")
 
     def setup(self, config: dict[str, Any]) -> None:
-        members, run_id, report_interval_s, pbt_config = self._parse_config(config)
-        self._population = PopulationAsyncSAC(
+        (
             members,
-            run_id=run_id,
-            report_interval_s=report_interval_s,
-            pbt_config=pbt_config,
-        )
+            run_id,
+            report_interval_s,
+            pbt_config,
+            run_mode,
+            checkpoint_path,
+        ) = self._parse_config(config)
+        self._members = members
+        self._run_id = run_id
+        self._report_interval_s = report_interval_s
+        self._pbt_config = pbt_config
+        if run_mode == "new":
+            self._population = PopulationAsyncSAC(
+                members,
+                run_id=run_id,
+                report_interval_s=report_interval_s,
+                pbt_config=pbt_config,
+            )
+        elif run_mode == "resume":
+            assert checkpoint_path is not None
+            self._population = PopulationAsyncSAC.from_checkpoint(
+                members,
+                checkpoint_path,
+                run_id=run_id,
+                report_interval_s=report_interval_s,
+                pbt_config=pbt_config,
+            )
+        else:
+            assert run_mode == "warm_start"
+            assert checkpoint_path is not None
+            self._population = PopulationAsyncSAC.from_warm_start_checkpoint(
+                members,
+                checkpoint_path,
+                run_id=run_id,
+                report_interval_s=report_interval_s,
+                pbt_config=pbt_config,
+            )
         self._population.start()
 
     def step(self) -> dict[str, Any]:
         return self._population.run_for_report_interval()
+
+    def save_checkpoint(self, checkpoint_dir: str) -> None:
+        self._population.save_checkpoint(checkpoint_dir)
+        return None
+
+    def load_checkpoint(self, checkpoint: object) -> None:
+        if not isinstance(checkpoint, str | os.PathLike):
+            raise TypeError("PopulationTrainable requires a directory checkpoint")
+        previous = self._population
+        previous.stop(graceful=False)
+        restored = PopulationAsyncSAC.from_checkpoint(
+            self._members,
+            checkpoint,
+            run_id=self._run_id,
+            report_interval_s=self._report_interval_s,
+            pbt_config=self._pbt_config,
+        )
+        self._population = restored
+        restored.start()
 
     def cleanup(self) -> None:
         population = getattr(self, "_population", None)
@@ -1345,6 +2021,8 @@ class PopulationTrainable(Trainable):
         str | None,
         float,
         SimplePBTConfig | None,
+        Literal["new", "resume", "warm_start"],
+        str | None,
     ]:
         if not isinstance(config, Mapping):
             raise TypeError("PopulationTrainable config must be a mapping")
@@ -1353,6 +2031,8 @@ class PopulationTrainable(Trainable):
             "pbt",
             "run_id",
             "report_interval_s",
+            "run_mode",
+            "checkpoint_path",
         }
         if unknown:
             raise ValueError(
@@ -1405,4 +2085,25 @@ class PopulationTrainable(Trainable):
             config.get("report_interval_s"),
         )
         pbt_config = SimplePBTConfig.from_mapping(config.get("pbt"))
-        return resolved_members, run_id, report_interval_s, pbt_config
+        run_mode = config.get("run_mode", "new")
+        if run_mode not in _POPULATION_RUN_MODES:
+            raise ValueError("run_mode must be 'new', 'resume', or 'warm_start'")
+        checkpoint_path = config.get("checkpoint_path")
+        if checkpoint_path is not None:
+            if not isinstance(checkpoint_path, str | os.PathLike):
+                raise TypeError("checkpoint_path must be a filesystem path")
+            checkpoint_path = os.fspath(checkpoint_path)
+            if not checkpoint_path:
+                raise ValueError("checkpoint_path must not be empty")
+        if run_mode == "new" and checkpoint_path is not None:
+            raise ValueError("new population mode does not accept checkpoint_path")
+        if run_mode != "new" and checkpoint_path is None:
+            raise ValueError(f"{run_mode} population mode requires checkpoint_path")
+        return (
+            resolved_members,
+            run_id,
+            report_interval_s,
+            pbt_config,
+            run_mode,
+            checkpoint_path,
+        )
