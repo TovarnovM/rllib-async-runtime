@@ -379,7 +379,11 @@ class SingleMemberAsyncSAC:
             )
         return self.get_report()
 
-    def get_report(self) -> dict[str, Any]:
+    def get_report(
+        self,
+        *,
+        include_authoritative_replay: bool = True,
+    ) -> dict[str, Any]:
         self._require_not_stopped()
         self._poll_learner_tick()
         assert self._rollout_group is not None
@@ -387,9 +391,13 @@ class SingleMemberAsyncSAC:
         assert self._learner_actor is not None
 
         rollout = self._rollout_group.get_stats()
-        replay = ray.get(self._replay_actor.get_stats.remote())
+        replay = (
+            ray.get(self._replay_actor.get_stats.remote())
+            if include_authoritative_replay
+            else None
+        )
         learner = ray.get(self._learner_actor.get_stats.remote())
-        if not isinstance(replay, ReplayStats):
+        if replay is not None and not isinstance(replay, ReplayStats):
             raise RuntimeError("replay actor returned invalid stats")
         if not isinstance(learner, LearnerHostStats):
             raise RuntimeError("learner actor returned invalid stats")
@@ -408,12 +416,13 @@ class SingleMemberAsyncSAC:
         learner_values = asdict(learner)
         fast_replay = learner_values.pop("fast_replay")
         batching = learner_values.pop("batch_producer")
-        replay_values = asdict(replay)
-        for name in (
-            "producer_episode_counts",
-            "producer_transition_counts",
-        ):
-            replay_values[name] = dict(replay_values[name])
+        replay_values = asdict(replay) if replay is not None else None
+        if replay_values is not None:
+            for name in (
+                "producer_episode_counts",
+                "producer_transition_counts",
+            ):
+                replay_values[name] = dict(replay_values[name])
         for name in (
             "active_module_transition_counts",
             "active_producer_episode_counts",
@@ -434,6 +443,17 @@ class SingleMemberAsyncSAC:
         learner_values["effective_training_intensity"] = (
             self._effective_training_intensity()
         )
+        rollout_values = asdict(rollout)
+        train_values = {
+            name: rollout_values.pop(name)
+            for name in (
+                "episode_reward_mean",
+                "episode_reward_min",
+                "episode_reward_max",
+                "episodes_in_window",
+                "episodes_since_metric_reset",
+            )
+        }
         result: dict[str, Any] = {
             "timesteps_this_iter": env_steps_this_iter,
             "episodes_this_iter": episodes_this_iter,
@@ -441,8 +461,8 @@ class SingleMemberAsyncSAC:
                 evaluation.latest_return_mean if evaluation is not None else math.nan
             ),
             "controller": self._controller_metrics(),
-            "rollout": self._metric_tree(asdict(rollout)),
-            "authoritative_replay": self._metric_tree(replay_values),
+            "train": self._metric_tree(train_values),
+            "rollout": self._metric_tree(rollout_values),
             "fast_replay": self._metric_tree(fast_replay),
             "batching": self._metric_tree(batching),
             "learner": self._metric_tree(learner_values),
@@ -452,6 +472,8 @@ class SingleMemberAsyncSAC:
                 else {"enabled": False}
             ),
         }
+        if replay_values is not None:
+            result["authoritative_replay"] = self._metric_tree(replay_values)
         return result
 
     def save_checkpoint(
@@ -1093,7 +1115,22 @@ class AsyncSACTrainable(Trainable):
     ) -> PlacementGroupFactory:
         sac_config, runtime, shared_replay, _ = cls._parse_config(config)
         del sac_config
-        bundles: list[dict[str, float]] = [{"CPU": 1.0}]
+        bundles = [
+            {"CPU": 1.0},
+            *cls._child_resource_bundles(
+                runtime,
+                include_replay=shared_replay is None,
+            ),
+        ]
+        return PlacementGroupFactory(bundles, strategy="PACK")
+
+    @staticmethod
+    def _child_resource_bundles(
+        runtime: AsyncSACRuntimeConfig,
+        *,
+        include_replay: bool,
+    ) -> list[dict[str, float]]:
+        bundles: list[dict[str, float]] = []
 
         def add_bundle(*, cpu: float = 0.0, gpu: float = 0.0) -> None:
             resources: dict[str, float] = {}
@@ -1104,7 +1141,7 @@ class AsyncSACTrainable(Trainable):
             if resources:
                 bundles.append(resources)
 
-        if shared_replay is None:
+        if include_replay:
             add_bundle(cpu=runtime.num_cpus_per_replay)
         add_bundle(
             cpu=runtime.num_cpus_per_learner,
@@ -1114,7 +1151,7 @@ class AsyncSACTrainable(Trainable):
             add_bundle(cpu=runtime.num_cpus_per_runner)
         for _ in range(runtime.evaluation_num_episodes):
             add_bundle(cpu=runtime.num_cpus_per_evaluation_runner)
-        return PlacementGroupFactory(bundles, strategy="PACK")
+        return bundles
 
     def setup(self, config: dict[str, Any]) -> None:
         (

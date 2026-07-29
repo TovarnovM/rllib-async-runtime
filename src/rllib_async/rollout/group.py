@@ -73,6 +73,11 @@ class RolloutGroupStats:
     duplicate_commits: int
     env_steps: int
     agent_steps: int
+    episode_reward_mean: float
+    episode_reward_min: float
+    episode_reward_max: float
+    episodes_in_window: int
+    episodes_since_metric_reset: int
     env_steps_per_s: float
     agent_steps_per_s: float
     sample_calls_started: int
@@ -155,6 +160,7 @@ class AsyncRolloutGroup:
         pending_commit_high_watermark: int,
         pending_commit_low_watermark: int,
         metrics_window: int = 2_048,
+        reward_window_episodes: int = 100,
         num_cpus_per_runner: float = 1.0,
         explore: bool = True,
         checkpoint_state: Mapping[str, Any] | None = None,
@@ -200,6 +206,12 @@ class AsyncRolloutGroup:
         ):
             raise ValueError("metrics_window must be a positive integer")
         if (
+            not isinstance(reward_window_episodes, int)
+            or isinstance(reward_window_episodes, bool)
+            or reward_window_episodes < 1
+        ):
+            raise ValueError("reward_window_episodes must be a positive integer")
+        if (
             not isinstance(num_cpus_per_runner, int | float)
             or isinstance(num_cpus_per_runner, bool)
             or not math.isfinite(num_cpus_per_runner)
@@ -225,6 +237,7 @@ class AsyncRolloutGroup:
         self._high_watermark = pending_commit_high_watermark
         self._low_watermark = pending_commit_low_watermark
         self._metrics_window = metrics_window
+        self._reward_window_episodes = reward_window_episodes
         self._num_cpus_per_runner = float(num_cpus_per_runner)
         self._explore = explore
         self._state = RolloutGroupState.CREATED
@@ -258,6 +271,10 @@ class AsyncRolloutGroup:
         self._rate_base_backpressure_s = 0.0
         self._episode_times_ms: deque[float] = deque(maxlen=metrics_window)
         self._policy_lags: deque[int] = deque(maxlen=metrics_window)
+        self._episode_returns: deque[float] = deque(
+            maxlen=reward_window_episodes,
+        )
+        self._episodes_since_metric_reset = 0
         if checkpoint_state is not None:
             self._restore_checkpoint_state(checkpoint_state)
 
@@ -430,6 +447,16 @@ class AsyncRolloutGroup:
         elapsed = (
             max(now - self._started_at, 0.0) if self._started_at is not None else 0.0
         )
+        if self._episode_returns:
+            episode_reward_mean = math.fsum(self._episode_returns) / len(
+                self._episode_returns
+            )
+            episode_reward_min = min(self._episode_returns)
+            episode_reward_max = max(self._episode_returns)
+        else:
+            episode_reward_mean = math.nan
+            episode_reward_min = math.nan
+            episode_reward_max = math.nan
         backpressure_s = self._backpressure_s
         if self._backpressure_started is not None:
             backpressure_s += now - self._backpressure_started
@@ -442,6 +469,11 @@ class AsyncRolloutGroup:
             duplicate_commits=self._duplicate_commits,
             env_steps=self._env_steps,
             agent_steps=self._agent_steps,
+            episode_reward_mean=episode_reward_mean,
+            episode_reward_min=episode_reward_min,
+            episode_reward_max=episode_reward_max,
+            episodes_in_window=len(self._episode_returns),
+            episodes_since_metric_reset=self._episodes_since_metric_reset,
             env_steps_per_s=(
                 (self._env_steps - self._rate_base_env_steps) / elapsed
                 if elapsed
@@ -476,6 +508,13 @@ class AsyncRolloutGroup:
             policy_version_lag_p50=self._percentile(self._policy_lags, 50),
             policy_version_lag_p95=self._percentile(self._policy_lags, 95),
         )
+
+    def reset_reward_metrics(self) -> None:
+        """Start a fresh train-reward eligibility window."""
+
+        self._require_not_stopped()
+        self._episode_returns.clear()
+        self._episodes_since_metric_reset = 0
 
     def get_checkpoint_state(self) -> dict[str, Any]:
         """Capture drained rollout state for collision-free actor recreation."""
@@ -739,6 +778,8 @@ class AsyncRolloutGroup:
         self._agent_steps += result.episode.agent_steps
         self._episode_times_ms.append(result.metrics.episode_time_s * 1_000.0)
         self._policy_lags.append(lag)
+        self._episode_returns.append(result.metrics.episode_return)
+        self._episodes_since_metric_reset += 1
         self._idle_runners.append(runner_id)
         try:
             commit_ref = self._replay_actor.commit_episode.remote(result.episode)
