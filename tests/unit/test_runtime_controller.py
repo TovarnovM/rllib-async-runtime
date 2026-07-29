@@ -74,6 +74,8 @@ def make_scheduler_runtime(
         learner_updates_per_tick=learner_updates_per_tick,
     )
     runtime._target_training_intensity = training_intensity
+    runtime._budget_sampled_origin = 0
+    runtime._budget_updates_origin = 0
     runtime._learner_updates_completed = 0
     runtime._pending_learner_tick = None
     learner = SchedulerLearnerActor()
@@ -186,6 +188,38 @@ def test_learning_start_does_not_create_a_warmup_update_backlog() -> None:
     )
     low_intensity._schedule_learner_tick()
     assert low_learner.tick.calls[-1]["max_updates"] == 1
+
+
+def test_pbt_budget_origin_skips_warmup_without_historical_catchup() -> None:
+    runtime, learner, rollout = make_scheduler_runtime(
+        sampled_steps=0,
+        batch_size=8,
+        training_intensity=8,
+        learning_starts=8,
+    )
+    runtime._budget_sampled_origin = 8
+    runtime._budget_updates_origin = runtime._learner_update_budget_for_sampled(8)
+
+    runtime._schedule_learner_tick()
+    assert learner.tick.calls == []
+
+    rollout.env_steps = 1
+    rollout.agent_steps = 1
+    runtime._schedule_learner_tick()
+    assert learner.tick.calls[-1] == {
+        "sampled_env_steps": 1,
+        "sampled_agent_steps": 1,
+        "max_updates": 1,
+    }
+    runtime._pending_learner_tick = None
+    runtime._accept_learner_tick(completed_tick(1))
+    runtime._schedule_learner_tick()
+    assert len(learner.tick.calls) == 1
+
+    rollout.env_steps = 2
+    rollout.agent_steps = 2
+    runtime._schedule_learner_tick()
+    assert len(learner.tick.calls) == 2
 
 
 @pytest.mark.parametrize("timeout_stage", ["learner_tick", "learner_pause"])

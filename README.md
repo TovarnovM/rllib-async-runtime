@@ -321,7 +321,7 @@ The corresponding target-hardware example and validation passed on
 2026-07-28. The commands and closure evidence are recorded in
 [`debt.md`](debt.md).
 
-## PBT stage 1 single-trial population
+## PBT stage 2 single-trial population
 
 `PopulationTrainable` owns one shared replay actor and every
 `SingleMemberAsyncSAC` runtime inside one Tune trial. Tune reserves the driver,
@@ -343,6 +343,16 @@ one copy of shared replay metrics. Ray Tune's standard TensorBoardX logger is
 the only event writer. In the event file, Ray adds its standard `ray/tune/`
 prefix to these result paths.
 
+An optional `SimplePBTConfig` enables report-cadence exploit/explore. Once at
+least `min_episodes_after_restart` fresh episodes are available, the best
+eligible slot donates its actor, critic, target-critic, and SAC temperature
+state to a new generation of the worst eligible slot. Exactly one configured
+learning rate is mutated. The target receives a new runtime ID, fresh
+optimizers, a fresh local replay view rebuilt from the unchanged shared replay,
+and target-owned published weights before its rollout workers start. Its
+learner budget starts from the existing learning threshold without repeating
+warm-up or consuming historical catch-up updates.
+
 Run a short CPU example inside the devcontainer:
 
 ```bash
@@ -350,6 +360,7 @@ uv run --locked --extra cu118 --group dev \
   python examples/population_single_trial.py \
   --population-size 2 \
   --reports 10 \
+  --pbt-interval-reports 5 \
   --num-gpus-per-member 0
 ```
 
@@ -360,8 +371,8 @@ uv run --locked --extra cu118 --group dev \
   tensorboard --logdir <ray-results>/async-sac-single-trial-population
 ```
 
-This stage does not yet implement exploit/explore, target replacement, or a
-live single-trial population checkpoint. Those belong to the next PBT stages.
+This stage does not yet implement a live single-trial population checkpoint,
+exact resume, or warm start. Those belong to PBT stage 3.
 Until the stop-the-world population checkpoint is implemented, every
 `PopulationTrainable` run must set
 `CheckpointConfig(checkpoint_at_end=False)` explicitly; otherwise Tune asks the

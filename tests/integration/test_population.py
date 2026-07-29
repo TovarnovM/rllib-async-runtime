@@ -18,10 +18,12 @@ from tensorboardX.proto.event_pb2 import Event
 from rllib_async.examples import SyntheticThroughputEnv
 from rllib_async.runtime import (
     AsyncSACRuntimeConfig,
+    FloatMutation,
     PopulationAsyncSAC,
     PopulationLauncher,
     PopulationMemberSpec,
     PopulationTrainable,
+    SimplePBTConfig,
     SingleMemberAsyncSAC,
     read_population_checkpoint_bundle,
 )
@@ -110,6 +112,22 @@ def make_single_trial_population_specs() -> tuple[PopulationMemberSpec, ...]:
             ),
         )
         for index, member in enumerate(make_population_specs())
+    )
+
+
+def make_test_pbt_config() -> SimplePBTConfig:
+    return SimplePBTConfig(
+        perturbation_interval_reports=10_000,
+        reward_window_episodes=8,
+        min_episodes_after_restart=1,
+        seed=20260729,
+        mutations={
+            "actor_lr": FloatMutation(
+                low=1e-5,
+                high=1e-3,
+                factors=(0.8,),
+            )
+        },
     )
 
 
@@ -297,6 +315,140 @@ def test_single_trial_population_runs_all_members_on_one_replay(
             if time.monotonic() >= deadline:
                 pytest.fail(f"{method_name} actor remained alive after stop")
             time.sleep(0.05)
+
+
+@pytest.mark.integration
+def test_pbt_restarts_only_target_and_resumes_learning_on_shared_replay(
+    ray_runtime: None,
+) -> None:
+    population = PopulationAsyncSAC(
+        make_single_trial_population_specs(),
+        run_id="run-pbt-integration",
+        report_interval_s=0.1,
+        pbt_config=make_test_pbt_config(),
+    )
+    try:
+        population.start()
+        report = None
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            report = population.run_for_report_interval(0.1)
+            if all(
+                member["learner"]["learner_updates"] >= 1
+                and member["train"]["episodes_since_metric_reset"] >= 1
+                for member in report["members"].values()
+            ):
+                break
+        assert report is not None
+        assert all(
+            member["learner"]["learner_updates"] >= 1
+            and member["train"]["episodes_since_metric_reset"] >= 1
+            for member in report["members"].values()
+        )
+
+        members_before = population.members
+        donor_before = members_before["member-01"]
+        target_before = members_before["member-00"]
+        donor_learner_id = donor_before._learner_actor._actor_id
+        target_learner_id = target_before._learner_actor._actor_id
+        donor_updates_before = report["members"]["member-01"]["learner"][
+            "learner_updates"
+        ]
+        replay_id = population.replay_actor._actor_id
+        replay_before = ray.get(population.replay_actor.get_stats.remote())
+        runtime_ids_before = population.runtime_member_ids
+        donor_hparams = dict(population._current_hparams["member-01"])
+
+        population._reports_since_perturbation = 10_000
+        event = population._maybe_run_pbt_step(
+            {
+                "member-00": {
+                    "train": {
+                        "episode_reward_mean": 1.0,
+                        "episodes_since_metric_reset": 1,
+                    }
+                },
+                "member-01": {
+                    "train": {
+                        "episode_reward_mean": 3.0,
+                        "episodes_since_metric_reset": 1,
+                    }
+                },
+            }
+        )
+
+        assert event["event_happened"] == 1
+        assert event["donor_slot"] == "member-01"
+        assert event["target_slot"] == "member-00"
+        assert event["mutated_parameter"] == "actor_lr"
+        assert population._generations == {"member-00": 1, "member-01": 0}
+        assert donor_before is population.members["member-01"]
+        assert donor_before._learner_actor._actor_id == donor_learner_id
+        target_after = population.members["member-00"]
+        assert target_after is not target_before
+        assert target_after._learner_actor._actor_id != target_learner_id
+        assert target_before.state.value == "stopped"
+        assert target_after._replay_actor._actor_id == replay_id
+        assert (
+            population.runtime_member_ids["member-01"]
+            == (runtime_ids_before["member-01"])
+        )
+        assert (
+            population.runtime_member_ids["member-00"]
+            != (runtime_ids_before["member-00"])
+        )
+        assert population._current_hparams["member-00"] == {
+            **donor_hparams,
+            "actor_lr": pytest.approx(donor_hparams["actor_lr"] * 0.8),
+        }
+        imported_weights = ray.get(
+            target_after._learner_actor.get_published_weights.remote()
+        )
+        assert imported_weights.member_id == population.runtime_member_ids["member-00"]
+        assert imported_weights.learner_updates == 0
+        assert set(imported_weights.module_versions.values()) == {1}
+
+        fresh_target_report = target_after.get_report()
+        assert fresh_target_report["train"]["episodes_since_metric_reset"] == 0
+        assert fresh_target_report["learner"]["learner_updates"] == 0
+        assert (
+            fresh_target_report["controller"]["budget_sampled_origin"]
+            == target_after._sac_config.num_steps_sampled_before_learning_starts
+        )
+        assert "member-00" not in population._eligible_member_scores(
+            {
+                "member-00": fresh_target_report,
+                "member-01": {
+                    "train": {
+                        "episode_reward_mean": 3.0,
+                        "episodes_since_metric_reset": 1,
+                    }
+                },
+            }
+        )
+
+        resumed_report = None
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            resumed_report = population.run_for_report_interval(0.1)
+            target_metrics = resumed_report["members"]["member-00"]
+            if (
+                target_metrics["rollout"]["env_steps"] >= 1
+                and target_metrics["learner"]["learner_updates"] >= 1
+            ):
+                break
+        assert resumed_report is not None
+        target_metrics = resumed_report["members"]["member-00"]
+        assert target_metrics["rollout"]["env_steps"] >= 1
+        assert target_metrics["learner"]["learner_updates"] >= 1
+        assert (
+            resumed_report["members"]["member-01"]["learner"]["learner_updates"]
+            > donor_updates_before
+        )
+        replay_after = ray.get(population.replay_actor.get_stats.remote())
+        assert replay_after.cursor.mutation_seq > replay_before.cursor.mutation_seq
+    finally:
+        population.stop(graceful=False)
 
 
 @pytest.mark.integration

@@ -35,11 +35,13 @@ from rllib_async.runtime.learner_host import (
     LearnerHostTick,
 )
 from rllib_async.runtime.population import (
+    FloatMutation,
     PopulationAsyncSAC,
     PopulationError,
     PopulationLauncher,
     PopulationMemberSpec,
     PopulationTrainable,
+    SimplePBTConfig,
     make_runtime_member_id,
 )
 
@@ -50,6 +52,7 @@ __all__ = [
     "EvaluationGroupError",
     "EvaluationGroupStats",
     "EvaluationResult",
+    "FloatMutation",
     "InvalidPopulationCheckpointError",
     "InvalidRuntimeCheckpointError",
     "LearnerHost",
@@ -72,6 +75,7 @@ __all__ = [
     "RuntimeCheckpointState",
     "RuntimeState",
     "SharedReplayDescriptor",
+    "SimplePBTConfig",
     "SingleMemberAsyncSAC",
     "make_runtime_member_id",
     "read_population_checkpoint_bundle",
