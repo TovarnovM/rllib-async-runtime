@@ -174,6 +174,37 @@ def test_pbt_mutation_is_reproducible_bounded_and_changes_one_hparam() -> None:
     assert bounds.low <= new_value <= bounds.high
 
 
+@pytest.mark.parametrize(
+    ("bound", "factor"),
+    ((1e-5, 0.8), (1e-3, 1.2)),
+)
+def test_pbt_one_sided_mutation_reflects_at_saturated_bound(
+    bound: float,
+    factor: float,
+) -> None:
+    config = make_pbt_config(
+        mutations={
+            name: FloatMutation(1e-5, 1e-3, factors=(factor,))
+            for name in ("actor_lr", "critic_lr", "alpha_lr")
+        }
+    )
+    hparams = {name: bound for name in config.mutations}
+
+    mutated, parameter, _, applied_factor, old_value, new_value = (
+        PopulationAsyncSAC._mutate_hparams(
+            hparams,
+            config=config,
+            exploit_count=0,
+        )
+    )
+
+    assert old_value == bound
+    assert new_value != old_value
+    assert 1e-5 <= new_value <= 1e-3
+    assert new_value == pytest.approx(old_value * applied_factor)
+    assert {name for name in hparams if hparams[name] != mutated[name]} == {parameter}
+
+
 def test_pbt_selection_has_deterministic_tie_breaking() -> None:
     scores = {
         "member-02": 3.0,

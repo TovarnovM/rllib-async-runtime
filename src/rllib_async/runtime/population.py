@@ -1122,17 +1122,29 @@ class PopulationAsyncSAC:
                 raise ValueError(f"mutable hparam {name!r} must be positive")
             old_value = float(value)
             mutation = config.mutations[name]
-            changed = tuple(
-                (factor, min(max(old_value * factor, mutation.low), mutation.high))
-                for factor in mutation.factors
-                if min(
+            changed: list[tuple[float, float]] = []
+            for factor in mutation.factors:
+                new_value = min(
                     max(old_value * factor, mutation.low),
                     mutation.high,
                 )
-                != old_value
-            )
+                if new_value == old_value and factor != 1.0:
+                    # A one-sided mutation eventually reaches its bound. Reflect
+                    # its direction there so a healthy long-running population
+                    # cannot fail merely because every donor is saturated.
+                    new_value = min(
+                        max(old_value / factor, mutation.low),
+                        mutation.high,
+                    )
+                if new_value == old_value and factor != 1.0:
+                    # Extremely small floating-point steps may round back to the
+                    # same value. The opposite bound is a deterministic last
+                    # resort that preserves the mutation's bounded contract.
+                    new_value = mutation.high if factor < 1.0 else mutation.low
+                if new_value != old_value:
+                    changed.append((new_value / old_value, new_value))
             if changed:
-                candidates[name] = changed
+                candidates[name] = tuple(changed)
         if not candidates:
             raise PopulationError("no configured PBT mutation can change donor hparams")
 
