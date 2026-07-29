@@ -35,9 +35,12 @@ from rllib_async.runtime.learner_host import (
     LearnerHostTick,
 )
 from rllib_async.runtime.population import (
+    PopulationAsyncSAC,
     PopulationError,
     PopulationLauncher,
     PopulationMemberSpec,
+    PopulationTrainable,
+    make_runtime_member_id,
 )
 
 __all__ = [
@@ -56,18 +59,21 @@ __all__ = [
     "LearnerHostState",
     "LearnerHostStats",
     "LearnerHostTick",
+    "PopulationAsyncSAC",
     "PopulationCheckpoint",
     "PopulationCheckpointState",
     "PopulationError",
     "PopulationLauncher",
     "PopulationMemberRecord",
     "PopulationMemberSpec",
+    "PopulationTrainable",
     "RuntimeCheckpoint",
     "RuntimeCheckpointError",
     "RuntimeCheckpointState",
     "RuntimeState",
     "SharedReplayDescriptor",
     "SingleMemberAsyncSAC",
+    "make_runtime_member_id",
     "read_population_checkpoint_bundle",
     "read_runtime_checkpoint",
     "read_runtime_member_checkpoint",
