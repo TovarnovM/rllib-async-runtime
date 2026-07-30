@@ -275,7 +275,7 @@ def test_exact_resume_rejects_hparam_outside_checkpoint_bounds(
     ("changed_config", "message"),
     [
         (lambda config: config.debugging(seed=999), "SAC seed"),
-        (lambda config: config.environment("Pendulum-v1"), "SAC env"),
+        (lambda config: config.environment("CartPole-v1"), "SAC env"),
         (
             lambda config: config.environment(env_config={"gravity": 3.0}),
             "SAC env_config",
@@ -292,12 +292,12 @@ def test_exact_resume_rejects_changed_rollout_configuration(
         tmp_path,
         monkeypatch,
     )
-    changed_specs = (
+    changed_specs = tuple(
         PopulationMemberSpec(
-            changed_config(specs[0].sac_config.copy(copy_frozen=False)),
-            specs[0].runtime_config,
-        ),
-        specs[1],
+            changed_config(spec.sac_config.copy(copy_frozen=False)),
+            spec.runtime_config,
+        )
+        for spec in specs
     )
 
     with pytest.raises(ValueError, match=message):
