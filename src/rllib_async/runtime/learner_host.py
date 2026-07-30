@@ -17,7 +17,7 @@ import numpy as np
 import ray
 from ray.rllib.algorithms.sac import SACConfig
 
-from rllib_async.learner import SACLearnerAdapter
+from rllib_async.learner import PBTModelState, SACLearnerAdapter
 from rllib_async.protocols import (
     FlatEpisodeCodec,
     ReplayCursor,
@@ -142,6 +142,8 @@ class LearnerHost:
         replay_sync_max_bytes: int,
         checkpoint_state: Mapping[str, Any] | bytes | None = None,
         allow_replay_ahead_on_restore: bool = False,
+        pbt_state: PBTModelState | None = None,
+        learning_starts_satisfied: bool = False,
     ) -> None:
         if not isinstance(config, SACConfig):
             raise TypeError("config must be an SACConfig")
@@ -159,6 +161,8 @@ class LearnerHost:
             )
         if not isinstance(allow_replay_ahead_on_restore, bool):
             raise TypeError("allow_replay_ahead_on_restore must be a bool")
+        if checkpoint_state is not None and pbt_state is not None:
+            raise ValueError("learner host accepts only one restore source")
 
         self._replay_actor = replay_actor
         self._codec = codec
@@ -181,7 +185,10 @@ class LearnerHost:
                 spaces=spaces,
                 member_id=member_id,
                 publication_interval_updates=publication_interval_updates,
+                learning_starts_satisfied=learning_starts_satisfied,
             )
+            if pbt_state is not None:
+                self._adapter.load_pbt_state(pbt_state)
             self._producer = BatchProducer(
                 self._fast_replay,
                 FlatBatchCollator(),
@@ -203,7 +210,7 @@ class LearnerHost:
         self._delta_transactions = 0
         self._full_resyncs = 0
         self._updates_skipped_learning_start = 0
-        self._weight_publications = 0
+        self._weight_publications = int(pbt_state is not None)
         self._last_learner_metrics: tuple[tuple[str, float], ...] = ()
         self._update_times_ms: deque[float] = deque(maxlen=1_024)
         initial_weights = self._adapter.get_published_weights()
@@ -355,6 +362,11 @@ class LearnerHost:
         self._require_not_stopped()
         assert self._adapter is not None
         return self._adapter.get_published_weights()
+
+    def export_pbt_state(self) -> PBTModelState:
+        self._require_not_stopped()
+        assert self._adapter is not None
+        return self._adapter.export_pbt_state()
 
     def get_stats(self) -> LearnerHostStats:
         self._require_not_stopped()
@@ -745,6 +757,9 @@ class LearnerHostActor:
 
     def get_published_weights(self) -> WeightsDescriptor:
         return self._host.get_published_weights()
+
+    def export_pbt_state(self) -> PBTModelState:
+        return self._host.export_pbt_state()
 
     def get_stats(self) -> LearnerHostStats:
         return replace(

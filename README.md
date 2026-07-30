@@ -4,17 +4,20 @@ Experimental Ray-native asynchronous off-policy runtime built on RLlib.
 
 > Experimental project built on Ray/RLlib; not an official Ray project.
 
-The planned `v0.1` phases through Phase 11 are implemented. Phase 8 adds two
-concurrent fixed-config Tune members sharing one authoritative replay; its
-dedicated two-GPU acceptance passed on the target workstation. Phase 9 adds a
-sparse hierarchy example with one discrete manager, two continuous workers,
-module-specific replay views, and a heterogeneous stock RLlib SAC learner.
-Phase 10 adds homogeneous logical agents using one shared ego-GNN SAC module,
-variable-size graph replay, and packed graph batches; its CUDA learner check
-also passed. Phase 11 adds deterministic component and end-to-end performance
-harnesses, a true no-prefetch comparison mode, boundedness gates, and measured
-batch/learner timing. Its reviewed target-GPU evidence closes the performance
-gate without making a portable speedup claim. The project also contains
+The planned `v0.1` phases through Phase 11 are implemented. The first PBT
+foundation stage adds an arbitrary fixed population inside one Tune trial,
+with all SAC members active on one authoritative replay and one TensorBoard
+run. It deliberately does not perform exploit/explore yet. Phase 8's legacy
+two-trial launcher remains available, and its dedicated two-GPU acceptance
+passed on the target workstation. Phase 9 adds a sparse hierarchy example with
+one discrete manager, two continuous workers, module-specific replay views,
+and a heterogeneous stock RLlib SAC learner. Phase 10 adds homogeneous logical
+agents using one shared ego-GNN SAC module, variable-size graph replay, and
+packed graph batches; its CUDA learner check also passed. Phase 11 adds
+deterministic component and end-to-end performance harnesses, a true
+no-prefetch comparison mode, boundedness gates, and measured batch/learner
+timing. Its reviewed target-GPU evidence closes the performance gate without
+making a portable speedup claim. The project also contains
 deterministic replay oracles, a serialized Ray `ReplayActor`, atomic
 trusted-local replay checkpoints, reader-safe background `FastReplay` index
 publication, a bounded local batch pipeline, version-aware asynchronous
@@ -317,6 +320,97 @@ cross-trial coordination protocol and are not claimed by Phase 8.
 The corresponding target-hardware example and validation passed on
 2026-07-28. The commands and closure evidence are recorded in
 [`debt.md`](debt.md).
+
+## PBT stage 3 single-trial population
+
+`PopulationTrainable` owns one shared replay actor and every
+`SingleMemberAsyncSAC` runtime inside one Tune trial. Tune reserves the driver,
+shared replay, and every learner/rollout/evaluation bundle before setup, so a
+successful trial never contains a partially scheduled population.
+
+Each slot keeps a stable name such as `member-00`, while its actor-facing
+identity is generation-specific:
+
+```text
+<run_id>-<slot_id>-g0000
+```
+
+The train reward is a rolling mean/minimum/maximum over completed rollout
+episodes. It is reported separately from deterministic evaluation under
+`members/<slot>/train/*`. The same Tune result also contains per-member
+learner/rollout metrics, current SAC learning rates, population summaries, and
+one copy of shared replay metrics. Ray Tune's standard TensorBoardX logger is
+the only event writer. In the event file, Ray adds its standard `ray/tune/`
+prefix to these result paths.
+
+An optional `SimplePBTConfig` enables report-cadence exploit/explore. Once at
+least `min_episodes_after_restart` fresh episodes are available, the best
+eligible slot donates its actor, critic, target-critic, and SAC temperature
+state to a new generation of the worst eligible slot. Exactly one configured
+learning rate is mutated. The target receives a new runtime ID, fresh
+optimizers, a fresh local replay view rebuilt from the unchanged shared replay,
+and target-owned published weights before its rollout workers start. Its
+learner budget starts from the existing learning threshold without repeating
+warm-up or consuming historical catch-up updates.
+
+Run a short CPU example inside the devcontainer:
+
+```bash
+uv run --locked --extra cu118 --group dev \
+  python examples/population_single_trial.py \
+  --population-size 2 \
+  --reports 10 \
+  --pbt-interval-reports 5 \
+  --num-gpus-per-member 0
+```
+
+`PopulationTrainable` now publishes one stop-the-world Tune checkpoint. It
+pauses every member before draining them, stores each full member state
+(including optimizer and RNG state), stores the authoritative replay exactly
+once, and publishes `pbt_state.json` with slot generations, current learning
+rates, runtime IDs, and PBT counters. Members resume in `finally`, including
+when snapshot publication fails.
+
+The example exposes three explicit modes:
+
+```bash
+# New population.
+uv run --locked --extra cu118 --group dev \
+  python examples/population_single_trial.py --mode new
+
+# Exact runtime continuation. The member specs and PBT/replay configuration
+# must match the checkpoint.
+uv run --locked --extra cu118 --group dev \
+  python examples/population_single_trial.py \
+  --mode resume \
+  --checkpoint-path <checkpoint-directory>
+
+# New run with the checkpoint's replay/models but fresh optimizers, RNG,
+# generation counters, runtime IDs, and reward windows.
+uv run --locked --extra cu118 --group dev \
+  python examples/population_single_trial.py \
+  --mode warm_start \
+  --checkpoint-path <checkpoint-directory>
+```
+
+`warm_start` requires the same population slots, population size, model/spaces,
+runtime topology, and replay retention configuration. Its new initial learning
+rates must lie inside the new mutation bounds; out-of-range values fail
+explicitly rather than being clamped. Exact Tune retry/experiment continuation
+also uses `PopulationTrainable.load_checkpoint()` automatically. Use Tune's
+standard `Tuner.restore(...)` lifecycle when the existing Tune experiment
+directory and TensorBoard run must be continued rather than starting a new
+driver invocation from a checkpoint directory.
+
+Inspect its single trial:
+
+```bash
+uv run --locked --extra cu118 --group dev \
+  tensorboard --logdir <ray-results>/async-sac-single-trial-population-<mode>
+```
+
+`PopulationLauncher` and `examples/population_two_members.py` remain the
+Phase 8 compatibility path.
 
 ## Phase 9 sparse hierarchy example
 

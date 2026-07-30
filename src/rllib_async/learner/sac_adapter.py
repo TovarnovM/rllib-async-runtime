@@ -34,6 +34,7 @@ from rllib_async.gnn.graph_batch import validate_packed_graph_batch
 from rllib_async.protocols.weights import WeightsDescriptor
 
 SAC_ADAPTER_STATE_VERSION = 1
+PBT_MODEL_STATE_VERSION = 1
 SAC_TEMPERATURE_STATE = "_rllib_async_sac_temperature"
 SAC_TARGET_UPDATE_STATE = "_rllib_async_target_update_ts"
 _LEARNER_GROUP_STATE = "learner_group"
@@ -79,6 +80,38 @@ class SACLearnerAdapterError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class PBTModelState:
+    """Model and temperature state transferred between PBT generations."""
+
+    state_version: int
+    spaces_fingerprint: str
+    model_fingerprint: str
+    module_state: Mapping[str, Any]
+    temperature_state: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.state_version, int)
+            or isinstance(self.state_version, bool)
+            or self.state_version != PBT_MODEL_STATE_VERSION
+        ):
+            raise ValueError("unsupported PBT model state version")
+        for name, value in (
+            ("spaces_fingerprint", self.spaces_fingerprint),
+            ("model_fingerprint", self.model_fingerprint),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a non-empty string")
+        for name, value in (
+            ("module_state", self.module_state),
+            ("temperature_state", self.temperature_state),
+        ):
+            if not isinstance(value, Mapping) or not value:
+                raise ValueError(f"{name} must be a non-empty mapping")
+            object.__setattr__(self, name, copy.deepcopy(dict(value)))
+
+
+@dataclass(frozen=True, slots=True)
 class SACUpdateResult:
     """Outcome of one adapter update request."""
 
@@ -110,15 +143,18 @@ class CheckpointableSACTorchLearner(SACTorchLearner):
             **kwargs,
         )
         if components is None:
-            state[SAC_TEMPERATURE_STATE] = {
-                module_id: value.detach().cpu().numpy().copy()
-                for module_id, value in self.curr_log_alpha.items()
-            }
+            state[SAC_TEMPERATURE_STATE] = self.get_temperature_state()
             state[SAC_TARGET_UPDATE_STATE] = {
                 module_id: self.last_update_ts_by_mid[module_id]
                 for module_id in tuple(self.module.keys())
             }
         return state
+
+    def get_temperature_state(self) -> dict[str, np.ndarray]:
+        return {
+            module_id: value.detach().cpu().numpy().copy()
+            for module_id, value in self.curr_log_alpha.items()
+        }
 
     def set_state(self, state: dict[str, Any]) -> None:
         temperatures = self._validate_temperatures(state.get(SAC_TEMPERATURE_STATE))
@@ -358,6 +394,7 @@ class SACLearnerAdapter:
         spaces: Mapping[str, tuple[gym.Space, gym.Space]],
         member_id: str,
         publication_interval_updates: int,
+        learning_starts_satisfied: bool = False,
     ) -> None:
         if not isinstance(config, SACConfig):
             raise TypeError("config must be an SACConfig")
@@ -379,6 +416,8 @@ class SACLearnerAdapter:
             raise ValueError("SACLearnerAdapter requires ConnectorV2")
         if config.num_learners != 0:
             raise ValueError("SACLearnerAdapter requires one local RLlib learner")
+        if not isinstance(learning_starts_satisfied, bool):
+            raise TypeError("learning_starts_satisfied must be a bool")
         resolved_learner_class = config.learner_class
         if resolved_learner_class not in {
             None,
@@ -394,6 +433,7 @@ class SACLearnerAdapter:
         self._member_id = member_id
         self._publication_interval_updates = publication_interval_updates
         self._learning_starts = adapter_config.num_steps_sampled_before_learning_starts
+        self._learning_starts_satisfied = learning_starts_satisfied
         self._config_contract = {
             name: copy.deepcopy(getattr(adapter_config, name))
             for name in _CONFIG_CONTRACT_FIELDS
@@ -534,7 +574,9 @@ class SACLearnerAdapter:
             if self._config.count_steps_by == "agent_steps"
             else sampled_env_steps
         )
-        return sampled_agent_steps, threshold_steps >= self._learning_starts
+        if threshold_steps >= self._learning_starts:
+            self._learning_starts_satisfied = True
+        return sampled_agent_steps, self._learning_starts_satisfied
 
     def _perform_update(
         self,
@@ -611,6 +653,87 @@ class SACLearnerAdapter:
         self._require_open()
         return copy.deepcopy(self._latest_weights)
 
+    def export_pbt_state(self) -> PBTModelState:
+        """Export model state without optimizer, RNG, counters, or member identity."""
+
+        self._require_open()
+        learner_group_state = self._learner_group.get_state(
+            components=f"{COMPONENT_LEARNER}/{COMPONENT_RL_MODULE}",
+        )
+        learner_state = learner_group_state.get(COMPONENT_LEARNER)
+        if not isinstance(learner_state, Mapping):
+            raise SACLearnerAdapterError("learner state is missing")
+        module_state = learner_state.get(COMPONENT_RL_MODULE)
+        learner = getattr(self._learner_group, "_learner", None)
+        if not isinstance(learner, CheckpointableSACTorchLearner):
+            raise SACLearnerAdapterError("checkpointable SAC learner is missing")
+        temperature_state = learner.get_temperature_state()
+        if not isinstance(module_state, Mapping):
+            raise SACLearnerAdapterError("learner PBT state is incomplete")
+        return PBTModelState(
+            state_version=PBT_MODEL_STATE_VERSION,
+            spaces_fingerprint=self._spaces_fingerprint,
+            model_fingerprint=self._fingerprint_model_state(module_state),
+            module_state=module_state,
+            temperature_state=temperature_state,
+        )
+
+    def load_pbt_state(self, state: PBTModelState) -> WeightsDescriptor:
+        """Import model state into a fresh learner and publish target-owned weights."""
+
+        self._require_open()
+        if not isinstance(state, PBTModelState):
+            raise TypeError("state must be PBTModelState")
+        if state.spaces_fingerprint != self._spaces_fingerprint:
+            raise ValueError("PBT observation/action spaces do not match")
+        if any(
+            value != 0
+            for value in (
+                self._learner_updates,
+                self._sampled_env_steps,
+                self._sampled_agent_steps,
+                self._last_published_update,
+            )
+        ):
+            raise SACLearnerAdapterError("PBT state requires a fresh learner")
+        if state.model_fingerprint != self._fingerprint_model_state(state.module_state):
+            raise ValueError("PBT model state fingerprint is invalid")
+
+        learner_group_state = self._learner_group.get_state(
+            components=f"{COMPONENT_LEARNER}/{COMPONENT_RL_MODULE}",
+        )
+        learner_state = learner_group_state.get(COMPONENT_LEARNER)
+        if not isinstance(learner_state, Mapping):
+            raise SACLearnerAdapterError("fresh learner state is missing")
+        current_module_state = learner_state.get(COMPONENT_RL_MODULE)
+        if not isinstance(current_module_state, Mapping):
+            raise SACLearnerAdapterError("fresh learner model state is missing")
+        if state.model_fingerprint != self._fingerprint_model_state(
+            current_module_state
+        ):
+            raise ValueError("PBT model structure does not match")
+
+        imported_state = {
+            COMPONENT_LEARNER: {
+                COMPONENT_RL_MODULE: copy.deepcopy(state.module_state),
+                SAC_TEMPERATURE_STATE: copy.deepcopy(state.temperature_state),
+            }
+        }
+        self._learner_group.set_state(imported_state)
+
+        module_versions = {
+            module_id: version + 1
+            for module_id, version in self._module_versions.items()
+        }
+        descriptor = self._new_descriptor(
+            self._get_inference_module_state(),
+            module_versions=module_versions,
+            learner_updates=0,
+        )
+        self._module_versions = module_versions
+        self._latest_weights = descriptor
+        return copy.deepcopy(descriptor)
+
     def get_state(self) -> dict[str, Any]:
         """Return a complete in-memory member checkpoint."""
 
@@ -630,6 +753,7 @@ class SACLearnerAdapter:
             "member_id": self._member_id,
             "publication_interval_updates": self._publication_interval_updates,
             "learning_starts": self._learning_starts,
+            "learning_starts_satisfied": self._learning_starts_satisfied,
             "config_contract": copy.deepcopy(self._config_contract),
             "spaces_fingerprint": self._spaces_fingerprint,
             "learner_updates": self._learner_updates,
@@ -660,6 +784,20 @@ class SACLearnerAdapter:
             raise ValueError("checkpoint publication interval does not match")
         if state.get("learning_starts") != self._learning_starts:
             raise ValueError("checkpoint learning-start threshold does not match")
+        learning_starts_satisfied = state.get("learning_starts_satisfied")
+        if learning_starts_satisfied is None:
+            sampled_steps = (
+                state.get("sampled_agent_steps")
+                if self._config.count_steps_by == "agent_steps"
+                else state.get("sampled_env_steps")
+            )
+            learning_starts_satisfied = (
+                isinstance(sampled_steps, int)
+                and not isinstance(sampled_steps, bool)
+                and sampled_steps >= self._learning_starts
+            )
+        if not isinstance(learning_starts_satisfied, bool):
+            raise ValueError("learning_starts_satisfied must be a bool")
         if state.get("config_contract") != self._config_contract:
             raise ValueError("checkpoint SAC configuration does not match")
         if state.get("spaces_fingerprint") != self._spaces_fingerprint:
@@ -747,6 +885,7 @@ class SACLearnerAdapter:
         self._learner_updates = learner_updates
         self._sampled_env_steps = sampled_env_steps
         self._sampled_agent_steps = sampled_agent_steps
+        self._learning_starts_satisfied = learning_starts_satisfied
         self._last_published_update = last_published_update
         self._module_versions = module_versions
         self._latest_weights = latest_weights_copy
@@ -814,6 +953,43 @@ class SACLearnerAdapter:
             ) from error
         payload = pickle.dumps(signature, protocol=pickle.HIGHEST_PROTOCOL)
         return hashlib.sha256(payload).hexdigest()
+
+    @classmethod
+    def _fingerprint_model_state(cls, state: Mapping[str, Any]) -> str:
+        if not isinstance(state, Mapping) or not state:
+            raise ValueError("model state must be a non-empty mapping")
+        payload = pickle.dumps(
+            cls._model_state_signature(state),
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+        return hashlib.sha256(payload).hexdigest()
+
+    @classmethod
+    def _model_state_signature(cls, value: object) -> object:
+        if torch.is_tensor(value):
+            return ("torch", tuple(value.shape), str(value.dtype))
+        if isinstance(value, np.ndarray):
+            return ("numpy", tuple(value.shape), value.dtype.str)
+        if isinstance(value, Mapping):
+            if any(not isinstance(key, str) for key in value):
+                raise ValueError("model state keys must be strings")
+            return (
+                "mapping",
+                tuple(
+                    (key, cls._model_state_signature(value[key]))
+                    for key in sorted(value)
+                ),
+            )
+        if isinstance(value, list | tuple):
+            return (
+                type(value).__name__,
+                tuple(cls._model_state_signature(item) for item in value),
+            )
+        if isinstance(value, np.generic):
+            return ("numpy_scalar", value.dtype.str)
+        if value is None or isinstance(value, bool | int | float | str):
+            return (type(value).__name__, value)
+        raise ValueError(f"unsupported model state value {type(value).__name__!r}")
 
     @staticmethod
     def _space_signature(space: gym.Space) -> object:

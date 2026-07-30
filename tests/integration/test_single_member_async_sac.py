@@ -109,6 +109,16 @@ def test_end_to_end_runtime_reports_all_layers_and_stops_actors(
                 break
         assert report is not None
         assert report["rollout"]["episodes_committed"] >= 1
+        assert report["train"]["episodes_in_window"] >= 1
+        assert report["train"]["episodes_since_metric_reset"] >= 1
+        assert (
+            report["train"]["episode_reward_min"]
+            <= (report["train"]["episode_reward_mean"])
+        )
+        assert (
+            report["train"]["episode_reward_mean"]
+            <= (report["train"]["episode_reward_max"])
+        )
         assert report["authoritative_replay"]["total_transitions"] >= 1
         assert report["fast_replay"]["total_transitions"] >= 1
         assert report["batching"]["queue_high_watermark"] <= 2

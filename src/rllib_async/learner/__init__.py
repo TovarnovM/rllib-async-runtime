@@ -1,10 +1,12 @@
 """RLlib learner adapters owned by the asynchronous runtime."""
 
 from rllib_async.learner.sac_adapter import (
+    PBT_MODEL_STATE_VERSION,
     SAC_ADAPTER_STATE_VERSION,
     SAC_TARGET_UPDATE_STATE,
     SAC_TEMPERATURE_STATE,
     CheckpointableSACTorchLearner,
+    PBTModelState,
     SACBatchError,
     SACLearnerAdapter,
     SACLearnerAdapterError,
@@ -14,10 +16,12 @@ from rllib_async.learner.sac_adapter import (
 )
 
 __all__ = [
+    "PBT_MODEL_STATE_VERSION",
     "SAC_ADAPTER_STATE_VERSION",
     "SAC_TARGET_UPDATE_STATE",
     "SAC_TEMPERATURE_STATE",
     "CheckpointableSACTorchLearner",
+    "PBTModelState",
     "SACBatchError",
     "SACLearnerAdapter",
     "SACLearnerAdapterError",

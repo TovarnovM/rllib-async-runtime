@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import pickle
 from collections.abc import Mapping
+from dataclasses import fields
 
 import numpy as np
 import pytest
@@ -31,6 +32,7 @@ from rllib_async.examples import (
 from rllib_async.learner import (
     SAC_TARGET_UPDATE_STATE,
     SAC_TEMPERATURE_STATE,
+    PBTModelState,
     SACBatchError,
     SACLearnerAdapter,
     build_rllib_multi_module_sac_batch,
@@ -39,6 +41,7 @@ from rllib_async.learner import (
 from tests.helpers import (
     assert_finite_losses,
     assert_tree_close,
+    flattened_key_paths,
     make_sac_config,
 )
 
@@ -516,3 +519,108 @@ def test_learning_start_and_full_checkpoint_restore_next_update() -> None:
             restored.close()
         runner.stop()
         restored_runner.stop()
+
+
+def test_pbt_state_transfers_full_model_and_temperature_with_fresh_optimizer() -> None:
+    config = make_sac_config()
+    config.training(
+        num_steps_sampled_before_learning_starts=100,
+        target_network_update_freq=1,
+    )
+    runner = SingleAgentEnvRunner(config=config, worker_index=0)
+    donor = target = incompatible_target = None
+
+    try:
+        spaces = runner.get_spaces()
+        donor = SACLearnerAdapter(
+            config,
+            spaces=spaces,
+            member_id="donor-g0000",
+            publication_interval_updates=1,
+        )
+        target = SACLearnerAdapter(
+            config,
+            spaces=spaces,
+            member_id="target-g0001",
+            publication_interval_updates=1,
+            learning_starts_satisfied=True,
+        )
+        donor_update = donor.update(
+            make_fixed_batch(),
+            sampled_env_steps=100,
+        )
+        assert donor_update.performed
+
+        pbt_state = donor.export_pbt_state()
+        assert {field.name for field in fields(PBTModelState)} == {
+            "state_version",
+            "spaces_fingerprint",
+            "model_fingerprint",
+            "module_state",
+            "temperature_state",
+        }
+        assert any(
+            "target" in path.lower()
+            for path in flattened_key_paths(pbt_state.module_state)
+        )
+        target_before = learner_payload(target.get_state()["learner_group"])
+
+        published = target.load_pbt_state(pbt_state)
+        donor_payload = learner_payload(donor.get_state()["learner_group"])
+        target_payload = learner_payload(target.get_state()["learner_group"])
+
+        assert_tree_close(
+            target_payload[COMPONENT_RL_MODULE],
+            donor_payload[COMPONENT_RL_MODULE],
+        )
+        assert_tree_close(
+            target_payload[SAC_TEMPERATURE_STATE],
+            donor_payload[SAC_TEMPERATURE_STATE],
+        )
+        assert_tree_close(
+            target_payload[COMPONENT_OPTIMIZER],
+            target_before[COMPONENT_OPTIMIZER],
+        )
+        assert_tree_close(
+            target_payload[SAC_TARGET_UPDATE_STATE],
+            target_before[SAC_TARGET_UPDATE_STATE],
+        )
+        assert published.member_id == "target-g0001"
+        assert published.learner_updates == 0
+        assert set(published.module_versions.values()) == {1}
+        assert_tree_close(
+            published.state,
+            donor.get_published_weights().state,
+        )
+
+        target_update = target.update(
+            make_fixed_batch(),
+            sampled_env_steps=1,
+        )
+        assert target_update.performed
+        assert target.learner_updates == 1
+        assert donor.learner_updates == 1
+
+        incompatible_target = SACLearnerAdapter(
+            config,
+            spaces=spaces,
+            member_id="incompatible-g0001",
+            publication_interval_updates=1,
+        )
+        invalid = PBTModelState(
+            state_version=pbt_state.state_version,
+            spaces_fingerprint=pbt_state.spaces_fingerprint,
+            model_fingerprint="invalid",
+            module_state=pbt_state.module_state,
+            temperature_state=pbt_state.temperature_state,
+        )
+        with pytest.raises(ValueError, match="fingerprint"):
+            incompatible_target.load_pbt_state(invalid)
+    finally:
+        if donor is not None:
+            donor.close()
+        if target is not None:
+            target.close()
+        if incompatible_target is not None:
+            incompatible_target.close()
+        runner.stop()

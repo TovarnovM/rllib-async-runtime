@@ -6,6 +6,7 @@ import math
 import os
 import time
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import asdict
 from enum import Enum
 from pathlib import Path
@@ -17,6 +18,7 @@ from ray.rllib.env.single_agent_env_runner import SingleAgentEnvRunner
 from ray.tune import Trainable
 from ray.tune.execution.placement_groups import PlacementGroupFactory
 
+from rllib_async.learner import PBTModelState
 from rllib_async.protocols import (
     FlatEpisodeCodec,
     ReplayCursor,
@@ -67,6 +69,8 @@ class SingleMemberAsyncSAC:
         checkpoint_dir: str | os.PathLike[str] | None = None,
         replay_actor: Any | None = None,
         member_checkpoint_state: RuntimeCheckpointState | None = None,
+        pbt_state: PBTModelState | None = None,
+        reward_window_episodes: int = 100,
     ) -> None:
         if not ray.is_initialized():
             raise RuntimeError("Ray must be initialized before SingleMemberAsyncSAC")
@@ -88,9 +92,24 @@ class SingleMemberAsyncSAC:
             raise ValueError("runtime restore accepts only one checkpoint source")
         if member_checkpoint_state is not None and replay_actor is None:
             raise ValueError("population member restore requires an external replay")
+        if pbt_state is not None and (
+            checkpoint_dir is not None or member_checkpoint_state is not None
+        ):
+            raise ValueError("PBT construction cannot restore a full checkpoint")
+        if pbt_state is not None and replay_actor is None:
+            raise ValueError("PBT construction requires an external replay")
+        if pbt_state is not None and not isinstance(pbt_state, PBTModelState):
+            raise TypeError("pbt_state must be PBTModelState")
+        if (
+            not isinstance(reward_window_episodes, int)
+            or isinstance(reward_window_episodes, bool)
+            or reward_window_episodes < 1
+        ):
+            raise ValueError("reward_window_episodes must be a positive integer")
 
         self._sac_config = sac_config.copy(copy_frozen=False)
         self._config = runtime_config
+        self._reward_window_episodes = reward_window_episodes
         self._owns_replay_actor = replay_actor is None
         restore_started = time.monotonic()
         checkpoint_state: RuntimeCheckpointState | None = None
@@ -112,6 +131,14 @@ class SingleMemberAsyncSAC:
         self._target_training_intensity = self._resolve_training_intensity(
             self._sac_config.training_intensity,
             batch_size=self._config.batch_size,
+        )
+        self._budget_sampled_origin = (
+            int(self._sac_config.num_steps_sampled_before_learning_starts)
+            if pbt_state is not None
+            else 0
+        )
+        self._budget_updates_origin = self._learner_update_budget_for_sampled(
+            self._budget_sampled_origin
         )
         self._codec = FlatEpisodeCodec()
         self._state = RuntimeState.CREATED
@@ -163,28 +190,20 @@ class SingleMemberAsyncSAC:
                     raise RuntimeError(
                         "replay actor did not restore the checkpoint cursor"
                     )
-            self._learner_actor = LearnerHostActor.options(
-                num_cpus=self._config.num_cpus_per_learner,
-                num_gpus=self._config.num_gpus_per_learner,
-            ).remote(
+            self._learner_actor = self._new_learner_actor(
                 self._sac_config,
                 spaces,
                 self._replay_actor,
                 self._codec,
-                member_id=self._config.member_id,
-                publication_interval_updates=(
-                    self._config.publication_interval_updates
-                ),
-                batch_size=self._config.batch_size,
-                batch_queue_capacity=self._config.batch_queue_capacity,
-                batch_seed=self._config.seed,
-                replay_sync_max_bytes=self._config.replay_sync_max_bytes,
+                runtime_config=self._config,
                 checkpoint_state=(
                     checkpoint_state.learner if checkpoint_state is not None else None
                 ),
                 allow_replay_ahead_on_restore=(
                     checkpoint_state is not None and not self._owns_replay_actor
                 ),
+                pbt_state=pbt_state,
+                learning_starts_satisfied=pbt_state is not None,
             )
             initial_weights = ray.get(
                 self._learner_actor.get_published_weights.remote()
@@ -207,6 +226,7 @@ class SingleMemberAsyncSAC:
                     self._config.pending_commit_low_watermark
                 ),
                 num_cpus_per_runner=self._config.num_cpus_per_runner,
+                reward_window_episodes=self._reward_window_episodes,
                 checkpoint_state=(
                     checkpoint_state.rollout if checkpoint_state is not None else None
                 ),
@@ -291,6 +311,7 @@ class SingleMemberAsyncSAC:
         checkpoint_state: RuntimeCheckpointState,
         *,
         replay_actor: Any,
+        reward_window_episodes: int = 100,
     ) -> SingleMemberAsyncSAC:
         """Restore one member state transferred independently of replay."""
 
@@ -301,6 +322,114 @@ class SingleMemberAsyncSAC:
             runtime_config,
             replay_actor=replay_actor,
             member_checkpoint_state=checkpoint_state,
+            reward_window_episodes=reward_window_episodes,
+        )
+
+    @classmethod
+    def from_pbt_state(
+        cls,
+        sac_config: SACConfig,
+        runtime_config: AsyncSACRuntimeConfig,
+        pbt_state: PBTModelState,
+        *,
+        replay_actor: Any,
+        reward_window_episodes: int,
+    ) -> SingleMemberAsyncSAC:
+        """Create one fresh generation from model-only donor state."""
+
+        return cls(
+            sac_config,
+            runtime_config,
+            replay_actor=replay_actor,
+            pbt_state=pbt_state,
+            reward_window_episodes=reward_window_episodes,
+        )
+
+    @classmethod
+    def pbt_state_from_member_checkpoint_state(
+        cls,
+        sac_config: SACConfig,
+        runtime_config: AsyncSACRuntimeConfig,
+        checkpoint_state: RuntimeCheckpointState,
+        *,
+        replay_actor: Any,
+        timeout_s: float | None = None,
+    ) -> PBTModelState:
+        """Extract model-only state on the learner device from a full checkpoint."""
+
+        if not isinstance(sac_config, SACConfig):
+            raise TypeError("sac_config must be an SACConfig")
+        if not isinstance(runtime_config, AsyncSACRuntimeConfig):
+            raise TypeError("runtime_config must be an AsyncSACRuntimeConfig")
+        if not isinstance(checkpoint_state, RuntimeCheckpointState):
+            raise TypeError("checkpoint_state must be RuntimeCheckpointState")
+        if checkpoint_state.member_id != runtime_config.member_id:
+            raise ValueError("runtime checkpoint member_id does not match")
+        if checkpoint_state.runtime_config != asdict(runtime_config):
+            raise ValueError("runtime checkpoint configuration does not match")
+        timeout_s = (
+            runtime_config.shutdown_timeout_s if timeout_s is None else timeout_s
+        )
+        if (
+            not isinstance(timeout_s, int | float)
+            or isinstance(timeout_s, bool)
+            or not math.isfinite(timeout_s)
+            or timeout_s <= 0
+        ):
+            raise ValueError("timeout_s must be finite and positive")
+
+        actor = cls._new_learner_actor(
+            sac_config.copy(copy_frozen=False),
+            cls._resolve_spaces(sac_config),
+            replay_actor,
+            FlatEpisodeCodec(),
+            runtime_config=runtime_config,
+            checkpoint_state=checkpoint_state.learner,
+            allow_replay_ahead_on_restore=True,
+            pbt_state=None,
+            learning_starts_satisfied=False,
+        )
+        try:
+            state = ray.get(actor.export_pbt_state.remote(), timeout=timeout_s)
+            if not isinstance(state, PBTModelState):
+                raise RuntimeError("learner actor returned invalid PBT state")
+            return state
+        finally:
+            with suppress(BaseException):
+                ray.get(actor.stop.remote(timeout_s=timeout_s), timeout=timeout_s)
+            ray.kill(actor, no_restart=True)
+
+    @staticmethod
+    def _new_learner_actor(
+        sac_config: SACConfig,
+        spaces: Mapping[str, tuple[Any, Any]],
+        replay_actor: Any,
+        codec: FlatEpisodeCodec,
+        *,
+        runtime_config: AsyncSACRuntimeConfig,
+        checkpoint_state: bytes | None,
+        allow_replay_ahead_on_restore: bool,
+        pbt_state: PBTModelState | None,
+        learning_starts_satisfied: bool,
+    ) -> Any:
+        return LearnerHostActor.options(
+            num_cpus=runtime_config.num_cpus_per_learner,
+            num_gpus=runtime_config.num_gpus_per_learner,
+        ).remote(
+            sac_config,
+            spaces,
+            replay_actor,
+            codec,
+            member_id=runtime_config.member_id,
+            publication_interval_updates=(runtime_config.publication_interval_updates),
+            batch_size=runtime_config.batch_size,
+            batch_queue_capacity=runtime_config.batch_queue_capacity,
+            batch_seed=runtime_config.seed,
+            replay_sync_max_bytes=runtime_config.replay_sync_max_bytes,
+            checkpoint_state=checkpoint_state,
+            allow_replay_ahead_on_restore=allow_replay_ahead_on_restore,
+            pbt_state=pbt_state,
+            learning_starts_satisfied=learning_starts_satisfied,
         )
 
     def start(self) -> None:
@@ -379,7 +508,11 @@ class SingleMemberAsyncSAC:
             )
         return self.get_report()
 
-    def get_report(self) -> dict[str, Any]:
+    def get_report(
+        self,
+        *,
+        include_authoritative_replay: bool = True,
+    ) -> dict[str, Any]:
         self._require_not_stopped()
         self._poll_learner_tick()
         assert self._rollout_group is not None
@@ -387,9 +520,13 @@ class SingleMemberAsyncSAC:
         assert self._learner_actor is not None
 
         rollout = self._rollout_group.get_stats()
-        replay = ray.get(self._replay_actor.get_stats.remote())
+        replay = (
+            ray.get(self._replay_actor.get_stats.remote())
+            if include_authoritative_replay
+            else None
+        )
         learner = ray.get(self._learner_actor.get_stats.remote())
-        if not isinstance(replay, ReplayStats):
+        if replay is not None and not isinstance(replay, ReplayStats):
             raise RuntimeError("replay actor returned invalid stats")
         if not isinstance(learner, LearnerHostStats):
             raise RuntimeError("learner actor returned invalid stats")
@@ -408,12 +545,13 @@ class SingleMemberAsyncSAC:
         learner_values = asdict(learner)
         fast_replay = learner_values.pop("fast_replay")
         batching = learner_values.pop("batch_producer")
-        replay_values = asdict(replay)
-        for name in (
-            "producer_episode_counts",
-            "producer_transition_counts",
-        ):
-            replay_values[name] = dict(replay_values[name])
+        replay_values = asdict(replay) if replay is not None else None
+        if replay_values is not None:
+            for name in (
+                "producer_episode_counts",
+                "producer_transition_counts",
+            ):
+                replay_values[name] = dict(replay_values[name])
         for name in (
             "active_module_transition_counts",
             "active_producer_episode_counts",
@@ -434,6 +572,17 @@ class SingleMemberAsyncSAC:
         learner_values["effective_training_intensity"] = (
             self._effective_training_intensity()
         )
+        rollout_values = asdict(rollout)
+        train_values = {
+            name: rollout_values.pop(name)
+            for name in (
+                "episode_reward_mean",
+                "episode_reward_min",
+                "episode_reward_max",
+                "episodes_in_window",
+                "episodes_since_metric_reset",
+            )
+        }
         result: dict[str, Any] = {
             "timesteps_this_iter": env_steps_this_iter,
             "episodes_this_iter": episodes_this_iter,
@@ -441,8 +590,8 @@ class SingleMemberAsyncSAC:
                 evaluation.latest_return_mean if evaluation is not None else math.nan
             ),
             "controller": self._controller_metrics(),
-            "rollout": self._metric_tree(asdict(rollout)),
-            "authoritative_replay": self._metric_tree(replay_values),
+            "train": self._metric_tree(train_values),
+            "rollout": self._metric_tree(rollout_values),
             "fast_replay": self._metric_tree(fast_replay),
             "batching": self._metric_tree(batching),
             "learner": self._metric_tree(learner_values),
@@ -452,7 +601,19 @@ class SingleMemberAsyncSAC:
                 else {"enabled": False}
             ),
         }
+        if replay_values is not None:
+            result["authoritative_replay"] = self._metric_tree(replay_values)
         return result
+
+    def export_pbt_state(self) -> PBTModelState:
+        """Read model-only state from the serialized learner actor."""
+
+        self._require_not_stopped()
+        assert self._learner_actor is not None
+        state = ray.get(self._learner_actor.export_pbt_state.remote())
+        if not isinstance(state, PBTModelState):
+            raise RuntimeError("learner actor returned invalid PBT state")
+        return state
 
     def save_checkpoint(
         self,
@@ -533,6 +694,45 @@ class SingleMemberAsyncSAC:
             if was_running and self._state is RuntimeState.PAUSED:
                 self.resume()
 
+    def get_member_checkpoint_state(
+        self,
+        *,
+        timeout_s: float | None = None,
+    ) -> RuntimeCheckpointState:
+        """Capture one already-drained member whose replay is externally owned."""
+
+        if self._owns_replay_actor:
+            raise RuntimeError(
+                "standalone runtime checkpoints must include authoritative replay"
+            )
+        self._require_state(RuntimeState.PAUSED)
+        timeout_s = self._config.shutdown_timeout_s if timeout_s is None else timeout_s
+        if (
+            not isinstance(timeout_s, int | float)
+            or isinstance(timeout_s, bool)
+            or not math.isfinite(timeout_s)
+            or timeout_s <= 0
+        ):
+            raise ValueError("timeout_s must be finite and positive")
+
+        started = time.monotonic()
+        assert self._learner_actor is not None
+        learner_checkpoint = ray.get(
+            self._learner_actor.get_checkpoint.remote(),
+            timeout=timeout_s,
+        )
+        if not isinstance(learner_checkpoint, LearnerHostCheckpoint):
+            raise RuntimeError("learner actor returned invalid checkpoint")
+        next_sequence = self._checkpoint_sequence + 1
+        state = self._build_checkpoint_state(
+            learner_checkpoint,
+            replay_cursor=learner_checkpoint.replay_cursor,
+            checkpoint_sequence=next_sequence,
+        )
+        self._checkpoint_sequence = next_sequence
+        self._last_checkpoint_duration_s = time.monotonic() - started
+        return state
+
     def save_member_checkpoint(
         self,
         checkpoint_dir: str | os.PathLike[str],
@@ -570,22 +770,10 @@ class SingleMemberAsyncSAC:
         was_running = self._state is RuntimeState.RUNNING
         try:
             self.drain(timeout_s=self._remaining(deadline))
-            assert self._learner_actor is not None
-            learner_checkpoint = ray.get(
-                self._learner_actor.get_checkpoint.remote(),
-                timeout=self._remaining(deadline),
-            )
-            if not isinstance(learner_checkpoint, LearnerHostCheckpoint):
-                raise RuntimeError("learner actor returned invalid checkpoint")
-
-            next_sequence = self._checkpoint_sequence + 1
-            state = self._build_checkpoint_state(
-                learner_checkpoint,
-                replay_cursor=learner_checkpoint.replay_cursor,
-                checkpoint_sequence=next_sequence,
+            state = self.get_member_checkpoint_state(
+                timeout_s=self._remaining(deadline),
             )
             checkpoint = write_runtime_member_checkpoint(directory, state)
-            self._checkpoint_sequence = next_sequence
             self._last_checkpoint_duration_s = time.monotonic() - started
             return checkpoint
         finally:
@@ -824,6 +1012,8 @@ class SingleMemberAsyncSAC:
                 learner_update_budget - self._learner_updates_completed,
                 0,
             ),
+            "budget_sampled_origin": self._budget_sampled_origin,
+            "budget_updates_origin": self._budget_updates_origin,
             "target_training_intensity": self._target_training_intensity,
             "effective_training_intensity": (self._effective_training_intensity()),
             "checkpoint_sequence": self._checkpoint_sequence,
@@ -850,6 +1040,8 @@ class SingleMemberAsyncSAC:
             "reports": self._reports,
             "pending_rpc_high_watermark": self._pending_rpc_high_watermark,
             "learner_updates_completed": self._learner_updates_completed,
+            "budget_sampled_origin": self._budget_sampled_origin,
+            "budget_updates_origin": self._budget_updates_origin,
             "last_report_env_steps": self._last_report_env_steps,
             "last_report_episodes": self._last_report_episodes,
             "next_evaluation_env_steps": self._next_evaluation_env_steps,
@@ -905,6 +1097,18 @@ class SingleMemberAsyncSAC:
             state,
             "learner_updates_completed",
         )
+        self._budget_sampled_origin = self._optional_checkpoint_counter(
+            state,
+            "budget_sampled_origin",
+        )
+        self._budget_updates_origin = self._optional_checkpoint_counter(
+            state,
+            "budget_updates_origin",
+        )
+        if self._budget_updates_origin != self._learner_update_budget_for_sampled(
+            self._budget_sampled_origin
+        ):
+            raise ValueError("controller checkpoint budget origin is invalid")
         self._last_report_env_steps = self._checkpoint_counter(
             state,
             "last_report_env_steps",
@@ -970,6 +1174,13 @@ class SingleMemberAsyncSAC:
             raise ValueError(f"controller checkpoint {name} is invalid")
         return value
 
+    @staticmethod
+    def _optional_checkpoint_counter(state: Mapping[str, Any], name: str) -> int:
+        value = state.get(name, 0)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"controller checkpoint {name} is invalid")
+        return value
+
     def _kill_components(self) -> None:
         if self._evaluation_group is not None:
             self._evaluation_group.stop()
@@ -997,7 +1208,14 @@ class SingleMemberAsyncSAC:
         )
 
     def _learner_update_budget(self, rollout: object) -> int:
-        sampled_steps = self._sampled_steps(rollout)
+        sampled_steps = self._budget_sampled_origin + self._sampled_steps(rollout)
+        return max(
+            self._learner_update_budget_for_sampled(sampled_steps)
+            - self._budget_updates_origin,
+            0,
+        )
+
+    def _learner_update_budget_for_sampled(self, sampled_steps: int) -> int:
         learning_starts = int(self._sac_config.num_steps_sampled_before_learning_starts)
         if sampled_steps < learning_starts:
             return 0
@@ -1093,7 +1311,22 @@ class AsyncSACTrainable(Trainable):
     ) -> PlacementGroupFactory:
         sac_config, runtime, shared_replay, _ = cls._parse_config(config)
         del sac_config
-        bundles: list[dict[str, float]] = [{"CPU": 1.0}]
+        bundles = [
+            {"CPU": 1.0},
+            *cls._child_resource_bundles(
+                runtime,
+                include_replay=shared_replay is None,
+            ),
+        ]
+        return PlacementGroupFactory(bundles, strategy="PACK")
+
+    @staticmethod
+    def _child_resource_bundles(
+        runtime: AsyncSACRuntimeConfig,
+        *,
+        include_replay: bool,
+    ) -> list[dict[str, float]]:
+        bundles: list[dict[str, float]] = []
 
         def add_bundle(*, cpu: float = 0.0, gpu: float = 0.0) -> None:
             resources: dict[str, float] = {}
@@ -1104,7 +1337,7 @@ class AsyncSACTrainable(Trainable):
             if resources:
                 bundles.append(resources)
 
-        if shared_replay is None:
+        if include_replay:
             add_bundle(cpu=runtime.num_cpus_per_replay)
         add_bundle(
             cpu=runtime.num_cpus_per_learner,
@@ -1114,7 +1347,7 @@ class AsyncSACTrainable(Trainable):
             add_bundle(cpu=runtime.num_cpus_per_runner)
         for _ in range(runtime.evaluation_num_episodes):
             add_bundle(cpu=runtime.num_cpus_per_evaluation_runner)
-        return PlacementGroupFactory(bundles, strategy="PACK")
+        return bundles
 
     def setup(self, config: dict[str, Any]) -> None:
         (

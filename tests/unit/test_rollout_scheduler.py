@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -98,7 +99,7 @@ class FakeRolloutActor:
             episode=episode,
             metrics=EpisodeRolloutMetrics(
                 episode_time_s=0.001,
-                episode_return=1.0,
+                episode_return=float(self._runner_id.rsplit("-", 1)[1]) + 1.0,
                 env_steps=1,
                 agent_steps=1,
             ),
@@ -193,6 +194,7 @@ def make_group(
     initial_weights: WeightsDescriptor | None = None,
     checkpoint_state: dict[str, object] | None = None,
     seed: int | None = None,
+    reward_window_episodes: int = 100,
 ) -> AsyncRolloutGroup:
     install_fake_ray(monkeypatch)
     codec = FlatEpisodeCodec()
@@ -209,6 +211,7 @@ def make_group(
         max_episode_steps=10,
         pending_commit_high_watermark=high,
         pending_commit_low_watermark=low,
+        reward_window_episodes=reward_window_episodes,
         num_cpus_per_runner=0,
         checkpoint_state=checkpoint_state,
     )
@@ -234,6 +237,46 @@ def test_watermark_reserves_commit_capacity_before_sampling(monkeypatch) -> None
         assert resumed.sample_calls_started == 7
         assert resumed.outstanding_high_watermark == 4
         assert resumed.pending_sample_calls + resumed.pending_episode_commits == 4
+    finally:
+        group.stop()
+
+
+def test_train_reward_window_tracks_only_completed_episodes_and_resets(
+    monkeypatch,
+) -> None:
+    group = make_group(
+        monkeypatch,
+        high=4,
+        low=1,
+        reward_window_episodes=3,
+    )
+    try:
+        created = group.get_stats()
+        assert math.isnan(created.episode_reward_mean)
+        assert math.isnan(created.episode_reward_min)
+        assert math.isnan(created.episode_reward_max)
+        assert created.episodes_in_window == 0
+        assert created.episodes_since_metric_reset == 0
+
+        group.start()
+        assert group.poll(max_events=4) == []
+        completions = group.poll(max_events=4)
+        assert len(completions) == 4
+
+        observed = group.get_stats()
+        assert observed.episode_reward_mean == 3.0
+        assert observed.episode_reward_min == 2.0
+        assert observed.episode_reward_max == 4.0
+        assert observed.episodes_in_window == 3
+        assert observed.episodes_since_metric_reset == 4
+
+        group.reset_reward_metrics()
+        reset = group.get_stats()
+        assert math.isnan(reset.episode_reward_mean)
+        assert math.isnan(reset.episode_reward_min)
+        assert math.isnan(reset.episode_reward_max)
+        assert reset.episodes_in_window == 0
+        assert reset.episodes_since_metric_reset == 0
     finally:
         group.stop()
 
@@ -355,6 +398,7 @@ def test_checkpoint_recreates_every_runner_in_a_new_generation(monkeypatch) -> N
         assert group.restart_runner("runner-0") == 1
         checkpoint = group.get_checkpoint_state()
         before = group.get_stats()
+        assert before.episodes_since_metric_reset > 0
 
         restored = make_group(
             monkeypatch,
@@ -372,6 +416,8 @@ def test_checkpoint_recreates_every_runner_in_a_new_generation(monkeypatch) -> N
         assert recovered.env_steps == before.env_steps
         assert recovered.episodes_committed == before.episodes_committed
         assert recovered.runner_restarts == before.runner_restarts + 4
+        assert recovered.episodes_in_window == 0
+        assert recovered.episodes_since_metric_reset == 0
 
         restored.start()
         recovered_after_start = restored.get_stats()
