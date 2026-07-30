@@ -321,7 +321,7 @@ The corresponding target-hardware example and validation passed on
 2026-07-28. The commands and closure evidence are recorded in
 [`debt.md`](debt.md).
 
-## PBT stage 2 single-trial population
+## PBT stage 3 single-trial population
 
 `PopulationTrainable` owns one shared replay actor and every
 `SingleMemberAsyncSAC` runtime inside one Tune trial. Tune reserves the driver,
@@ -364,19 +364,51 @@ uv run --locked --extra cu118 --group dev \
   --num-gpus-per-member 0
 ```
 
+`PopulationTrainable` now publishes one stop-the-world Tune checkpoint. It
+pauses every member before draining them, stores each full member state
+(including optimizer and RNG state), stores the authoritative replay exactly
+once, and publishes `pbt_state.json` with slot generations, current learning
+rates, runtime IDs, and PBT counters. Members resume in `finally`, including
+when snapshot publication fails.
+
+The example exposes three explicit modes:
+
+```bash
+# New population.
+uv run --locked --extra cu118 --group dev \
+  python examples/population_single_trial.py --mode new
+
+# Exact runtime continuation. The member specs and PBT/replay configuration
+# must match the checkpoint.
+uv run --locked --extra cu118 --group dev \
+  python examples/population_single_trial.py \
+  --mode resume \
+  --checkpoint-path <checkpoint-directory>
+
+# New run with the checkpoint's replay/models but fresh optimizers, RNG,
+# generation counters, runtime IDs, and reward windows.
+uv run --locked --extra cu118 --group dev \
+  python examples/population_single_trial.py \
+  --mode warm_start \
+  --checkpoint-path <checkpoint-directory>
+```
+
+`warm_start` requires the same population slots, population size, model/spaces,
+runtime topology, and replay retention configuration. Its new initial learning
+rates must lie inside the new mutation bounds; out-of-range values fail
+explicitly rather than being clamped. Exact Tune retry/experiment continuation
+also uses `PopulationTrainable.load_checkpoint()` automatically. Use Tune's
+standard `Tuner.restore(...)` lifecycle when the existing Tune experiment
+directory and TensorBoard run must be continued rather than starting a new
+driver invocation from a checkpoint directory.
+
 Inspect its single trial:
 
 ```bash
 uv run --locked --extra cu118 --group dev \
-  tensorboard --logdir <ray-results>/async-sac-single-trial-population
+  tensorboard --logdir <ray-results>/async-sac-single-trial-population-<mode>
 ```
 
-This stage does not yet implement a live single-trial population checkpoint,
-exact resume, or warm start. Those belong to PBT stage 3.
-Until the stop-the-world population checkpoint is implemented, every
-`PopulationTrainable` run must set
-`CheckpointConfig(checkpoint_at_end=False)` explicitly; otherwise Tune asks the
-class-based Trainable for its not-yet-supported final checkpoint.
 `PopulationLauncher` and `examples/population_two_members.py` remain the
 Phase 8 compatibility path.
 

@@ -9,6 +9,7 @@ from rllib_async.protocols import FlatEpisodeCodec, ReplayCursor
 from rllib_async.replay.checkpoint import write_replay_checkpoint
 from rllib_async.replay.reference import EpisodeStore
 from rllib_async.runtime.checkpoint import (
+    PBT_STATE_FILENAME,
     POPULATION_CHECKPOINT_FILENAME,
     POPULATION_MEMBERS_DIRECTORY,
     RUNTIME_CHECKPOINT_FILENAME,
@@ -17,6 +18,7 @@ from rllib_async.runtime.checkpoint import (
     InvalidPopulationCheckpointError,
     InvalidRuntimeCheckpointError,
     RuntimeCheckpointState,
+    read_pbt_checkpoint_metadata,
     read_population_checkpoint_bundle,
     read_runtime_checkpoint,
     write_population_checkpoint,
@@ -145,6 +147,10 @@ def test_population_checkpoint_persists_shared_replay_exactly_once(tmp_path) -> 
             "member-0": member_zero,
             "member-1": member_one,
         },
+        pbt_metadata={
+            "schema_version": 1,
+            "run_id": "run-test",
+        },
     )
     manifest, replay, members = read_population_checkpoint_bundle(checkpoint_dir)
 
@@ -156,12 +162,26 @@ def test_population_checkpoint_persists_shared_replay_exactly_once(tmp_path) -> 
         "member-0": member_zero,
         "member-1": member_one,
     }
+    assert read_pbt_checkpoint_metadata(checkpoint_dir) == {
+        "schema_version": 1,
+        "run_id": "run-test",
+    }
     assert (checkpoint_dir / POPULATION_CHECKPOINT_FILENAME).is_file()
+    assert (checkpoint_dir / PBT_STATE_FILENAME).is_file()
     assert (checkpoint_dir / RUNTIME_REPLAY_FILENAME).is_file()
     for member_id in checkpoint.member_ids:
         member_directory = checkpoint_dir / POPULATION_MEMBERS_DIRECTORY / member_id
         assert (member_directory / RUNTIME_CHECKPOINT_FILENAME).is_file()
         assert not (member_directory / RUNTIME_REPLAY_FILENAME).exists()
+
+
+def test_pbt_checkpoint_metadata_is_required_and_strict_json(tmp_path) -> None:
+    with pytest.raises(InvalidPopulationCheckpointError, match="PBT checkpoint"):
+        read_pbt_checkpoint_metadata(tmp_path)
+
+    (tmp_path / PBT_STATE_FILENAME).write_text("{broken", encoding="utf-8")
+    with pytest.raises(InvalidPopulationCheckpointError, match="PBT checkpoint"):
+        read_pbt_checkpoint_metadata(tmp_path)
 
 
 def test_population_checkpoint_rejects_newer_member_and_corruption(tmp_path) -> None:

@@ -1,6 +1,7 @@
 """Asynchronous SAC member and fixed-population runtime composition."""
 
 from rllib_async.runtime.checkpoint import (
+    PBT_STATE_FILENAME,
     InvalidPopulationCheckpointError,
     InvalidRuntimeCheckpointError,
     PopulationCheckpoint,
@@ -9,6 +10,7 @@ from rllib_async.runtime.checkpoint import (
     RuntimeCheckpoint,
     RuntimeCheckpointError,
     RuntimeCheckpointState,
+    read_pbt_checkpoint_metadata,
     read_population_checkpoint_bundle,
     read_runtime_checkpoint,
     read_runtime_member_checkpoint,
@@ -46,6 +48,7 @@ from rllib_async.runtime.population import (
 )
 
 __all__ = [
+    "PBT_STATE_FILENAME",
     "AsyncEvaluationGroup",
     "AsyncSACRuntimeConfig",
     "AsyncSACTrainable",
@@ -78,6 +81,7 @@ __all__ = [
     "SimplePBTConfig",
     "SingleMemberAsyncSAC",
     "make_runtime_member_id",
+    "read_pbt_checkpoint_metadata",
     "read_population_checkpoint_bundle",
     "read_runtime_checkpoint",
     "read_runtime_member_checkpoint",
