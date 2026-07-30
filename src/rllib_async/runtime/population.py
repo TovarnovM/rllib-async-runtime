@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 import os
@@ -15,7 +17,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import ray
-from ray import tune
+from ray import cloudpickle, tune
 from ray.air import RunConfig
 from ray.rllib.algorithms.sac import SACConfig
 from ray.tune import ResultGrid, Trainable
@@ -51,7 +53,7 @@ class PopulationError(RuntimeError):
 
 _LOGGER = logging.getLogger(__name__)
 _MUTABLE_HPARAMS = ("actor_lr", "critic_lr", "alpha_lr")
-_PBT_CHECKPOINT_SCHEMA_VERSION = 1
+_PBT_CHECKPOINT_SCHEMA_VERSION = 2
 _POPULATION_RUN_MODES = frozenset({"new", "resume", "warm_start"})
 _SHARED_REPLAY_SETTINGS = (
     "replay_capacity_transitions",
@@ -85,6 +87,22 @@ _SAC_STRUCTURAL_SETTINGS = (
     "enable_rl_module_and_learner",
     "enable_env_runner_and_connector_v2",
 )
+
+
+def _config_value_fingerprint(value: object) -> str:
+    """Return a stable digest for a JSON-like or cloudpickle-able config value."""
+
+    try:
+        encoded = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        encoded = cloudpickle.dumps(value)
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +245,9 @@ class _PBTMemberCheckpointMetadata:
     runtime_member_id: str
     hparams: Mapping[str, Any]
     exploit_count_as_target: int
+    sac_seed: int
+    env_fingerprint: str
+    env_config_fingerprint: str
 
     @classmethod
     def from_mapping(
@@ -241,6 +262,9 @@ class _PBTMemberCheckpointMetadata:
             "runtime_member_id",
             "exploit_count_as_target",
             *_MUTABLE_HPARAMS,
+            "sac_seed",
+            "env_fingerprint",
+            "env_config_fingerprint",
         }
         if set(value) != expected:
             raise ValueError(f"PBT member {slot_id!r} metadata fields do not match")
@@ -260,12 +284,28 @@ class _PBTMemberCheckpointMetadata:
             value["runtime_member_id"],
             name=f"PBT member {slot_id!r} runtime_member_id",
         )
+        sac_seed = value["sac_seed"]
+        if not isinstance(sac_seed, int) or isinstance(sac_seed, bool):
+            raise ValueError(f"PBT member {slot_id!r} SAC seed is invalid")
+        fingerprints = {}
+        for name in ("env_fingerprint", "env_config_fingerprint"):
+            fingerprint = value[name]
+            if (
+                not isinstance(fingerprint, str)
+                or len(fingerprint) != 64
+                or any(character not in "0123456789abcdef" for character in fingerprint)
+            ):
+                raise ValueError(f"PBT member {slot_id!r} {name} is invalid")
+            fingerprints[name] = fingerprint
         hparams = {name: value[name] for name in _MUTABLE_HPARAMS}
         return cls(
             generation=generation,
             runtime_member_id=runtime_member_id,
             hparams=hparams,
             exploit_count_as_target=exploit_count,
+            sac_seed=sac_seed,
+            env_fingerprint=fingerprints["env_fingerprint"],
+            env_config_fingerprint=fingerprints["env_config_fingerprint"],
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -274,6 +314,9 @@ class _PBTMemberCheckpointMetadata:
             "runtime_member_id": self.runtime_member_id,
             **dict(self.hparams),
             "exploit_count_as_target": self.exploit_count_as_target,
+            "sac_seed": self.sac_seed,
+            "env_fingerprint": self.env_fingerprint,
+            "env_config_fingerprint": self.env_config_fingerprint,
         }
 
 
@@ -1069,6 +1112,22 @@ class PopulationAsyncSAC:
         for slot_id in self._slot_ids:
             member_metadata = metadata.members[slot_id]
             template = self._member_specs[slot_id]
+            if self._base_sac_seeds[slot_id] != member_metadata.sac_seed:
+                raise ValueError(
+                    f"exact resume SAC seed for {slot_id!r} does not match checkpoint"
+                )
+            for name, expected in (
+                ("env", member_metadata.env_fingerprint),
+                ("env_config", member_metadata.env_config_fingerprint),
+            ):
+                if (
+                    _config_value_fingerprint(getattr(template.sac_config, name))
+                    != expected
+                ):
+                    raise ValueError(
+                        f"exact resume SAC {name} for {slot_id!r} "
+                        "does not match checkpoint"
+                    )
             sac_config = template.sac_config.copy(copy_frozen=False)
             sac_config.training(**dict(member_metadata.hparams))
             sac_config.debugging(
@@ -1437,6 +1496,13 @@ class PopulationAsyncSAC:
                 runtime_member_id=self.runtime_member_ids[slot_id],
                 hparams=dict(self._current_hparams[slot_id]),
                 exploit_count_as_target=(self._exploit_count_as_target[slot_id]),
+                sac_seed=self._base_sac_seeds[slot_id],
+                env_fingerprint=_config_value_fingerprint(
+                    self._member_specs[slot_id].sac_config.env
+                ),
+                env_config_fingerprint=_config_value_fingerprint(
+                    self._member_specs[slot_id].sac_config.env_config
+                ),
             )
             for slot_id in self._slot_ids
         }

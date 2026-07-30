@@ -271,6 +271,43 @@ def test_exact_resume_rejects_hparam_outside_checkpoint_bounds(
         )
 
 
+@pytest.mark.parametrize(
+    ("changed_config", "message"),
+    [
+        (lambda config: config.debugging(seed=999), "SAC seed"),
+        (lambda config: config.environment("Pendulum-v1"), "SAC env"),
+        (
+            lambda config: config.environment(env_config={"gravity": 3.0}),
+            "SAC env_config",
+        ),
+    ],
+)
+def test_exact_resume_rejects_changed_rollout_configuration(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_config,
+    message: str,
+) -> None:
+    checkpoint_dir, specs, pbt_config, _ = write_single_trial_checkpoint(
+        tmp_path,
+        monkeypatch,
+    )
+    changed_specs = (
+        PopulationMemberSpec(
+            changed_config(specs[0].sac_config.copy(copy_frozen=False)),
+            specs[0].runtime_config,
+        ),
+        specs[1],
+    )
+
+    with pytest.raises(ValueError, match=message):
+        PopulationAsyncSAC.from_checkpoint(
+            changed_specs,
+            checkpoint_dir,
+            pbt_config=pbt_config,
+        )
+
+
 def test_warm_start_resets_identity_and_rejects_ambiguous_hparams(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
