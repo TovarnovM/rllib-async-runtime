@@ -65,7 +65,7 @@ def build_replay(
     replay = FastReplay(codec)
     replay.load_snapshot(store.get_snapshot())
     collator = (
-        FlatBatchCollator()
+        FlatBatchCollator(validate=False)
         if payload_kind == "flat"
         else GraphBatchCollator(module_id=SHARED_GNN_MODULE_ID)
     )
