@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import pickle
-from dataclasses import replace
+from dataclasses import make_dataclass, replace
 
 import pytest
 
@@ -109,3 +110,53 @@ def test_envelope_requires_a_completed_episode_and_behavior_version() -> None:
         replace(episode, terminated=False, truncated=False)
     with pytest.raises(EpisodeValidationError, match="must not be empty"):
         replace(episode, behavior_versions=FrozenVersions({}))
+
+
+def test_cached_payload_size_preserves_legacy_pickle_and_fingerprint(
+    monkeypatch,
+) -> None:
+    import rllib_async.protocols.episodes as module
+    from rllib_async.replay.reference import EpisodeStore
+
+    current_type = module.FlatEpisodePayload
+    legacy_type = make_dataclass(
+        "FlatEpisodePayload",
+        [("encoded_transitions", tuple[bytes, ...])],
+        frozen=True,
+        slots=True,
+        namespace={"__module__": module.__name__},
+    )
+    transitions = (pickle.dumps({"value": 1}), pickle.dumps({"value": 2}))
+    episode = make_episode(FlatEpisodeCodec())
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "FlatEpisodePayload", legacy_type)
+        legacy_episode = replace(
+            episode,
+            payload=legacy_type(transitions),
+            estimated_bytes=sum(map(len, transitions)),
+        )
+        legacy_bytes = pickle.dumps(legacy_episode, protocol=5)
+    restored_episode = pickle.loads(legacy_bytes)
+    restored = restored_episode.payload
+    assert isinstance(restored, current_type)
+    assert restored.estimated_bytes == sum(map(len, transitions))
+    assert (
+        EpisodeStore._fingerprint(restored_episode)
+        == hashlib.sha256(legacy_bytes).digest()
+    )
+
+    def unexpected_recount(self):
+        raise AssertionError("transport recalculated payload size")
+
+    monkeypatch.setattr(current_type, "__post_init__", unexpected_recount)
+    assert (
+        pickle.loads(pickle.dumps(restored)).estimated_bytes == restored.estimated_bytes
+    )
+
+    # A cached read must not touch the encoded transition sequence again.
+    class Unreadable:
+        def __iter__(self):
+            raise AssertionError("payload size was rescanned")
+
+    object.__setattr__(restored, "encoded_transitions", Unreadable())
+    assert restored.estimated_bytes == sum(map(len, transitions))

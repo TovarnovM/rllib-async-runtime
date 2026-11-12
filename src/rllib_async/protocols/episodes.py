@@ -68,6 +68,7 @@ class FlatEpisodePayload:
     """
 
     encoded_transitions: tuple[bytes, ...]
+    _estimated_bytes: int = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if type(self.encoded_transitions) is not tuple:
@@ -76,10 +77,24 @@ class FlatEpisodePayload:
             raise EpisodeValidationError("an episode must contain a transition")
         if any(type(item) is not bytes for item in self.encoded_transitions):
             raise EpisodeValidationError("encoded transitions must be bytes")
+        object.__setattr__(
+            self, "_estimated_bytes", sum(map(len, self.encoded_transitions))
+        )
+
+    def __getstate__(self) -> list[object]:
+        return [self.encoded_transitions, self._estimated_bytes]
+
+    def __setstate__(self, state: list[object]) -> None:
+        object.__setattr__(self, "encoded_transitions", state[0])
+        if len(state) == 1:
+            # Old checkpoints predate the size cache. Reconstruct it once.
+            self.__post_init__()
+        else:
+            object.__setattr__(self, "_estimated_bytes", state[1])
 
     @property
     def estimated_bytes(self) -> int:
-        return sum(map(len, self.encoded_transitions))
+        return self._estimated_bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,7 +350,9 @@ class EpisodeCodec(Protocol):
 
     def transition_count(self, episode: EpisodeEnvelope) -> int: ...
 
-    def get_transition(self, episode: EpisodeEnvelope, index: int) -> object: ...
+    def get_transition(
+        self, episode: EpisodeEnvelope, index: int, *, validate: bool = True
+    ) -> object: ...
 
     def estimate_bytes(self, episode: EpisodeEnvelope) -> int: ...
 
@@ -357,6 +374,8 @@ class ModuleEpisodeCodec(EpisodeCodec, Protocol):
         episode: EpisodeEnvelope,
         module_id: str,
         index: int,
+        *,
+        validate: bool = True,
     ) -> MultiModuleTransition: ...
 
 
@@ -399,8 +418,11 @@ class FlatEpisodeCodec:
         assert isinstance(episode.payload, FlatEpisodePayload)
         return len(episode.payload.encoded_transitions)
 
-    def get_transition(self, episode: EpisodeEnvelope, index: int) -> object:
-        self.validate(episode)
+    def get_transition(
+        self, episode: EpisodeEnvelope, index: int, *, validate: bool = True
+    ) -> object:
+        if validate:
+            self.validate(episode)
         assert isinstance(episode.payload, FlatEpisodePayload)
         if index < 0 or index >= len(episode.payload.encoded_transitions):
             raise IndexError(index)
@@ -480,8 +502,11 @@ class MultiModuleEpisodeCodec:
         self.validate(episode)
         return self._payload(episode).transition_count
 
-    def get_transition(self, episode: EpisodeEnvelope, index: int) -> object:
-        self.validate(episode)
+    def get_transition(
+        self, episode: EpisodeEnvelope, index: int, *, validate: bool = True
+    ) -> object:
+        if validate:
+            self.validate(episode)
         if not isinstance(index, int) or isinstance(index, bool) or index < 0:
             raise IndexError(index)
         offset = index
@@ -511,8 +536,11 @@ class MultiModuleEpisodeCodec:
         episode: EpisodeEnvelope,
         module_id: str,
         index: int,
+        *,
+        validate: bool = True,
     ) -> MultiModuleTransition:
-        self.validate(episode)
+        if validate:
+            self.validate(episode)
         transitions = self._module_transitions(episode, module_id)
         if (
             not isinstance(index, int)

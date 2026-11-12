@@ -26,29 +26,37 @@ MultiModuleGraphBatch: TypeAlias = dict[str, GraphModuleBatch]
 
 def pack_graph_observations(
     observations: Sequence[object],
+    *,
+    validate: bool = True,
 ) -> GraphBatch:
     """Pack validated ego-graphs without padding or copied per-graph models."""
 
     if not observations:
         raise BatchCollationError("graph collation requires at least one observation")
     try:
-        graphs = [normalize_graph_observation(item) for item in observations]
+        graphs = (
+            [normalize_graph_observation(item) for item in observations]
+            if validate
+            else observations
+        )
     except ValueError as error:
         raise BatchCollationError(str(error)) from error
 
-    node_feature_dims = {graph[NODE_FEATURES].shape[1] for graph in graphs}
-    if len(node_feature_dims) != 1:
-        raise BatchCollationError("all graphs must share one node feature dimension")
-    edge_feature_presence = [EDGE_FEATURES in graph for graph in graphs]
-    if len(set(edge_feature_presence)) != 1:
-        raise BatchCollationError(
-            "edge_features must be present for every graph or for none"
-        )
-    action_mask_presence = [ACTION_MASK in graph for graph in graphs]
-    if len(set(action_mask_presence)) != 1:
-        raise BatchCollationError(
-            "action_mask must be present for every graph or for none"
-        )
+    edge_features_present = EDGE_FEATURES in graphs[0]
+    action_masks_present = ACTION_MASK in graphs[0]
+    if validate:
+        if len({graph[NODE_FEATURES].shape[1] for graph in graphs}) != 1:
+            raise BatchCollationError(
+                "all graphs must share one node feature dimension"
+            )
+        if any((EDGE_FEATURES in graph) != edge_features_present for graph in graphs):
+            raise BatchCollationError(
+                "edge_features must be present for every graph or for none"
+            )
+        if any((ACTION_MASK in graph) != action_masks_present for graph in graphs):
+            raise BatchCollationError(
+                "action_mask must be present for every graph or for none"
+            )
 
     node_parts: list[np.ndarray] = []
     edge_parts: list[np.ndarray] = []
@@ -63,7 +71,7 @@ def pack_graph_observations(
         edge_parts.append(edge_index + offset)
         controlled_nodes.append(offset + graph[CONTROLLED_NODE])
         graph_ptr.append(offset + len(node_features))
-        if edge_feature_presence[0]:
+        if edge_features_present:
             edge_feature_parts.append(graph[EDGE_FEATURES])
 
     packed: GraphBatch = {
@@ -78,9 +86,8 @@ def pack_graph_observations(
         "graph_ptr": np.ascontiguousarray(graph_ptr, dtype=np.int64),
         CONTROLLED_NODE: np.ascontiguousarray(controlled_nodes, dtype=np.int64),
     }
-    if edge_feature_presence[0]:
-        feature_dims = {part.shape[1] for part in edge_feature_parts}
-        if len(feature_dims) != 1:
+    if edge_features_present:
+        if validate and len({part.shape[1] for part in edge_feature_parts}) != 1:
             raise BatchCollationError(
                 "all graphs must share one edge feature dimension"
             )
@@ -88,15 +95,15 @@ def pack_graph_observations(
             np.concatenate(edge_feature_parts, axis=0),
             dtype=np.float32,
         )
-    if action_mask_presence[0]:
+    if action_masks_present:
         masks = [graph[ACTION_MASK] for graph in graphs]
-        if len({mask.shape for mask in masks}) != 1:
+        if validate and len({mask.shape for mask in masks}) != 1:
             raise BatchCollationError("all action masks must have the same shape")
         packed[ACTION_MASK] = np.ascontiguousarray(
             np.stack(masks, axis=0),
             dtype=np.float32,
         )
-    return validate_packed_graph_batch(packed)
+    return validate_packed_graph_batch(packed) if validate else packed
 
 
 def validate_packed_graph_batch(batch: object) -> GraphBatch:
@@ -207,14 +214,19 @@ class GraphBatchCollator:
         self,
         *,
         module_id: str,
+        validate_startup: bool = False,
     ) -> None:
         if not isinstance(module_id, str) or not module_id:
             raise ValueError("module_id must be a non-empty string")
         self._module_id = module_id
+        self._validate_next_batch = validate_startup
+        self._scalar_collator = FlatBatchCollator(validate=False)
 
     def collate(self, transitions: Sequence[object]) -> MultiModuleGraphBatch:
         if not transitions:
             raise BatchCollationError("collation requires at least one transition")
+        if not self._validate_next_batch:
+            return {self._module_id: self._collate_module(transitions)}
         validated: list[MultiModuleTransition] = []
         for transition in transitions:
             if not isinstance(transition, MultiModuleTransition):
@@ -228,8 +240,8 @@ class GraphBatchCollator:
             validated.append(transition)
         return {self._module_id: self._collate_module(validated)}
 
-    @staticmethod
     def _collate_module(
+        self,
         transitions: Sequence[MultiModuleTransition],
     ) -> GraphModuleBatch:
         observations = [item.data[Columns.OBS] for item in transitions]
@@ -242,9 +254,14 @@ class GraphBatchCollator:
             }
             for item in transitions
         ]
-        batch: GraphModuleBatch = FlatBatchCollator().collate(scalar_rows)
-        batch[Columns.OBS] = pack_graph_observations(observations)
-        batch[Columns.NEXT_OBS] = pack_graph_observations(next_observations)
+        batch: GraphModuleBatch = self._scalar_collator.collate(scalar_rows)
+        batch[Columns.OBS] = pack_graph_observations(
+            observations, validate=self._validate_next_batch
+        )
+        batch[Columns.NEXT_OBS] = pack_graph_observations(
+            next_observations, validate=self._validate_next_batch
+        )
+        self._validate_next_batch = False
         return batch
 
 

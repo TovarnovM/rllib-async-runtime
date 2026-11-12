@@ -14,6 +14,7 @@ from rllib_async.protocols import (
     WeightsDescriptor,
 )
 from rllib_async.rollout import EpisodeRolloutMetrics, EpisodeRolloutResult
+from rllib_async.rollout.episode_runner import EpisodeRolloutSummary
 from rllib_async.runtime import AsyncEvaluationGroup
 from tests.helpers import make_sac_config
 
@@ -28,6 +29,13 @@ class FakeRemoteMethod:
         self._function = function
 
     def remote(self, *args, **kwargs) -> FakeRef:
+        args = tuple(
+            value.value if isinstance(value, FakeRef) else value for value in args
+        )
+        kwargs = {
+            key: value.value if isinstance(value, FakeRef) else value
+            for key, value in kwargs.items()
+        }
         return FakeRef(self._function(*args, **kwargs))
 
 
@@ -44,7 +52,11 @@ class FakeEvaluationActor:
         self._sequence = 0
         self.explore_arguments: list[bool] = []
         self.weight_arguments: list[WeightsDescriptor | None] = []
-        self.collect_episode = FakeRemoteMethod(self._collect_episode)
+        self.evaluate = FakeRemoteMethod(
+            lambda weights: EpisodeRolloutSummary.from_result(
+                self._collect_episode(weights, explore=False)
+            )
+        )
 
     def _collect_episode(
         self,
@@ -116,7 +128,7 @@ class FakeEvaluationActorClass:
         initial_weights,
         worker_index,
     ) -> FakeEvaluationActor:
-        actor = FakeEvaluationActor(codec, runner_id, initial_weights)
+        actor = FakeEvaluationActor(codec, runner_id, initial_weights.value)
         cls.created.append(actor)
         return actor
 
@@ -137,12 +149,13 @@ def install_fake_ray(monkeypatch) -> None:
     monkeypatch.setattr(
         evaluation_module.ray,
         "wait",
-        lambda refs, *, num_returns, timeout: (
+        lambda refs, *, num_returns, timeout, fetch_local=True: (
             refs[:num_returns],
             refs[num_returns:],
         ),
     )
     monkeypatch.setattr(evaluation_module.ray, "get", lambda ref: ref.value)
+    monkeypatch.setattr(evaluation_module.ray, "put", FakeRef)
     monkeypatch.setattr(evaluation_module.ray, "cancel", lambda ref: None)
     monkeypatch.setattr(
         evaluation_module.ray,
@@ -238,3 +251,35 @@ def test_evaluation_checkpoint_preserves_completed_round_metrics(monkeypatch) ->
         group.stop()
         if restored is not None:
             restored.stop()
+
+
+def test_evaluation_reuses_rollout_weight_refs_without_another_put(monkeypatch) -> None:
+    install_fake_ray(monkeypatch)
+
+    def unexpected_put(value):
+        raise AssertionError("evaluation duplicated a shared publication")
+
+    monkeypatch.setattr(evaluation_module.ray, "put", unexpected_put)
+    initial = make_weights(0)
+    group = AsyncEvaluationGroup(
+        make_sac_config(),
+        FlatEpisodeCodec(),
+        member_id="member-0",
+        initial_weights=initial,
+        initial_weights_ref=FakeRef(initial),
+        episode_count=2,
+        max_episode_steps=10,
+        num_cpus_per_runner=0,
+    )
+    try:
+        group.start_round(initial)
+        group.drain(timeout_s=1)
+        newer = make_weights(1)
+        group.start_round(newer, weights_ref=FakeRef(newer))
+        group.drain(timeout_s=1)
+        assert all(
+            actor.weight_arguments == [None, newer]
+            for actor in FakeEvaluationActorClass.created
+        )
+    finally:
+        group.stop()

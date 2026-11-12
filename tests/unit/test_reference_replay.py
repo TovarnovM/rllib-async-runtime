@@ -414,3 +414,19 @@ def test_sustained_ingest_bounds_payload_and_journal_but_counts_dedup_growth() -
     restored = EpisodeStore.from_state(codec, store.export_state())
     assert restored.get_snapshot() == store.get_snapshot()
     assert restored.get_stats() == stats
+
+
+def test_current_cursor_does_not_scan_the_journal() -> None:
+    from collections import deque
+
+    class UnreadableJournal(deque):
+        def __iter__(self):
+            raise AssertionError("empty sync scanned the journal")
+
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(codec, capacity_transitions=100, capacity_bytes=100_000)
+    store.commit_episode(make_episode(codec, 0, [1]))
+    store._journal = UnreadableJournal(store._journal)
+    delta = store.get_delta(store.cursor, max_bytes=1)
+    assert delta.transactions == ()
+    assert delta.base_cursor == delta.next_cursor == store.cursor

@@ -59,12 +59,15 @@ class AsyncSACRuntimeConfig:
     replay_capacity_bytes: int = 512 * 1024 * 1024
     replay_journal_capacity: int = 4_096
     replay_sync_max_bytes: int = 16 * 1024 * 1024
+    replay_sync_interval_s: float = 0.05
     pending_commit_high_watermark: int = 16
     pending_commit_low_watermark: int = 8
     batch_size: int = 256
-    batch_queue_capacity: int = 4
-    learner_updates_per_tick: int = 1
-    publication_interval_updates: int = 1
+    batch_queue_capacity: int = 0
+    learner_updates_per_tick: int = 8
+    publication_interval_updates: int = 8
+    validate_startup: bool = False
+    colocate_replay_and_learners: bool = False
     evaluation_interval_env_steps: int = 5_000
     evaluation_num_episodes: int = 4
     report_interval_s: float = 1.0
@@ -163,6 +166,33 @@ class AsyncSACRuntimeConfig:
             self._non_negative_float(name, getattr(self, name))
         if self.num_gpus_per_learner not in {0.0, 1.0}:
             raise ValueError("num_gpus_per_learner must be 0 or 1")
+        self._non_negative_float("replay_sync_interval_s", self.replay_sync_interval_s)
+        for name in ("validate_startup", "colocate_replay_and_learners"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool")
+
+    def core_actor_options(self) -> dict[str, Any]:
+        """Pin replay and learners to the explicitly reserved Tune core bundle."""
+
+        if not self.colocate_replay_and_learners:
+            return {}
+        from ray.util import get_current_placement_group
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+        group = get_current_placement_group()
+        if group is None:
+            raise ValueError("colocation requires a Tune trainable placement group")
+        return {
+            "scheduling_strategy": PlacementGroupSchedulingStrategy(
+                placement_group=group,
+                placement_group_bundle_index=1,
+            )
+        }
+
+    def matches_checkpoint(self, values: Mapping[str, Any]) -> bool:
+        """Supply new optional settings while preserving saved scheduling values."""
+
+        return self == type(self)(**values)
 
     @classmethod
     def from_mapping(

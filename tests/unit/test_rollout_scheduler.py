@@ -20,6 +20,7 @@ from rllib_async.rollout import (
     EpisodeRolloutMetrics,
     EpisodeRolloutResult,
 )
+from rllib_async.rollout.episode_runner import EpisodeRolloutSummary
 from tests.helpers import make_sac_config
 
 
@@ -33,7 +34,22 @@ class FakeRemoteMethod:
         self._function = function
 
     def remote(self, *args, **kwargs) -> FakeRef:
+        args = tuple(
+            value.value if isinstance(value, FakeRef) else value for value in args
+        )
+        kwargs = {
+            key: value.value if isinstance(value, FakeRef) else value
+            for key, value in kwargs.items()
+        }
         return FakeRef(self._function(*args, **kwargs))
+
+
+class FakeSplitRemoteMethod(FakeRemoteMethod):
+    def remote(self, *args, **kwargs):
+        result = super().remote(*args, **kwargs).value
+        return FakeRef(result.episode), FakeRef(
+            EpisodeRolloutSummary.from_result(result)
+        )
 
 
 class FakeRolloutActor:
@@ -56,6 +72,7 @@ class FakeRolloutActor:
         self.effective_seed = effective_seed
         self.weight_arguments: list[WeightsDescriptor | None] = []
         self.collect_episode = FakeRemoteMethod(self._collect_episode)
+        self.collect_episode_refs = FakeSplitRemoteMethod(self._collect_episode)
 
     def _collect_episode(
         self,
@@ -134,7 +151,7 @@ class FakeRolloutActorClass:
             member_id=member_id,
             runner_id=runner_id,
             runner_generation=runner_generation,
-            initial_weights=initial_weights,
+            initial_weights=initial_weights.value,
             effective_seed=effective_seed,
         )
         cls.created[runner_id] = actor
@@ -157,12 +174,13 @@ def install_fake_ray(monkeypatch) -> None:
     monkeypatch.setattr(
         group_module.ray,
         "wait",
-        lambda refs, *, num_returns, timeout: (
+        lambda refs, *, num_returns, timeout, fetch_local=True: (
             refs[:num_returns],
             refs[num_returns:],
         ),
     )
     monkeypatch.setattr(group_module.ray, "get", lambda ref: ref.value)
+    monkeypatch.setattr(group_module.ray, "put", FakeRef)
     monkeypatch.setattr(group_module.ray, "cancel", lambda ref: None)
     monkeypatch.setattr(
         group_module.ray,
@@ -486,3 +504,39 @@ def test_checkpoint_recreates_runners_with_a_new_seed_range(monkeypatch) -> None
         group.stop()
         if restored is not None:
             restored.stop()
+
+
+def test_controller_never_fetches_payloads_and_reuses_publication_refs(
+    monkeypatch,
+) -> None:
+    group = make_group(monkeypatch, high=4, low=1)
+    puts = []
+
+    def put(value):
+        ref = FakeRef(value)
+        puts.append(ref)
+        return ref
+
+    def get(ref):
+        assert not isinstance(ref.value, EpisodeEnvelope), "controller fetched payload"
+        return ref.value
+
+    monkeypatch.setattr(group_module.ray, "put", put)
+    monkeypatch.setattr(group_module.ray, "get", get)
+    try:
+        group.start()
+        group.update_weights(make_weights(1))
+        assert len(puts) == 1
+        assert group.published_weights_ref is puts[0]
+        group.pause()
+        completions = group.drain(timeout_s=1)
+        assert len(completions) == 4
+        assert all(item.acknowledgement.committed for item in completions)
+        assert all(
+            isinstance(item.episode_ref.value, EpisodeEnvelope) for item in completions
+        )
+        assert group.pending_sample_calls == group.pending_episode_commits == 0
+        assert not group.update_weights(make_weights(1))
+        assert len(puts) == 1
+    finally:
+        group.stop()

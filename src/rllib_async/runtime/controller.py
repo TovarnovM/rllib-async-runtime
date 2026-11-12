@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict
 from enum import Enum
@@ -71,6 +71,7 @@ class SingleMemberAsyncSAC:
         member_checkpoint_state: RuntimeCheckpointState | None = None,
         pbt_state: PBTModelState | None = None,
         reward_window_episodes: int = 100,
+        worker_bundle_start: int = 2,
     ) -> None:
         if not ray.is_initialized():
             raise RuntimeError("Ray must be initialized before SingleMemberAsyncSAC")
@@ -120,13 +121,13 @@ class SingleMemberAsyncSAC:
             )
             if checkpoint_state.member_id != runtime_config.member_id:
                 raise ValueError("runtime checkpoint member_id does not match")
-            if checkpoint_state.runtime_config != asdict(runtime_config):
+            if not runtime_config.matches_checkpoint(checkpoint_state.runtime_config):
                 raise ValueError("runtime checkpoint configuration does not match")
         elif member_checkpoint_state is not None:
             checkpoint_state = member_checkpoint_state
             if checkpoint_state.member_id != runtime_config.member_id:
                 raise ValueError("runtime checkpoint member_id does not match")
-            if checkpoint_state.runtime_config != asdict(runtime_config):
+            if not runtime_config.matches_checkpoint(checkpoint_state.runtime_config):
                 raise ValueError("runtime checkpoint configuration does not match")
         self._target_training_intensity = self._resolve_training_intensity(
             self._sac_config.training_intensity,
@@ -147,6 +148,7 @@ class SingleMemberAsyncSAC:
         self._rollout_group: AsyncRolloutGroup | None = None
         self._evaluation_group: AsyncEvaluationGroup | None = None
         self._pending_learner_tick: ray.ObjectRef | None = None
+        self._next_learner_tick_at = 0.0
         self._latest_weights: WeightsDescriptor | None = None
         self._started_at: float | None = None
         self._pump_iterations = 0
@@ -169,6 +171,7 @@ class SingleMemberAsyncSAC:
             if replay_actor is None:
                 self._replay_actor = ReplayActor.options(
                     num_cpus=self._config.num_cpus_per_replay,
+                    **self._config.core_actor_options(),
                 ).remote(
                     self._codec,
                     capacity_transitions=self._config.replay_capacity_transitions,
@@ -226,6 +229,12 @@ class SingleMemberAsyncSAC:
                     self._config.pending_commit_low_watermark
                 ),
                 num_cpus_per_runner=self._config.num_cpus_per_runner,
+                placement_group_bundle_start=(
+                    worker_bundle_start
+                    if self._config.colocate_replay_and_learners
+                    and self._config.num_cpus_per_runner
+                    else None
+                ),
                 reward_window_episodes=self._reward_window_episodes,
                 checkpoint_state=(
                     checkpoint_state.rollout if checkpoint_state is not None else None
@@ -239,9 +248,21 @@ class SingleMemberAsyncSAC:
                     self._codec,
                     member_id=self._config.member_id,
                     initial_weights=initial_weights,
+                    initial_weights_ref=self._rollout_group.published_weights_ref,
                     episode_count=self._config.evaluation_num_episodes,
                     max_episode_steps=self._config.max_episode_steps,
                     num_cpus_per_runner=(self._config.num_cpus_per_evaluation_runner),
+                    placement_group_bundle_start=(
+                        worker_bundle_start
+                        + (
+                            self._config.runner_count
+                            if self._config.num_cpus_per_runner
+                            else 0
+                        )
+                        if self._config.colocate_replay_and_learners
+                        and self._config.num_cpus_per_evaluation_runner
+                        else None
+                    ),
                     checkpoint_state=(
                         checkpoint_state.evaluation
                         if checkpoint_state is not None
@@ -312,6 +333,7 @@ class SingleMemberAsyncSAC:
         *,
         replay_actor: Any,
         reward_window_episodes: int = 100,
+        worker_bundle_start: int = 2,
     ) -> SingleMemberAsyncSAC:
         """Restore one member state transferred independently of replay."""
 
@@ -323,6 +345,7 @@ class SingleMemberAsyncSAC:
             replay_actor=replay_actor,
             member_checkpoint_state=checkpoint_state,
             reward_window_episodes=reward_window_episodes,
+            worker_bundle_start=worker_bundle_start,
         )
 
     @classmethod
@@ -334,6 +357,7 @@ class SingleMemberAsyncSAC:
         *,
         replay_actor: Any,
         reward_window_episodes: int,
+        worker_bundle_start: int = 2,
     ) -> SingleMemberAsyncSAC:
         """Create one fresh generation from model-only donor state."""
 
@@ -343,6 +367,7 @@ class SingleMemberAsyncSAC:
             replay_actor=replay_actor,
             pbt_state=pbt_state,
             reward_window_episodes=reward_window_episodes,
+            worker_bundle_start=worker_bundle_start,
         )
 
     @classmethod
@@ -365,7 +390,7 @@ class SingleMemberAsyncSAC:
             raise TypeError("checkpoint_state must be RuntimeCheckpointState")
         if checkpoint_state.member_id != runtime_config.member_id:
             raise ValueError("runtime checkpoint member_id does not match")
-        if checkpoint_state.runtime_config != asdict(runtime_config):
+        if not runtime_config.matches_checkpoint(checkpoint_state.runtime_config):
             raise ValueError("runtime checkpoint configuration does not match")
         timeout_s = (
             runtime_config.shutdown_timeout_s if timeout_s is None else timeout_s
@@ -415,6 +440,7 @@ class SingleMemberAsyncSAC:
         return LearnerHostActor.options(
             num_cpus=runtime_config.num_cpus_per_learner,
             num_gpus=runtime_config.num_gpus_per_learner,
+            **runtime_config.core_actor_options(),
         ).remote(
             sac_config,
             spaces,
@@ -426,6 +452,8 @@ class SingleMemberAsyncSAC:
             batch_queue_capacity=runtime_config.batch_queue_capacity,
             batch_seed=runtime_config.seed,
             replay_sync_max_bytes=runtime_config.replay_sync_max_bytes,
+            replay_sync_interval_s=runtime_config.replay_sync_interval_s,
+            validate_startup=runtime_config.validate_startup,
             checkpoint_state=checkpoint_state,
             allow_replay_ahead_on_restore=allow_replay_ahead_on_restore,
             pbt_state=pbt_state,
@@ -451,7 +479,10 @@ class SingleMemberAsyncSAC:
             if self._restored:
                 self._maybe_start_evaluation()
             else:
-                self._evaluation_group.start_round(self._latest_weights)
+                self._evaluation_group.start_round(
+                    self._latest_weights,
+                    weights_ref=self._rollout_group.published_weights_ref,
+                )
                 self._next_evaluation_env_steps = (
                     self._config.evaluation_interval_env_steps
                 )
@@ -826,7 +857,7 @@ class SingleMemberAsyncSAC:
             self._finish_learner_tick(timeout_s=self._remaining(deadline))
             if self._evaluation_group is not None:
                 self._evaluation_group.drain(timeout_s=self._remaining(deadline))
-            rollout = self._rollout_group.get_stats()
+            rollout = self._rollout_group
             remaining_updates = self._remaining_learner_update_budget(rollout)
             tick = ray.get(
                 self._learner_actor.drain.remote(
@@ -892,11 +923,12 @@ class SingleMemberAsyncSAC:
         if (
             self._state is not RuntimeState.RUNNING
             or self._pending_learner_tick is not None
+            or time.monotonic() < self._next_learner_tick_at
         ):
             return
         assert self._learner_actor is not None
         assert self._rollout_group is not None
-        rollout = self._rollout_group.get_stats()
+        rollout = self._rollout_group
         remaining_updates = self._remaining_learner_update_budget(rollout)
         if remaining_updates == 0:
             return
@@ -938,6 +970,9 @@ class SingleMemberAsyncSAC:
         ):
             raise RuntimeError("learner actor returned an invalid update count")
         self._learner_updates_completed += tick.updates_performed
+        if not math.isfinite(tick.retry_after_s) or tick.retry_after_s < 0:
+            raise RuntimeError("learner actor returned an invalid retry interval")
+        self._next_learner_tick_at = time.monotonic() + tick.retry_after_s
         if tick.published_weights is None:
             return
         assert self._rollout_group is not None
@@ -949,19 +984,22 @@ class SingleMemberAsyncSAC:
             return
         assert self._rollout_group is not None
         assert self._latest_weights is not None
-        env_steps = self._rollout_group.get_stats().env_steps
+        env_steps = self._rollout_group.env_steps
         if env_steps < self._next_evaluation_env_steps:
             return
-        self._evaluation_group.start_round(self._latest_weights)
+        self._evaluation_group.start_round(
+            self._latest_weights,
+            weights_ref=self._rollout_group.published_weights_ref,
+        )
         self._next_evaluation_env_steps = (
             env_steps + self._config.evaluation_interval_env_steps
         )
 
     def _record_pending_high_watermark(self) -> None:
         assert self._rollout_group is not None
-        rollout = self._rollout_group.get_stats()
+        rollout = self._rollout_group
         evaluation_pending = (
-            self._evaluation_group.get_stats().pending_calls
+            self._evaluation_group.pending_calls
             if self._evaluation_group is not None
             else 0
         )
@@ -978,9 +1016,9 @@ class SingleMemberAsyncSAC:
 
     def _controller_metrics(self) -> dict[str, Any]:
         assert self._rollout_group is not None
-        rollout = self._rollout_group.get_stats()
+        rollout = self._rollout_group
         evaluation_pending = (
-            self._evaluation_group.get_stats().pending_calls
+            self._evaluation_group.pending_calls
             if self._evaluation_group is not None
             else 0
         )
@@ -1311,6 +1349,21 @@ class AsyncSACTrainable(Trainable):
     ) -> PlacementGroupFactory:
         sac_config, runtime, shared_replay, _ = cls._parse_config(config)
         del sac_config
+        if runtime.colocate_replay_and_learners:
+            if shared_replay is not None:
+                raise ValueError(
+                    "shared replay colocation requires PopulationTrainable"
+                )
+            return PlacementGroupFactory(
+                [
+                    {"CPU": 1.0},
+                    cls._core_resource_bundle([runtime]),
+                    *cls._child_resource_bundles(
+                        runtime, include_replay=False, include_learner=False
+                    ),
+                ],
+                strategy="PACK",
+            )
         bundles = [
             {"CPU": 1.0},
             *cls._child_resource_bundles(
@@ -1321,10 +1374,24 @@ class AsyncSACTrainable(Trainable):
         return PlacementGroupFactory(bundles, strategy="PACK")
 
     @staticmethod
+    def _core_resource_bundle(
+        runtimes: Sequence[AsyncSACRuntimeConfig],
+    ) -> dict[str, float]:
+        resources = {
+            "CPU": runtimes[0].num_cpus_per_replay
+            + sum(runtime.num_cpus_per_learner for runtime in runtimes),
+            "GPU": sum(runtime.num_gpus_per_learner for runtime in runtimes),
+        }
+        if not any(resources.values()):
+            raise ValueError("colocation requires non-zero core resources")
+        return {name: value for name, value in resources.items() if value}
+
+    @staticmethod
     def _child_resource_bundles(
         runtime: AsyncSACRuntimeConfig,
         *,
         include_replay: bool,
+        include_learner: bool = True,
     ) -> list[dict[str, float]]:
         bundles: list[dict[str, float]] = []
 
@@ -1339,10 +1406,11 @@ class AsyncSACTrainable(Trainable):
 
         if include_replay:
             add_bundle(cpu=runtime.num_cpus_per_replay)
-        add_bundle(
-            cpu=runtime.num_cpus_per_learner,
-            gpu=runtime.num_gpus_per_learner,
-        )
+        if include_learner:
+            add_bundle(
+                cpu=runtime.num_cpus_per_learner,
+                gpu=runtime.num_gpus_per_learner,
+            )
         for _ in range(runtime.runner_count):
             add_bundle(cpu=runtime.num_cpus_per_runner)
         for _ in range(runtime.evaluation_num_episodes):

@@ -172,7 +172,7 @@ def test_async_rollout_has_no_episode_barrier_and_tracks_weight_lag(
             for completion in completions
         )
 
-        duplicate = ray.get(replay.commit_episode.remote(first.episode))
+        duplicate = ray.get(replay.commit_episode.remote(first.episode_ref))
         assert not duplicate.committed and duplicate.duplicate
         replay_stats = ray.get(replay.get_stats.remote())
         assert replay_stats.duplicate_commits == 1

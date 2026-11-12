@@ -77,9 +77,17 @@ class BatchProducerStats:
 class FlatBatchCollator:
     """Stack flat numeric mapping transitions into contiguous NumPy columns."""
 
+    def __init__(self, *, validate: bool = True) -> None:
+        self._validate = validate
+
     def collate(self, transitions: Sequence[object]) -> FlatBatch:
         if not transitions:
             raise BatchCollationError("collation requires at least one transition")
+        if not self._validate:
+            return {
+                key: np.ascontiguousarray(np.stack([row[key] for row in transitions]))
+                for key in transitions[0]
+            }
         first = transitions[0]
         if not isinstance(first, Mapping):
             raise BatchCollationError("every flat transition must be a mapping")
@@ -134,7 +142,9 @@ class MultiModuleBatchCollator:
         self,
         *,
         expected_module_ids: Sequence[str] | None = None,
+        validate_startup: bool = False,
     ) -> None:
+        self._validate_next_batch = validate_startup
         if expected_module_ids is None:
             self._expected_module_ids = None
             return
@@ -171,11 +181,13 @@ class MultiModuleBatchCollator:
             module_ids = self._expected_module_ids
         else:
             module_ids = tuple(sorted(grouped))
-        flat_collator = FlatBatchCollator()
-        return {
+        flat_collator = FlatBatchCollator(validate=self._validate_next_batch)
+        batch = {
             module_id: flat_collator.collate(grouped[module_id])
             for module_id in module_ids
         }
+        self._validate_next_batch = False
+        return batch
 
 
 class BatchProducer(Generic[BatchT]):

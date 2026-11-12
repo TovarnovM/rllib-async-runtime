@@ -32,6 +32,7 @@ class GraphEncoderConfig(ModelConfig):
     edge_feature_dim: int = 0
     hidden_dim: int = 32
     message_layers: int = 2
+    validate_startup: bool = False
 
     @property
     def output_dims(self) -> tuple[int, ...]:
@@ -53,6 +54,8 @@ class GraphEncoderConfig(ModelConfig):
             or self.edge_feature_dim < 0
         ):
             raise ValueError("edge_feature_dim must be a non-negative integer")
+        if not isinstance(self.validate_startup, bool):
+            raise TypeError("validate_startup must be a bool")
         return TorchGraphEncoder(self)
 
 
@@ -62,6 +65,7 @@ class TorchGraphEncoder(TorchModel, Encoder):
     def __init__(self, config: GraphEncoderConfig) -> None:
         TorchModel.__init__(self, config)
         Encoder.__init__(self, config)
+        self._validate_next_batch = config.validate_startup
         self.node_projection = torch.nn.Linear(
             config.node_feature_dim,
             config.hidden_dim,
@@ -94,6 +98,7 @@ class TorchGraphEncoder(TorchModel, Encoder):
         if not isinstance(observations, Mapping):
             raise ValueError("graph encoder observations must be a mapping")
         packed = self._packed_tensors(observations)
+        self._validate_next_batch = False
         node_features = packed[NODE_FEATURES]
         edge_index = packed[EDGE_INDEX]
         graph_ptr = packed["graph_ptr"]
@@ -138,6 +143,7 @@ class TorchGraphEncoder(TorchModel, Encoder):
                 device=hidden.device,
             ),
             graph_lengths,
+            output_size=len(hidden),
         )
         pooled = torch.zeros(
             (len(graph_lengths), hidden.shape[1]),
@@ -186,38 +192,43 @@ class TorchGraphEncoder(TorchModel, Encoder):
             dtype=torch.long,
             device=device,
         )
-        if (
-            nodes.ndim != 2
-            or nodes.shape[1] != self.config.node_feature_dim
-            or edges.ndim != 2
-            or edges.shape[0] != 2
-            or graph_ptr.ndim != 1
-            or len(graph_ptr) < 2
-            or controlled.shape != (len(graph_ptr) - 1,)
-        ):
-            raise ValueError("invalid packed graph tensor shapes")
-        if (
-            graph_ptr[0].item() != 0
-            or graph_ptr[-1].item() != len(nodes)
-            or torch.any(graph_ptr[1:] <= graph_ptr[:-1])
-        ):
-            raise ValueError("graph_ptr must delimit non-empty packed graphs")
-        if edges.shape[1] and (torch.any(edges < 0) or torch.any(edges >= len(nodes))):
-            raise ValueError("edge_index references an unknown packed node")
-        if edges.shape[1]:
-            edge_graph_ids = torch.bucketize(
-                edges,
-                graph_ptr[1:],
-                right=True,
-            )
-            if torch.any(edge_graph_ids[0] != edge_graph_ids[1]):
-                raise ValueError("edge_index cannot connect different packed graphs")
-        if torch.any(controlled < graph_ptr[:-1]) or torch.any(
-            controlled >= graph_ptr[1:]
-        ):
-            raise ValueError("controlled_node is outside its packed graph")
-        if not torch.isfinite(nodes).all():
-            raise ValueError("node_features must be finite")
+        if self._validate_next_batch:
+            if (
+                nodes.ndim != 2
+                or nodes.shape[1] != self.config.node_feature_dim
+                or edges.ndim != 2
+                or edges.shape[0] != 2
+                or graph_ptr.ndim != 1
+                or len(graph_ptr) < 2
+                or controlled.shape != (len(graph_ptr) - 1,)
+            ):
+                raise ValueError("invalid packed graph tensor shapes")
+            if (
+                graph_ptr[0].item() != 0
+                or graph_ptr[-1].item() != len(nodes)
+                or torch.any(graph_ptr[1:] <= graph_ptr[:-1])
+            ):
+                raise ValueError("graph_ptr must delimit non-empty packed graphs")
+            if edges.shape[1] and (
+                torch.any(edges < 0) or torch.any(edges >= len(nodes))
+            ):
+                raise ValueError("edge_index references an unknown packed node")
+            if edges.shape[1]:
+                edge_graph_ids = torch.bucketize(
+                    edges,
+                    graph_ptr[1:],
+                    right=True,
+                )
+                if torch.any(edge_graph_ids[0] != edge_graph_ids[1]):
+                    raise ValueError(
+                        "edge_index cannot connect different packed graphs"
+                    )
+            if torch.any(controlled < graph_ptr[:-1]) or torch.any(
+                controlled >= graph_ptr[1:]
+            ):
+                raise ValueError("controlled_node is outside its packed graph")
+            if not torch.isfinite(nodes).all():
+                raise ValueError("node_features must be finite")
 
         packed = {
             NODE_FEATURES: nodes,
@@ -232,12 +243,12 @@ class TorchGraphEncoder(TorchModel, Encoder):
                 dtype=torch.float32,
                 device=device,
             )
-            if edge_features.shape != (
+            if self._validate_next_batch and edge_features.shape != (
                 edges.shape[1],
                 self.config.edge_feature_dim,
             ):
                 raise ValueError("edge_features do not align with packed edges")
-            if not torch.isfinite(edge_features).all():
+            if self._validate_next_batch and not torch.isfinite(edge_features).all():
                 raise ValueError("edge_features must be finite")
             packed[EDGE_FEATURES] = edge_features
         elif edge_features_raw is not None:
@@ -282,27 +293,28 @@ class TorchGraphEncoder(TorchModel, Encoder):
         edge_counts = edge_counts.reshape(-1)
         controlled = controlled.reshape(-1)
         batch_size = nodes.shape[0]
-        if (
-            nodes.ndim != 3
-            or nodes.shape[2] != self.config.node_feature_dim
-            or edges.ndim != 3
-            or edges.shape[:2] != (batch_size, 2)
-            or node_counts.shape != (batch_size,)
-            or edge_counts.shape != (batch_size,)
-            or controlled.shape != (batch_size,)
-        ):
-            raise ValueError("invalid padded graph tensor shapes")
-        if not torch.isfinite(nodes).all():
-            raise ValueError("padded node_features must be finite")
-        if (
-            torch.any(node_counts < 1)
-            or torch.any(node_counts > nodes.shape[1])
-            or torch.any(edge_counts < 0)
-            or torch.any(edge_counts > edges.shape[2])
-            or torch.any(controlled < 0)
-            or torch.any(controlled >= node_counts)
-        ):
-            raise ValueError("invalid padded graph counts or controlled nodes")
+        if self._validate_next_batch:
+            if (
+                nodes.ndim != 3
+                or nodes.shape[2] != self.config.node_feature_dim
+                or edges.ndim != 3
+                or edges.shape[:2] != (batch_size, 2)
+                or node_counts.shape != (batch_size,)
+                or edge_counts.shape != (batch_size,)
+                or controlled.shape != (batch_size,)
+            ):
+                raise ValueError("invalid padded graph tensor shapes")
+            if not torch.isfinite(nodes).all():
+                raise ValueError("padded node_features must be finite")
+            if (
+                torch.any(node_counts < 1)
+                or torch.any(node_counts > nodes.shape[1])
+                or torch.any(edge_counts < 0)
+                or torch.any(edge_counts > edges.shape[2])
+                or torch.any(controlled < 0)
+                or torch.any(controlled >= node_counts)
+            ):
+                raise ValueError("invalid padded graph counts or controlled nodes")
 
         edge_features = None
         if self.config.edge_feature_dim:
@@ -313,33 +325,33 @@ class TorchGraphEncoder(TorchModel, Encoder):
             )
             if edge_features.ndim == 2:
                 edge_features = edge_features.unsqueeze(0)
-            if edge_features.shape != (
+            if self._validate_next_batch and edge_features.shape != (
                 batch_size,
                 edges.shape[2],
                 self.config.edge_feature_dim,
             ):
                 raise ValueError("invalid padded edge_features shape")
-            if not torch.isfinite(edge_features).all():
+            if self._validate_next_batch and not torch.isfinite(edge_features).all():
                 raise ValueError("padded edge_features must be finite")
 
         node_parts: list[torch.Tensor] = []
         edge_parts: list[torch.Tensor] = []
         edge_feature_parts: list[torch.Tensor] = []
-        global_controlled: list[int] = []
         graph_ptr = [0]
         for batch_index, (node_count, edge_count) in enumerate(
             zip(node_counts.tolist(), edge_counts.tolist(), strict=True)
         ):
             node_part = nodes[batch_index, :node_count]
             edge_part = edges[batch_index, :, :edge_count]
-            if edge_count and (
-                torch.any(edge_part < 0) or torch.any(edge_part >= node_count)
+            if (
+                self._validate_next_batch
+                and edge_count
+                and (torch.any(edge_part < 0) or torch.any(edge_part >= node_count))
             ):
                 raise ValueError("padded edge_index references a padded node")
             offset = graph_ptr[-1]
             node_parts.append(node_part)
             edge_parts.append(edge_part + offset)
-            global_controlled.append(offset + int(controlled[batch_index]))
             graph_ptr.append(offset + node_count)
             if edge_features is not None:
                 edge_feature_parts.append(edge_features[batch_index, :edge_count])
@@ -351,11 +363,8 @@ class TorchGraphEncoder(TorchModel, Encoder):
                 dtype=torch.long,
                 device=device,
             ),
-            CONTROLLED_NODE: torch.tensor(
-                global_controlled,
-                dtype=torch.long,
-                device=device,
-            ),
+            CONTROLLED_NODE: controlled
+            + torch.tensor(graph_ptr[:-1], dtype=torch.long, device=device),
         }
         if edge_features is not None:
             packed[EDGE_FEATURES] = torch.cat(edge_feature_parts, dim=0)
@@ -450,4 +459,5 @@ class SharedGraphSACCatalog(SACCatalog):
             edge_feature_dim=edge_feature_dim,
             hidden_dim=hidden_dims[-1],
             message_layers=len(hidden_dims),
+            validate_startup=model_config_dict.get("validate_startup", False),
         )
