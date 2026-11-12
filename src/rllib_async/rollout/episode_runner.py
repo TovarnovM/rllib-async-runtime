@@ -80,6 +80,39 @@ class EpisodeRolloutResult:
 
 
 @dataclass(frozen=True, slots=True)
+class EpisodeMetadata:
+    """Small rollout provenance; the replay payload travels separately."""
+
+    episode_id: str
+    runner_id: str
+    runner_generation: int
+    behavior_versions: FrozenVersions
+    env_steps: int
+    agent_steps: int
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeRolloutSummary:
+    episode: EpisodeMetadata
+    metrics: EpisodeRolloutMetrics
+
+    @classmethod
+    def from_result(cls, result: EpisodeRolloutResult) -> EpisodeRolloutSummary:
+        episode = result.episode
+        return cls(
+            EpisodeMetadata(
+                episode.episode_id,
+                episode.runner_id,
+                episode.runner_generation,
+                FrozenVersions(episode.behavior_versions),
+                episode.env_steps,
+                episode.agent_steps,
+            ),
+            result.metrics,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _TimeLimitedEnvCreator:
     creator: Callable[[Mapping[str, Any]], gym.Env]
     max_episode_steps: int
@@ -265,7 +298,7 @@ class EpisodeRunner:
                 WEIGHTS_SEQ_NO: version,
             }
         )
-        self._weights = copy.deepcopy(weights)
+        self._weights = weights
         return True
 
     def collect_episode(

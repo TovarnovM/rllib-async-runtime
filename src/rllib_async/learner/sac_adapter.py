@@ -222,7 +222,22 @@ class CheckpointableSACTorchLearner(SACTorchLearner):
         return validated
 
 
-def _build_sac_sample_batch(batch: Mapping[str, Any]) -> SampleBatch:
+def _build_sac_sample_batch(
+    batch: Mapping[str, Any], *, validate: bool = True
+) -> SampleBatch:
+    if not validate:
+        columns = dict(batch)
+        batch_size = len(columns[Columns.REWARDS])
+        columns[Columns.REWARDS] = np.ascontiguousarray(
+            columns[Columns.REWARDS], dtype=np.float32
+        )
+        for name, dtype in (("n_step", np.int64), ("weights", np.float32)):
+            columns[name] = (
+                np.ascontiguousarray(columns[name], dtype=dtype)
+                if name in columns
+                else np.ones(batch_size, dtype=dtype)
+            )
+        return SampleBatch(columns)
     if not isinstance(batch, Mapping):
         raise SACBatchError("SAC batch must be a mapping")
     missing = set(_REQUIRED_BATCH_COLUMNS) - set(batch)
@@ -355,10 +370,12 @@ def _validate_graph_observation_pair(
             )
 
 
-def build_rllib_sac_batch(batch: Mapping[str, Any]) -> MultiAgentBatch:
+def build_rllib_sac_batch(
+    batch: Mapping[str, Any], *, validate: bool = True
+) -> MultiAgentBatch:
     """Validate one NumPy transition batch and build RLlib's exact SAC input."""
 
-    sample_batch = _build_sac_sample_batch(batch)
+    sample_batch = _build_sac_sample_batch(batch, validate=validate)
     return MultiAgentBatch(
         {DEFAULT_MODULE_ID: sample_batch},
         env_steps=sample_batch.count,
@@ -367,6 +384,8 @@ def build_rllib_sac_batch(batch: Mapping[str, Any]) -> MultiAgentBatch:
 
 def build_rllib_multi_module_sac_batch(
     batches: Mapping[str, Mapping[str, Any]],
+    *,
+    validate: bool = True,
 ) -> MultiAgentBatch:
     """Validate independent batches for one heterogeneous MultiRLModule."""
 
@@ -375,7 +394,7 @@ def build_rllib_multi_module_sac_batch(
     if any(not isinstance(module_id, str) or not module_id for module_id in batches):
         raise SACBatchError("module IDs must be non-empty strings")
     sample_batches = {
-        module_id: _build_sac_sample_batch(batch)
+        module_id: _build_sac_sample_batch(batch, validate=validate)
         for module_id, batch in batches.items()
     }
     return MultiAgentBatch(
@@ -395,7 +414,11 @@ class SACLearnerAdapter:
         member_id: str,
         publication_interval_updates: int,
         learning_starts_satisfied: bool = False,
+        validate_startup: bool = False,
     ) -> None:
+        if not isinstance(validate_startup, bool):
+            raise TypeError("validate_startup must be a bool")
+        self._validate_next_batch = validate_startup
         if not isinstance(config, SACConfig):
             raise TypeError("config must be an SACConfig")
         if not isinstance(member_id, str) or not member_id:
@@ -509,8 +532,10 @@ class SACLearnerAdapter:
                 sampled_env_steps=sampled_env_steps,
                 sampled_agent_steps=sampled_agent_steps,
             )
+        rllib_batch = build_rllib_sac_batch(batch, validate=self._validate_next_batch)
+        self._validate_next_batch = False
         return self._perform_update(
-            build_rllib_sac_batch(batch),
+            rllib_batch,
             sampled_env_steps=sampled_env_steps,
             sampled_agent_steps=sampled_agent_steps,
         )
@@ -540,8 +565,12 @@ class SACLearnerAdapter:
                 sampled_env_steps=sampled_env_steps,
                 sampled_agent_steps=sampled_agent_steps,
             )
+        rllib_batch = build_rllib_multi_module_sac_batch(
+            batches, validate=self._validate_next_batch
+        )
+        self._validate_next_batch = False
         return self._perform_update(
-            build_rllib_multi_module_sac_batch(batches),
+            rllib_batch,
             sampled_env_steps=sampled_env_steps,
             sampled_agent_steps=sampled_agent_steps,
         )
@@ -918,7 +947,7 @@ class SACLearnerAdapter:
             module_versions=module_versions,
             learner_updates=learner_updates,
             published_at_monotonic=time.monotonic(),
-            state=copy.deepcopy(state),
+            state=state,
         )
 
     def _get_inference_module_state(self) -> dict[str, Any]:

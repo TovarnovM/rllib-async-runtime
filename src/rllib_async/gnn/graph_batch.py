@@ -26,13 +26,18 @@ MultiModuleGraphBatch: TypeAlias = dict[str, GraphModuleBatch]
 
 def pack_graph_observations(
     observations: Sequence[object],
+    *,
+    validate: bool = True,
 ) -> GraphBatch:
     """Pack validated ego-graphs without padding or copied per-graph models."""
 
     if not observations:
         raise BatchCollationError("graph collation requires at least one observation")
     try:
-        graphs = [normalize_graph_observation(item) for item in observations]
+        graphs = (
+            [normalize_graph_observation(item) for item in observations]
+            if validate else observations
+        )
     except ValueError as error:
         raise BatchCollationError(str(error)) from error
 
@@ -96,7 +101,7 @@ def pack_graph_observations(
             np.stack(masks, axis=0),
             dtype=np.float32,
         )
-    return validate_packed_graph_batch(packed)
+    return validate_packed_graph_batch(packed) if validate else packed
 
 
 def validate_packed_graph_batch(batch: object) -> GraphBatch:
@@ -207,10 +212,13 @@ class GraphBatchCollator:
         self,
         *,
         module_id: str,
+        validate_startup: bool = False,
     ) -> None:
         if not isinstance(module_id, str) or not module_id:
             raise ValueError("module_id must be a non-empty string")
         self._module_id = module_id
+        self._validate_next_batch = validate_startup
+        self._scalar_collator = FlatBatchCollator(validate=False)
 
     def collate(self, transitions: Sequence[object]) -> MultiModuleGraphBatch:
         if not transitions:
@@ -228,8 +236,8 @@ class GraphBatchCollator:
             validated.append(transition)
         return {self._module_id: self._collate_module(validated)}
 
-    @staticmethod
     def _collate_module(
+        self,
         transitions: Sequence[MultiModuleTransition],
     ) -> GraphModuleBatch:
         observations = [item.data[Columns.OBS] for item in transitions]
@@ -242,9 +250,14 @@ class GraphBatchCollator:
             }
             for item in transitions
         ]
-        batch: GraphModuleBatch = FlatBatchCollator().collate(scalar_rows)
-        batch[Columns.OBS] = pack_graph_observations(observations)
-        batch[Columns.NEXT_OBS] = pack_graph_observations(next_observations)
+        batch: GraphModuleBatch = self._scalar_collator.collate(scalar_rows)
+        batch[Columns.OBS] = pack_graph_observations(
+            observations, validate=self._validate_next_batch
+        )
+        batch[Columns.NEXT_OBS] = pack_graph_observations(
+            next_observations, validate=self._validate_next_batch
+        )
+        self._validate_next_batch = False
         return batch
 
 

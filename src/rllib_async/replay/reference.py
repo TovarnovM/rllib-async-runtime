@@ -282,6 +282,9 @@ class EpisodeStore:
                 has_more=False,
             )
 
+        if cursor == self.cursor:
+            return ReplayDelta(cursor, cursor, (), False, False)
+
         pending = [
             transaction
             for transaction in self._journal

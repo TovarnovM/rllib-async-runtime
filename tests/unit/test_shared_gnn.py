@@ -318,6 +318,7 @@ def test_packed_graph_batch_rejects_cross_graph_edges() -> None:
 
     encoder = TorchGraphEncoder(
         GraphEncoderConfig(
+            validate_startup=True,
             node_feature_dim=4,
             hidden_dim=8,
             message_layers=1,
@@ -358,3 +359,24 @@ def test_graph_encoder_batches_graphs_and_backpropagates() -> None:
     assert torch.isfinite(output).all()
     assert encoder.node_projection.weight.grad is not None
     assert torch.count_nonzero(encoder.node_projection.weight.grad) > 0
+
+
+@pytest.mark.parametrize("validate_startup", [False, True])
+def test_graph_encoder_scans_contents_only_at_opted_in_startup(monkeypatch, validate_startup) -> None:
+    encoder = TorchGraphEncoder(GraphEncoderConfig(node_feature_dim=4, validate_startup=validate_startup))
+    batch = {
+        NODE_FEATURES: np.zeros((2, 4), dtype=np.float32),
+        EDGE_INDEX: np.empty((2, 0), dtype=np.int64),
+        "graph_ptr": np.asarray([0, 2], dtype=np.int64),
+        CONTROLLED_NODE: np.asarray([0], dtype=np.int64),
+    }
+    calls = []
+    original = torch.isfinite
+    def finite(value):
+        calls.append(value)
+        return original(value)
+    monkeypatch.setattr(torch, "isfinite", finite)
+    encoder({Columns.OBS: batch})
+    assert len(calls) == int(validate_startup)
+    encoder({Columns.OBS: batch})
+    assert len(calls) == int(validate_startup)

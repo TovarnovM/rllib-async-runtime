@@ -77,6 +77,7 @@ class ReplayStats:
     rejected_commits: int
     conflicting_commits: int
     evicted_episodes: int
+    node_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)

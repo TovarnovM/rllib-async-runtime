@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import ray
 
 from rllib_async.protocols.episodes import EpisodeCodec, EpisodeEnvelope
@@ -52,7 +54,9 @@ class ReplayActor:
         return self._store.get_snapshot(max_bytes=max_bytes)
 
     def get_stats(self) -> ReplayStats:
-        return self._store.get_stats()
+        return replace(
+            self._store.get_stats(), node_id=ray.get_runtime_context().get_node_id()
+        )
 
     def save_snapshot(self, path: str) -> ReplayCheckpoint:
         return write_replay_checkpoint(path, self._store.export_state())

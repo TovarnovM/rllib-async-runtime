@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pickle
-from dataclasses import replace
+from dataclasses import make_dataclass, replace
 
 import pytest
 
@@ -109,3 +109,32 @@ def test_envelope_requires_a_completed_episode_and_behavior_version() -> None:
         replace(episode, terminated=False, truncated=False)
     with pytest.raises(EpisodeValidationError, match="must not be empty"):
         replace(episode, behavior_versions=FrozenVersions({}))
+
+
+def test_cached_payload_size_preserves_legacy_pickle_and_fingerprint(monkeypatch) -> None:
+    import rllib_async.protocols.episodes as module
+
+    current_type = module.FlatEpisodePayload
+    legacy_type = make_dataclass(
+        "FlatEpisodePayload",
+        [("encoded_transitions", tuple[bytes, ...])],
+        frozen=True,
+        slots=True,
+        namespace={"__module__": module.__name__},
+    )
+    transitions = (pickle.dumps({"value": 1}), pickle.dumps({"value": 2}))
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "FlatEpisodePayload", legacy_type)
+        legacy_bytes = pickle.dumps(legacy_type(transitions), protocol=5)
+    restored = pickle.loads(legacy_bytes)
+    assert isinstance(restored, current_type)
+    assert restored.estimated_bytes == sum(map(len, transitions))
+    assert pickle.dumps(restored, protocol=5) == legacy_bytes
+
+    # A cached read must not touch the encoded transition sequence again.
+    class Unreadable:
+        def __iter__(self):
+            raise AssertionError("payload size was rescanned")
+
+    object.__setattr__(restored, "encoded_transitions", Unreadable())
+    assert restored.estimated_bytes == sum(map(len, transitions))

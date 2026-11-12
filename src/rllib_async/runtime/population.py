@@ -666,7 +666,7 @@ class PopulationLauncher:
                 raise TypeError(
                     "member_checkpoint_states must contain RuntimeCheckpointState"
                 )
-            if state.runtime_config != asdict(member.runtime_config):
+            if not member.runtime_config.matches_checkpoint(state.runtime_config):
                 raise ValueError(
                     f"checkpoint configuration for {member_id!r} does not match"
                 )
@@ -694,6 +694,8 @@ class PopulationLauncher:
         if self._replay_actor is not None:
             return
         runtime = self._members[0].runtime_config
+        if runtime.colocate_replay_and_learners:
+            raise ValueError("shared replay colocation requires PopulationTrainable")
         actor = ReplayActor.options(
             name=self._descriptor.actor_name,
             namespace=self._descriptor.namespace,
@@ -1143,7 +1145,7 @@ class PopulationAsyncSAC:
                 raise InvalidPopulationCheckpointError(
                     f"PBT checkpoint is missing member {slot_id!r}"
                 )
-            if checkpoint_state.runtime_config != asdict(runtime_config):
+            if not runtime_config.matches_checkpoint(checkpoint_state.runtime_config):
                 raise ValueError(
                     f"exact resume runtime config for {slot_id!r} does not match"
                 )
@@ -1271,6 +1273,7 @@ class PopulationAsyncSAC:
         try:
             self._replay_actor = ReplayActor.options(
                 num_cpus=replay_config.num_cpus_per_replay,
+                **replay_config.core_actor_options(),
             ).remote(
                 FlatEpisodeCodec(),
                 capacity_transitions=replay_config.replay_capacity_transitions,
@@ -1310,6 +1313,7 @@ class PopulationAsyncSAC:
                             self._checkpoint_member_states[slot_id],
                             replay_actor=self._replay_actor,
                             reward_window_episodes=reward_window_episodes,
+                            worker_bundle_start=self._worker_bundle_start(slot_id),
                         )
                     )
                 elif (
@@ -1331,6 +1335,7 @@ class PopulationAsyncSAC:
                         pbt_state,
                         replay_actor=self._replay_actor,
                         reward_window_episodes=reward_window_episodes,
+                            worker_bundle_start=self._worker_bundle_start(slot_id),
                     )
                 else:
                     self._members[slot_id] = SingleMemberAsyncSAC(
@@ -1338,6 +1343,7 @@ class PopulationAsyncSAC:
                         member.runtime_config,
                         replay_actor=self._replay_actor,
                         reward_window_episodes=reward_window_episodes,
+                            worker_bundle_start=self._worker_bundle_start(slot_id),
                     )
             self._checkpoint_member_states = None
             self._warm_start_source_states = None
@@ -1856,6 +1862,18 @@ class PopulationAsyncSAC:
             new_value,
         )
 
+    def _worker_bundle_start(self, slot_id: str) -> int:
+        index = 2
+        for preceding in self._slot_ids:
+            if preceding == slot_id:
+                return index
+            runtime = self._member_specs[preceding].runtime_config
+            if runtime.num_cpus_per_runner:
+                index += runtime.runner_count
+            if runtime.num_cpus_per_evaluation_runner:
+                index += runtime.evaluation_num_episodes
+        raise KeyError(slot_id)
+
     def _replace_target(
         self,
         target_slot: str,
@@ -1894,6 +1912,7 @@ class PopulationAsyncSAC:
                 donor_state,
                 replay_actor=self.replay_actor,
                 reward_window_episodes=self._pbt_config.reward_window_episodes,
+                worker_bundle_start=self._worker_bundle_start(target_slot),
             )
             replacement.start()
         except Exception as error:
@@ -1999,6 +2018,21 @@ class PopulationTrainable(Trainable):
     ) -> PlacementGroupFactory:
         members, _, _, _, _, _ = cls._parse_config(config)
         bundles: list[dict[str, float]] = [{"CPU": 1.0}]
+        if members[0].runtime_config.colocate_replay_and_learners:
+            bundles.append(
+                AsyncSACTrainable._core_resource_bundle(
+                    [member.runtime_config for member in members]
+                )
+            )
+            for member in members:
+                bundles.extend(
+                    AsyncSACTrainable._child_resource_bundles(
+                        member.runtime_config,
+                        include_replay=False,
+                        include_learner=False,
+                    )
+                )
+            return PlacementGroupFactory(bundles, strategy="PACK")
         replay_cpu = members[0].runtime_config.num_cpus_per_replay
         if replay_cpu:
             bundles.append({"CPU": replay_cpu})

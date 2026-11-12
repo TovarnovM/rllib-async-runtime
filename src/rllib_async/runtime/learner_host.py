@@ -82,6 +82,7 @@ class LearnerHostTick:
     updates_skipped_learning_start: int
     published_weights: WeightsDescriptor | None
     learner_metrics: tuple[tuple[str, float], ...]
+    retry_after_s: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +141,8 @@ class LearnerHost:
         batch_queue_capacity: int,
         batch_seed: int,
         replay_sync_max_bytes: int,
+        replay_sync_interval_s: float = 0.0,
+        validate_startup: bool = False,
         checkpoint_state: Mapping[str, Any] | bytes | None = None,
         allow_replay_ahead_on_restore: bool = False,
         pbt_state: PBTModelState | None = None,
@@ -163,11 +166,21 @@ class LearnerHost:
             raise TypeError("allow_replay_ahead_on_restore must be a bool")
         if checkpoint_state is not None and pbt_state is not None:
             raise ValueError("learner host accepts only one restore source")
+        if (
+            isinstance(replay_sync_interval_s, bool)
+            or not isinstance(replay_sync_interval_s, int | float)
+            or not math.isfinite(replay_sync_interval_s)
+            or replay_sync_interval_s < 0
+        ):
+            raise ValueError("replay_sync_interval_s must be finite and non-negative")
 
         self._replay_actor = replay_actor
         self._codec = codec
         self._member_id = member_id
         self._sync_max_bytes = replay_sync_max_bytes
+        self._sync_interval_s = replay_sync_interval_s
+        self._next_sync_at = 0.0
+        self._sync_has_more = False
         self._batch_size = batch_size
         self._allow_replay_ahead_on_restore = allow_replay_ahead_on_restore
         self._fast_replay = FastReplay(codec)
@@ -186,12 +199,13 @@ class LearnerHost:
                 member_id=member_id,
                 publication_interval_updates=publication_interval_updates,
                 learning_starts_satisfied=learning_starts_satisfied,
+                validate_startup=validate_startup,
             )
             if pbt_state is not None:
                 self._adapter.load_pbt_state(pbt_state)
             self._producer = BatchProducer(
                 self._fast_replay,
-                FlatBatchCollator(),
+                FlatBatchCollator(validate=False),
                 batch_size=batch_size,
                 queue_capacity=batch_queue_capacity,
                 seed=batch_seed,
@@ -212,6 +226,7 @@ class LearnerHost:
         self._updates_skipped_learning_start = 0
         self._weight_publications = int(pbt_state is not None)
         self._last_learner_metrics: tuple[tuple[str, float], ...] = ()
+        self._last_learner_results: object = None
         self._update_times_ms: deque[float] = deque(maxlen=1_024)
         initial_weights = self._adapter.get_published_weights()
         self._latest_module_version = max(
@@ -263,14 +278,20 @@ class LearnerHost:
         ):
             raise ValueError("max_updates must be a positive integer")
         try:
-            transaction_count, has_more = self._sync_once()
-            return self._consume_available_batches(
+            transaction_count, has_more = self._sync_once(respect_interval=True)
+            tick = self._consume_available_batches(
                 sampled_env_steps=sampled_env_steps,
                 sampled_agent_steps=sampled_agent_steps,
                 max_updates=max_updates,
                 synced_transactions=transaction_count,
                 sync_has_more=has_more,
             )
+            if not tick.updates_performed and not has_more:
+                tick = replace(
+                    tick,
+                    retry_after_s=max(self._next_sync_at - time.monotonic(), 0.0),
+                )
+            return tick
         except Exception:
             self._state = LearnerHostState.FAILED
             raise
@@ -378,6 +399,7 @@ class LearnerHost:
             else 0.0
         )
         producer = self._producer.get_stats()
+        self._refresh_learner_metrics()
         return LearnerHostStats(
             state=self._state,
             sync_requests=self._sync_requests,
@@ -429,6 +451,7 @@ class LearnerHost:
             raise LearnerHostError(
                 "learner-local replay must be fully materialized before checkpoint"
             )
+        self._refresh_learner_metrics()
         return {
             "state_version": LEARNER_HOST_CHECKPOINT_VERSION,
             "member_id": self._member_id,
@@ -468,7 +491,13 @@ class LearnerHost:
                 f"learner host shutdown failed: {errors[0]}"
             ) from errors[0]
 
-    def _sync_once(self) -> tuple[int, bool]:
+    def _sync_once(self, *, respect_interval: bool = False) -> tuple[int, bool]:
+        if (
+            respect_interval
+            and not self._sync_has_more
+            and time.monotonic() < self._next_sync_at
+        ):
+            return 0, False
         cursor = self._fast_replay.cursor
         if cursor is None:
             raise LearnerHostError("local replay has no synchronization cursor")
@@ -481,6 +510,8 @@ class LearnerHost:
         )
         if not isinstance(delta, ReplayDelta):
             raise LearnerHostError("replay actor returned an invalid delta")
+        self._next_sync_at = time.monotonic() + self._sync_interval_s
+        self._sync_has_more = delta.has_more
         if delta.full_resync_required:
             snapshot = ray.get(self._replay_actor.get_snapshot.remote())
             if not isinstance(snapshot, ReplaySnapshot):
@@ -488,6 +519,7 @@ class LearnerHost:
             self._fast_replay.load_snapshot(snapshot)
             self._snapshot_loads += 1
             self._full_resyncs += 1
+            self._sync_has_more = False
             return 0, False
         self._fast_replay.apply_delta(delta)
         transaction_count = len(delta.transactions)
@@ -544,7 +576,7 @@ class LearnerHost:
                     (time.monotonic() - update_started) * 1_000
                 )
                 updates_performed += 1
-                last_metrics = self._extract_numeric_metrics(update.learner_results)
+                self._last_learner_results = update.learner_results
             else:
                 skipped += 1
             if update.published_weights is not None:
@@ -691,6 +723,13 @@ class LearnerHost:
 
         visit(value, ())
         return tuple(sorted(metrics.items()))
+
+    def _refresh_learner_metrics(self) -> None:
+        if self._last_learner_results is not None:
+            self._last_learner_metrics = self._extract_numeric_metrics(
+                self._last_learner_results
+            )
+            self._last_learner_results = None
 
     @staticmethod
     def _percentile(values: tuple[float, ...] | deque[float], percentile: int) -> float:

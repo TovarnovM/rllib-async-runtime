@@ -10,7 +10,6 @@ import numpy as np
 from ray.rllib.core.columns import Columns
 
 from rllib_async.protocols.episodes import (
-    EncodedModuleTransition,
     EpisodeEnvelope,
     EpisodeValidationError,
     MultiModuleEpisodeCodec,
@@ -262,14 +261,6 @@ class GraphEpisodeCodec(MultiModuleEpisodeCodec):
                 "graph payload feature schema does not match the codec"
             )
         return episode.payload
-
-    def _decode(
-        self,
-        module_id: str,
-        transition: EncodedModuleTransition,
-    ) -> MultiModuleTransition:
-        decoded = MultiModuleEpisodeCodec._decode(module_id, transition)
-        return self._normalize_transition(decoded)
 
     def _normalize_transition(
         self,

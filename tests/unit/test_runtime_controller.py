@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -78,6 +79,7 @@ def make_scheduler_runtime(
     runtime._budget_updates_origin = 0
     runtime._learner_updates_completed = 0
     runtime._pending_learner_tick = None
+    runtime._next_learner_tick_at = 0.0
     learner = SchedulerLearnerActor()
     rollout = SchedulerRolloutGroup(env_steps=sampled_steps)
     runtime._learner_actor = learner
@@ -311,3 +313,19 @@ def test_force_stop_kills_learner_without_waiting_for_remote_shutdown(
     assert runtime.state is RuntimeState.STOPPED
     assert learner.stop.calls == []
     assert killed == [learner]
+
+
+def test_scheduler_uses_counters_and_respects_empty_replay_retry(monkeypatch) -> None:
+    runtime, learner, rollout = make_scheduler_runtime(
+        sampled_steps=100, batch_size=8, training_intensity=8
+    )
+    rollout.get_stats = Mock(side_effect=AssertionError("expensive stats in pump"))
+    clock = [10.0]
+    monkeypatch.setattr(controller_module.time, "monotonic", lambda: clock[0])
+    runtime._accept_learner_tick(replace(completed_tick(0), retry_after_s=0.05))
+    runtime._schedule_learner_tick()
+    assert learner.tick.calls == []
+    clock[0] += 0.05
+    runtime._schedule_learner_tick()
+    assert learner.tick.calls[-1]["max_updates"] == 4
+    rollout.get_stats.assert_not_called()

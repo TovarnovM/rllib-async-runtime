@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import math
 import time
 from collections import deque
@@ -15,6 +14,8 @@ import numpy as np
 import ray
 from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
 from ray.rllib.core import DEFAULT_MODULE_ID
+from ray.util import get_current_placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from rllib_async.protocols import (
     CommitAck,
@@ -24,8 +25,10 @@ from rllib_async.protocols import (
     WeightsDescriptor,
 )
 from rllib_async.rollout.episode_runner import (
+    EpisodeMetadata,
     EpisodeRolloutMetrics,
     EpisodeRolloutResult,
+    EpisodeRolloutSummary,
     EpisodeRunner,
     accept_weight_publication,
     make_episode_id,
@@ -49,10 +52,16 @@ class RolloutGroupState(str, Enum):
 class RolloutCompletion:
     """One replay acknowledgement with rollout provenance and lag."""
 
-    episode: EpisodeEnvelope
+    episode_ref: ray.ObjectRef
+    episode_metadata: EpisodeMetadata
     metrics: EpisodeRolloutMetrics
     acknowledgement: CommitAck
     policy_version_lag: int
+
+    @property
+    def episode(self) -> EpisodeEnvelope:
+        """Fetch payload only for callers explicitly requesting the full episode."""
+        return ray.get(self.episode_ref)
 
     def __post_init__(self) -> None:
         if (
@@ -133,6 +142,21 @@ class EpisodeRolloutActor:
     ) -> EpisodeRolloutResult:
         return self._runner.collect_episode(weights, explore=explore)
 
+    @ray.method(num_returns=2)
+    def collect_episode_refs(
+        self,
+        weights: WeightsDescriptor | None = None,
+        *,
+        explore: bool = True,
+    ) -> tuple[EpisodeEnvelope, EpisodeRolloutSummary]:
+        result = self._runner.collect_episode(weights, explore=explore)
+        return result.episode, EpisodeRolloutSummary.from_result(result)
+
+    def evaluate(self, weights: WeightsDescriptor | None = None) -> EpisodeRolloutSummary:
+        return EpisodeRolloutSummary.from_result(
+            self._runner.collect_episode(weights, explore=False)
+        )
+
     def close(self) -> None:
         self._runner.close()
 
@@ -140,7 +164,8 @@ class EpisodeRolloutActor:
 @dataclass(frozen=True, slots=True)
 class _PendingCommit:
     runner_id: str
-    result: EpisodeRolloutResult
+    result: EpisodeRolloutSummary
+    episode_ref: ray.ObjectRef
     policy_version_lag: int
 
 
@@ -162,6 +187,7 @@ class AsyncRolloutGroup:
         metrics_window: int = 2_048,
         reward_window_episodes: int = 100,
         num_cpus_per_runner: float = 1.0,
+        placement_group_bundle_start: int | None = None,
         explore: bool = True,
         checkpoint_state: Mapping[str, Any] | None = None,
     ) -> None:
@@ -231,7 +257,8 @@ class AsyncRolloutGroup:
         self._codec = codec
         self._replay_actor = replay_actor
         self._member_id = member_id
-        self._latest_weights = copy.deepcopy(initial_weights)
+        self._latest_weights = initial_weights
+        self._latest_weights_ref = ray.put(initial_weights)
         self._runner_count = runner_count
         self._max_episode_steps = max_episode_steps
         self._high_watermark = pending_commit_high_watermark
@@ -239,6 +266,7 @@ class AsyncRolloutGroup:
         self._metrics_window = metrics_window
         self._reward_window_episodes = reward_window_episodes
         self._num_cpus_per_runner = float(num_cpus_per_runner)
+        self._placement_group_bundle_start = placement_group_bundle_start
         self._explore = explore
         self._state = RolloutGroupState.CREATED
         self._runners: dict[str, Any] = {}
@@ -250,7 +278,7 @@ class AsyncRolloutGroup:
             f"runner-{index}": index + 1 for index in range(runner_count)
         }
         self._idle_runners = deque(self._runner_generations)
-        self._pending_samples: dict[ray.ObjectRef, str] = {}
+        self._pending_samples: dict[ray.ObjectRef, tuple[str, ray.ObjectRef]] = {}
         self._pending_commits: dict[ray.ObjectRef, _PendingCommit] = {}
         self._episodes_collected = 0
         self._episodes_committed = 0
@@ -363,8 +391,13 @@ class AsyncRolloutGroup:
             module_ids={DEFAULT_MODULE_ID},
         ):
             return False
-        self._latest_weights = copy.deepcopy(weights)
+        self._latest_weights_ref = ray.put(weights)
+        self._latest_weights = weights
         return True
+
+    @property
+    def published_weights_ref(self) -> ray.ObjectRef:
+        return self._latest_weights_ref
 
     def poll(
         self,
@@ -400,12 +433,14 @@ class AsyncRolloutGroup:
             refs,
             num_returns=1,
             timeout=timeout_s,
+            fetch_local=False,
         )
         if ready and max_events > 1 and remaining:
             additionally_ready, _ = ray.wait(
                 remaining,
                 num_returns=min(max_events - 1, len(remaining)),
                 timeout=0,
+                fetch_local=False,
             )
             ready.extend(additionally_ready)
         completions: list[RolloutCompletion] = []
@@ -425,7 +460,7 @@ class AsyncRolloutGroup:
         if runner_id not in self._runners:
             raise KeyError(runner_id)
         actor = self._runners[runner_id]
-        for ref, active_runner_id in tuple(self._pending_samples.items()):
+        for ref, (active_runner_id, _) in tuple(self._pending_samples.items()):
             if active_runner_id == runner_id:
                 self._pending_samples.pop(ref)
                 ray.cancel(ref)
@@ -441,6 +476,22 @@ class AsyncRolloutGroup:
         if self._state is RolloutGroupState.RUNNING:
             self._schedule_available()
         return self._runner_generations[runner_id]
+
+    @property
+    def env_steps(self) -> int:
+        return self._env_steps
+
+    @property
+    def agent_steps(self) -> int:
+        return self._agent_steps
+
+    @property
+    def pending_sample_calls(self) -> int:
+        return len(self._pending_samples)
+
+    @property
+    def pending_episode_commits(self) -> int:
+        return len(self._pending_commits)
 
     def get_stats(self) -> RolloutGroupStats:
         now = time.monotonic()
@@ -560,6 +611,7 @@ class AsyncRolloutGroup:
         self._pending_samples.clear()
         self._pending_commits.clear()
         self._idle_runners.clear()
+        self._latest_weights_ref = None
         self._state = RolloutGroupState.STOPPED
 
     def __enter__(self) -> AsyncRolloutGroup:
@@ -576,7 +628,16 @@ class AsyncRolloutGroup:
             runner_config.seed = int(runner_config.seed) + (
                 runner_generation * self._runner_count
             )
+        options = {}
+        if self._placement_group_bundle_start is not None:
+            options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                placement_group=get_current_placement_group(),
+                placement_group_bundle_index=(
+                    self._placement_group_bundle_start + self._worker_indices[runner_id] - 1
+                ),
+            )
         actor = EpisodeRolloutActor.options(
+            **options,
             num_cpus=self._num_cpus_per_runner,
         ).remote(
             runner_config,
@@ -585,7 +646,7 @@ class AsyncRolloutGroup:
             runner_id=runner_id,
             runner_generation=runner_generation,
             max_episode_steps=self._max_episode_steps,
-            initial_weights=self._latest_weights,
+            initial_weights=self._latest_weights_ref,
             worker_index=self._worker_indices[runner_id],
         )
         self._runner_weight_versions[runner_id] = FrozenVersions(
@@ -730,20 +791,20 @@ class AsyncRolloutGroup:
             runner_id = self._idle_runners.popleft()
             actor = self._runners[runner_id]
             weights = (
-                self._latest_weights
+                self._latest_weights_ref
                 if self._runner_weight_versions[runner_id]
                 != self._latest_weights.module_versions
                 else None
             )
-            ref = actor.collect_episode.remote(
+            episode_ref, ref = actor.collect_episode_refs.remote(
                 weights,
                 explore=self._explore,
             )
             if weights is not None:
                 self._runner_weight_versions[runner_id] = FrozenVersions(
-                    weights.module_versions
+                    self._latest_weights.module_versions
                 )
-            self._pending_samples[ref] = runner_id
+            self._pending_samples[ref] = (runner_id, episode_ref)
             self._sample_calls_started += 1
             self._outstanding_high_watermark = max(
                 self._outstanding_high_watermark,
@@ -753,7 +814,7 @@ class AsyncRolloutGroup:
             self._enter_backpressure()
 
     def _finish_sample(self, ref: ray.ObjectRef) -> None:
-        runner_id = self._pending_samples.pop(ref)
+        runner_id, episode_ref = self._pending_samples.pop(ref)
         try:
             result = ray.get(ref)
         except Exception as error:
@@ -761,7 +822,7 @@ class AsyncRolloutGroup:
             raise RolloutGroupError(
                 f"episode collection failed on {runner_id!r}"
             ) from error
-        if not isinstance(result, EpisodeRolloutResult):
+        if not isinstance(result, EpisodeRolloutSummary):
             self._sample_failures += 1
             raise RolloutGroupError("rollout actor returned an invalid result")
         if result.episode.runner_id != runner_id:
@@ -782,13 +843,14 @@ class AsyncRolloutGroup:
         self._episodes_since_metric_reset += 1
         self._idle_runners.append(runner_id)
         try:
-            commit_ref = self._replay_actor.commit_episode.remote(result.episode)
+            commit_ref = self._replay_actor.commit_episode.remote(episode_ref)
         except Exception as error:
             self._commit_failures += 1
             raise RolloutGroupError("could not submit episode commit") from error
         self._pending_commits[commit_ref] = _PendingCommit(
             runner_id=runner_id,
             result=result,
+            episode_ref=episode_ref,
             policy_version_lag=lag,
         )
 
@@ -809,13 +871,14 @@ class AsyncRolloutGroup:
         if acknowledgement.duplicate:
             self._duplicate_commits += 1
         return RolloutCompletion(
-            episode=pending.result.episode,
+            episode_ref=pending.episode_ref,
+            episode_metadata=pending.result.episode,
             metrics=pending.result.metrics,
             acknowledgement=acknowledgement,
             policy_version_lag=pending.policy_version_lag,
         )
 
-    def _policy_lag(self, episode: EpisodeEnvelope) -> int:
+    def _policy_lag(self, episode: EpisodeMetadata) -> int:
         latest = self._latest_weights.module_versions
         if set(episode.behavior_versions) != set(latest):
             raise RolloutGroupError("episode behavior module IDs do not match weights")

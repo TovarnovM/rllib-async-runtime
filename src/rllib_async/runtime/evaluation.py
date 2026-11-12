@@ -13,14 +13,19 @@ import numpy as np
 import ray
 from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
 from ray.rllib.core import DEFAULT_MODULE_ID
+from ray.util import get_current_placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from rllib_async.protocols import (
     FlatEpisodeCodec,
     FrozenVersions,
     WeightsDescriptor,
 )
-from rllib_async.rollout import EpisodeRolloutActor, EpisodeRolloutResult
-from rllib_async.rollout.episode_runner import accept_weight_publication
+from rllib_async.rollout import EpisodeRolloutActor
+from rllib_async.rollout.episode_runner import (
+    EpisodeRolloutSummary,
+    accept_weight_publication,
+)
 
 EVALUATION_GROUP_CHECKPOINT_VERSION = 1
 
@@ -87,6 +92,8 @@ class AsyncEvaluationGroup:
         max_episode_steps: int,
         num_cpus_per_runner: float = 1.0,
         checkpoint_state: Mapping[str, Any] | None = None,
+        initial_weights_ref: ray.ObjectRef | None = None,
+        placement_group_bundle_start: int | None = None,
     ) -> None:
         if not ray.is_initialized():
             raise RuntimeError("Ray must be initialized before AsyncEvaluationGroup")
@@ -126,7 +133,10 @@ class AsyncEvaluationGroup:
         self._episode_count = episode_count
         self._max_episode_steps = max_episode_steps
         self._num_cpus_per_runner = float(num_cpus_per_runner)
-        self._latest_weights = copy.deepcopy(initial_weights)
+        self._latest_weights = initial_weights
+        self._latest_weights_ref = (
+            initial_weights_ref if initial_weights_ref is not None else ray.put(initial_weights)
+        )
         self._actor_versions: dict[str, FrozenVersions] = {}
         self._actors: dict[str, Any] = {}
         self._pending: dict[ray.ObjectRef, str] = {}
@@ -146,7 +156,14 @@ class AsyncEvaluationGroup:
         try:
             for index in range(episode_count):
                 runner_id = f"evaluation-{index}"
+                options = {}
+                if placement_group_bundle_start is not None:
+                    options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                        placement_group=get_current_placement_group(),
+                        placement_group_bundle_index=placement_group_bundle_start + index,
+                    )
                 self._actors[runner_id] = EpisodeRolloutActor.options(
+                    **options,
                     num_cpus=self._num_cpus_per_runner,
                 ).remote(
                     self._config,
@@ -155,7 +172,7 @@ class AsyncEvaluationGroup:
                     runner_id=runner_id,
                     runner_generation=0,
                     max_episode_steps=self._max_episode_steps,
-                    initial_weights=self._latest_weights,
+                    initial_weights=self._latest_weights_ref,
                     worker_index=10_000 + index,
                 )
                 self._actor_versions[runner_id] = FrozenVersions(
@@ -171,10 +188,16 @@ class AsyncEvaluationGroup:
         return bool(self._pending)
 
     @property
+    def pending_calls(self) -> int:
+        return len(self._pending)
+
+    @property
     def latest_result(self) -> EvaluationResult | None:
         return self._latest_result
 
-    def start_round(self, weights: WeightsDescriptor) -> int:
+    def start_round(
+        self, weights: WeightsDescriptor, *, weights_ref: ray.ObjectRef | None = None
+    ) -> int:
         """Start a bounded round; every actor receives the same publication."""
 
         self._require_open()
@@ -194,11 +217,12 @@ class AsyncEvaluationGroup:
         ):
             raise EvaluationGroupError("cannot evaluate a stale weight publication")
         if accepted:
-            self._latest_weights = copy.deepcopy(weights)
-        else:
-            self._latest_weights = copy.deepcopy(self._latest_weights)
+            self._latest_weights_ref = (
+                weights_ref if weights_ref is not None else ray.put(weights)
+            )
+            self._latest_weights = weights
 
-        frozen = copy.deepcopy(self._latest_weights)
+        frozen = self._latest_weights
         self._active_weights = frozen
         self._active_returns = []
         self._active_env_steps = 0
@@ -206,11 +230,11 @@ class AsyncEvaluationGroup:
         self._rounds_started += 1
         for runner_id, actor in self._actors.items():
             actor_weights = (
-                frozen
+                self._latest_weights_ref
                 if self._actor_versions[runner_id] != frozen.module_versions
                 else None
             )
-            ref = actor.collect_episode.remote(actor_weights, explore=False)
+            ref = actor.evaluate.remote(actor_weights)
             if actor_weights is not None:
                 self._actor_versions[runner_id] = FrozenVersions(frozen.module_versions)
             self._pending[ref] = runner_id
@@ -348,6 +372,8 @@ class AsyncEvaluationGroup:
             ray.kill(actor, no_restart=True)
         self._pending.clear()
         self._actors.clear()
+        self._latest_weights_ref = None
+        self._active_weights = None
         self._stopped = True
 
     def _accept_result(
@@ -355,7 +381,7 @@ class AsyncEvaluationGroup:
         runner_id: str,
         result: object,
     ) -> None:
-        if not isinstance(result, EpisodeRolloutResult):
+        if not isinstance(result, EpisodeRolloutSummary):
             self._failures += 1
             raise EvaluationGroupError("evaluation actor returned an invalid result")
         if result.episode.runner_id != runner_id:

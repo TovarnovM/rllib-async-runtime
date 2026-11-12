@@ -689,14 +689,26 @@ def test_population_checkpoint_exact_resume_and_warm_start(
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("colocate", [False, True])
 def test_single_trial_population_writes_expected_tensorboard_tags(
     ray_runtime: None,
     tmp_path: Path,
+    colocate: bool,
 ) -> None:
+    members = make_single_trial_population_specs()
+    if colocate:
+        members = tuple(
+            replace(member, runtime_config=replace(
+                member.runtime_config, colocate_replay_and_learners=True,
+                runner_count=2, num_cpus_per_replay=0.25,
+                num_cpus_per_learner=0.25, num_cpus_per_runner=0.05,
+            ))
+            for member in members
+        )
     results = tune.Tuner(
         PopulationTrainable,
         param_space={
-            "members": make_single_trial_population_specs(),
+            "members": members,
             "run_id": "run-tensorboard",
             "report_interval_s": 0.1,
         },

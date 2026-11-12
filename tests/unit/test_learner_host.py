@@ -413,3 +413,40 @@ def test_population_restore_accepts_newer_shared_replay(monkeypatch) -> None:
         if restored is not None:
             restored.stop(timeout_s=2)
         runner.stop()
+
+
+def test_sync_interval_skips_empty_polls_but_not_backlog_or_drain(monkeypatch) -> None:
+    from rllib_async.replay import FastReplay
+
+    monkeypatch.setattr(learner_host_module.ray, "get", lambda value: value)
+    clock = [10.0]
+    monkeypatch.setattr(learner_host_module.time, "monotonic", lambda: clock[0])
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(codec, capacity_transitions=1000, capacity_bytes=10_000_000)
+    host = object.__new__(LearnerHost)
+    host._fast_replay = FastReplay(codec)
+    host._fast_replay.load_snapshot(store.get_snapshot())
+    host._replay_actor = ImmediateReplayActor(store)
+    host._sync_interval_s = 0.05
+    host._next_sync_at = 0.0
+    host._sync_has_more = False
+    host._sync_max_bytes = 1
+    host._sync_requests = host._delta_transactions = 0
+    try:
+        assert host._sync_once(respect_interval=True) == (0, False)
+        assert host._sync_requests == 1
+        first = make_episode(codec)
+        store.commit_episode(first)
+        store.commit_episode(replace(first, episode_id="another", local_episode_seq=1))
+        assert host._sync_once(respect_interval=True) == (0, False)
+        assert host._sync_requests == 1
+        clock[0] += 0.05
+        assert host._sync_once(respect_interval=True) == (1, True)
+        # A byte-limited backlog is drained without waiting for the interval.
+        assert host._sync_once(respect_interval=True) == (1, False)
+        assert host._sync_requests == 3
+        # Drain/checkpoint explicitly forces the last synchronization.
+        assert host._sync_once() == (0, False)
+        assert host._sync_requests == 4
+    finally:
+        host._fast_replay.close()

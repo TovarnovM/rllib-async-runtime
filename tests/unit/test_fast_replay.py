@@ -449,3 +449,41 @@ def test_sampling_is_uniform_over_transitions_not_episodes() -> None:
         count / len(coordinates) == pytest.approx(0.1, abs=0.01)
         for count in counts.values()
     )
+
+
+def test_empty_delta_does_not_scan_replay_and_still_checks_cursor() -> None:
+    class UnreadableRecords(dict):
+        def __iter__(self):
+            raise AssertionError("empty delta scanned the manifest")
+
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(codec, capacity_transitions=100, capacity_bytes=100_000)
+    store.commit_episode(make_episode(codec, 0, [1, 2]))
+    replay = FastReplay(codec)
+    try:
+        replay.load_snapshot(store.get_snapshot())
+        replay._target = replace(
+            replay._target, records=UnreadableRecords(replay._target.records)
+        )
+        delta = store.get_delta(store.cursor, max_bytes=1)
+        replay.apply_delta(delta)
+        assert replay.cursor == store.cursor
+        with pytest.raises(CursorMismatchError, match="empty delta"):
+            replay.apply_delta(replace(delta, next_cursor=replace(store.cursor, mutation_seq=2)))
+    finally:
+        replay.close()
+
+
+def test_sampling_does_not_revalidate_admitted_episodes(monkeypatch) -> None:
+    codec = FlatEpisodeCodec()
+    store = EpisodeStore(codec, capacity_transitions=100, capacity_bytes=100_000)
+    store.commit_episode(make_episode(codec, 0, [1, 2]))
+    replay = FastReplay(codec)
+    try:
+        replay.load_snapshot(store.get_snapshot())
+        def unexpected_validation(episode):
+            raise AssertionError("sampling revalidated an admitted episode")
+        monkeypatch.setattr(codec, "validate", unexpected_validation)
+        assert set(replay.sample(32, rng=random.Random(4))) == {1, 2}
+    finally:
+        replay.close()

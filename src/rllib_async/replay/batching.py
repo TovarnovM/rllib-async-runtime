@@ -77,9 +77,17 @@ class BatchProducerStats:
 class FlatBatchCollator:
     """Stack flat numeric mapping transitions into contiguous NumPy columns."""
 
+    def __init__(self, *, validate: bool = True) -> None:
+        self._validate = validate
+
     def collate(self, transitions: Sequence[object]) -> FlatBatch:
         if not transitions:
             raise BatchCollationError("collation requires at least one transition")
+        if not self._validate:
+            return {
+                key: np.ascontiguousarray(np.stack([row[key] for row in transitions]))
+                for key in transitions[0]
+            }
         first = transitions[0]
         if not isinstance(first, Mapping):
             raise BatchCollationError("every flat transition must be a mapping")

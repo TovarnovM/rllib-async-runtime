@@ -96,6 +96,8 @@ class _MaterializedView:
     sampling_index: _SamplingIndex
     module_sampling_indices: Mapping[str, _ModuleSamplingIndex]
     total_estimated_bytes: int
+    producer_episode_counts: tuple[tuple[str, int], ...]
+    producer_transition_counts: tuple[tuple[str, int], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,6 +239,11 @@ class FastReplay:
                     f"delta base {delta.base_cursor!r}"
                 )
 
+            if not delta.transactions:
+                if delta.next_cursor != target.cursor:
+                    raise CursorMismatchError("empty delta must preserve its cursor")
+                return
+
             manifest_ids = deque(target.records)
             present_ids = set(manifest_ids)
             added_records: dict[str, _EpisodeRecord] = {}
@@ -288,9 +295,6 @@ class FastReplay:
                 raise CursorMismatchError(
                     "delta next cursor does not match its transaction suffix"
                 )
-            if not delta.transactions:
-                return
-
             with self._condition:
                 self._ensure_open_locked()
                 for transaction in delta.transactions:
@@ -333,21 +337,6 @@ class FastReplay:
             target = self._target
             active = self._active_view
             lag_mutations = self._delta_lag_mutations_locked(target, active)
-            producer_episode_counts: Counter[str] = Counter()
-            producer_transition_counts: Counter[str] = Counter()
-            if active is not None:
-                previous_cumulative_length = 0
-                for episode, cumulative_length in zip(
-                    active.episodes,
-                    active.sampling_index.cumulative_lengths,
-                    strict=True,
-                ):
-                    transition_count = cumulative_length - previous_cumulative_length
-                    previous_cumulative_length = cumulative_length
-                    producer_episode_counts[episode.producer_member_id] += 1
-                    producer_transition_counts[episode.producer_member_id] += (
-                        transition_count
-                    )
             return FastReplayStats(
                 cursor=target.cursor if target is not None else None,
                 active_cursor=active.cursor if active is not None else None,
@@ -358,11 +347,11 @@ class FastReplay:
                 total_estimated_bytes=(
                     target.total_estimated_bytes if target is not None else 0
                 ),
-                active_producer_episode_counts=tuple(
-                    sorted(producer_episode_counts.items())
+                active_producer_episode_counts=(
+                    active.producer_episode_counts if active is not None else ()
                 ),
-                active_producer_transition_counts=tuple(
-                    sorted(producer_transition_counts.items())
+                active_producer_transition_counts=(
+                    active.producer_transition_counts if active is not None else ()
                 ),
                 active_module_transition_counts=(
                     ()
@@ -495,6 +484,7 @@ class FastReplay:
             self._codec.get_transition(
                 view.episodes[episode_index],
                 transition_index,
+                validate=False,
             )
             for episode_index, transition_index in self._sample_positions(
                 view,
@@ -539,6 +529,7 @@ class FastReplay:
                 view.episodes[episode_index],
                 module_id,
                 transition_index,
+                validate=False,
             )
             for episode_index, transition_index in self._sample_module_positions(
                 view,
@@ -632,6 +623,8 @@ class FastReplay:
         module_episode_indices: dict[str, list[int]] = {}
         module_cumulative_lengths: dict[str, list[int]] = {}
         module_totals: dict[str, int] = {}
+        producer_episode_counts: Counter[str] = Counter()
+        producer_transition_counts: Counter[str] = Counter()
         module_codec = (
             self._codec if isinstance(self._codec, ModuleEpisodeCodec) else None
         )
@@ -641,6 +634,9 @@ class FastReplay:
             episode_ids.append(record.episode.episode_id)
             total_transitions += record.transition_count
             cumulative_lengths.append(total_transitions)
+            producer_id = record.episode.producer_member_id
+            producer_episode_counts[producer_id] += 1
+            producer_transition_counts[producer_id] += record.transition_count
             if module_codec is not None:
                 episode_module_total = 0
                 for module_id in module_codec.module_ids(record.episode):
@@ -687,6 +683,8 @@ class FastReplay:
             ),
             module_sampling_indices=MappingProxyType(module_sampling_indices),
             total_estimated_bytes=request.total_estimated_bytes,
+            producer_episode_counts=tuple(sorted(producer_episode_counts.items())),
+            producer_transition_counts=tuple(sorted(producer_transition_counts.items())),
         )
 
     def _schedule_rebuild_locked(self) -> None:
