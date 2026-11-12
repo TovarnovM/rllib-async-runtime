@@ -469,7 +469,9 @@ def test_empty_delta_does_not_scan_replay_and_still_checks_cursor() -> None:
         replay.apply_delta(delta)
         assert replay.cursor == store.cursor
         with pytest.raises(CursorMismatchError, match="empty delta"):
-            replay.apply_delta(replace(delta, next_cursor=replace(store.cursor, mutation_seq=2)))
+            replay.apply_delta(
+                replace(delta, next_cursor=replace(store.cursor, mutation_seq=2))
+            )
     finally:
         replay.close()
 
@@ -481,8 +483,10 @@ def test_sampling_does_not_revalidate_admitted_episodes(monkeypatch) -> None:
     replay = FastReplay(codec)
     try:
         replay.load_snapshot(store.get_snapshot())
+
         def unexpected_validation(episode):
             raise AssertionError("sampling revalidated an admitted episode")
+
         monkeypatch.setattr(codec, "validate", unexpected_validation)
         assert set(replay.sample(32, rng=random.Random(4))) == {1, 2}
     finally:

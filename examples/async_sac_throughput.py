@@ -15,6 +15,8 @@ from rllib_async.runtime import AsyncSACTrainable
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--validate-startup", action="store_true")
+    parser.add_argument("--colocate-replay-and-learners", action="store_true")
     parser.add_argument("--stop-timesteps", type=int, default=20_000)
     parser.add_argument("--runner-count", type=int, default=8)
     parser.add_argument("--episode-length", type=int, default=32)
@@ -60,12 +62,12 @@ def main() -> None:
             param_space={
                 "sac_config": sac_config,
                 "runtime": {
+                    "validate_startup": args.validate_startup,
+                    "colocate_replay_and_learners": args.colocate_replay_and_learners,
                     "runner_count": args.runner_count,
                     "max_episode_steps": args.episode_length,
                     "pending_commit_high_watermark": args.runner_count * 2,
                     "pending_commit_low_watermark": args.runner_count,
-                    "learner_updates_per_tick": 4,
-                    "publication_interval_updates": 10,
                     "evaluation_interval_env_steps": 0,
                     "evaluation_num_episodes": 0,
                     "seed": args.seed,

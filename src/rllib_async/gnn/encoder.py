@@ -209,7 +209,9 @@ class TorchGraphEncoder(TorchModel, Encoder):
                 or torch.any(graph_ptr[1:] <= graph_ptr[:-1])
             ):
                 raise ValueError("graph_ptr must delimit non-empty packed graphs")
-            if edges.shape[1] and (torch.any(edges < 0) or torch.any(edges >= len(nodes))):
+            if edges.shape[1] and (
+                torch.any(edges < 0) or torch.any(edges >= len(nodes))
+            ):
                 raise ValueError("edge_index references an unknown packed node")
             if edges.shape[1]:
                 edge_graph_ids = torch.bucketize(
@@ -218,7 +220,9 @@ class TorchGraphEncoder(TorchModel, Encoder):
                     right=True,
                 )
                 if torch.any(edge_graph_ids[0] != edge_graph_ids[1]):
-                    raise ValueError("edge_index cannot connect different packed graphs")
+                    raise ValueError(
+                        "edge_index cannot connect different packed graphs"
+                    )
             if torch.any(controlled < graph_ptr[:-1]) or torch.any(
                 controlled >= graph_ptr[1:]
             ):
@@ -339,8 +343,10 @@ class TorchGraphEncoder(TorchModel, Encoder):
         ):
             node_part = nodes[batch_index, :node_count]
             edge_part = edges[batch_index, :, :edge_count]
-            if self._validate_next_batch and edge_count and (
-                torch.any(edge_part < 0) or torch.any(edge_part >= node_count)
+            if (
+                self._validate_next_batch
+                and edge_count
+                and (torch.any(edge_part < 0) or torch.any(edge_part >= node_count))
             ):
                 raise ValueError("padded edge_index references a padded node")
             offset = graph_ptr[-1]
@@ -357,9 +363,8 @@ class TorchGraphEncoder(TorchModel, Encoder):
                 dtype=torch.long,
                 device=device,
             ),
-            CONTROLLED_NODE: controlled + torch.tensor(
-                graph_ptr[:-1], dtype=torch.long, device=device
-            ),
+            CONTROLLED_NODE: controlled
+            + torch.tensor(graph_ptr[:-1], dtype=torch.long, device=device),
         }
         if edge_features is not None:
             packed[EDGE_FEATURES] = torch.cat(edge_feature_parts, dim=0)

@@ -22,6 +22,8 @@ from rllib_async.runtime import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--validate-startup", action="store_true")
+    parser.add_argument("--colocate-replay-and-learners", action="store_true")
     parser.add_argument(
         "--mode",
         choices=("new", "resume", "warm_start"),
@@ -96,12 +98,12 @@ def build_members(args: argparse.Namespace) -> tuple[PopulationMemberSpec, ...]:
         )
         runtime_config = AsyncSACRuntimeConfig(
             member_id=f"member-{index:02d}",
+            validate_startup=args.validate_startup,
+            colocate_replay_and_learners=args.colocate_replay_and_learners,
             runner_count=args.runner_count,
             max_episode_steps=args.episode_length,
             pending_commit_high_watermark=args.runner_count * 2,
             pending_commit_low_watermark=args.runner_count,
-            learner_updates_per_tick=4,
-            publication_interval_updates=10,
             evaluation_interval_env_steps=0,
             evaluation_num_episodes=0,
             report_interval_s=args.report_interval_s,

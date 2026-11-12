@@ -674,13 +674,13 @@ class SACLearnerAdapter:
         self._module_versions = module_versions
         self._last_published_update = self._learner_updates
         self._latest_weights = descriptor
-        return copy.deepcopy(self._latest_weights)
+        return self._latest_weights
 
     def get_published_weights(self) -> WeightsDescriptor:
         """Return the most recently published, immutable-by-contract weights."""
 
         self._require_open()
-        return copy.deepcopy(self._latest_weights)
+        return self._latest_weights
 
     def export_pbt_state(self) -> PBTModelState:
         """Export model state without optimizer, RNG, counters, or member identity."""

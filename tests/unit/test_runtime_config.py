@@ -129,9 +129,18 @@ def test_network_defaults_and_legacy_checkpoint_settings() -> None:
     assert runtime.learner_updates_per_tick == runtime.publication_interval_updates == 8
     assert runtime.replay_sync_interval_s == 0.05
     assert not runtime.validate_startup
-    legacy_runtime = replace(runtime, batch_queue_capacity=4, learner_updates_per_tick=1, publication_interval_updates=1)
+    legacy_runtime = replace(
+        runtime,
+        batch_queue_capacity=4,
+        learner_updates_per_tick=1,
+        publication_interval_updates=1,
+    )
     saved = asdict(legacy_runtime)
-    for name in ("validate_startup", "replay_sync_interval_s", "colocate_replay_and_learners"):
+    for name in (
+        "validate_startup",
+        "replay_sync_interval_s",
+        "colocate_replay_and_learners",
+    ):
         saved.pop(name)
     assert legacy_runtime.matches_checkpoint(saved)
     assert not runtime.matches_checkpoint(saved)
@@ -141,17 +150,22 @@ def test_network_defaults_and_legacy_checkpoint_settings() -> None:
 
 
 def test_colocation_reserves_one_core_bundle_without_taking_rollout_cpus() -> None:
-    resources = AsyncSACTrainable.default_resource_request({
-        "sac_config": make_sac_config(),
-        "runtime": {
-            "colocate_replay_and_learners": True,
-            "runner_count": 2,
-            "evaluation_num_episodes": 1,
-            "num_cpus_per_runner": 0.5,
-            "num_cpus_per_evaluation_runner": 0.25,
-        },
-    })
+    resources = AsyncSACTrainable.default_resource_request(
+        {
+            "sac_config": make_sac_config(),
+            "runtime": {
+                "colocate_replay_and_learners": True,
+                "runner_count": 2,
+                "evaluation_num_episodes": 1,
+                "num_cpus_per_runner": 0.5,
+                "num_cpus_per_evaluation_runner": 0.25,
+            },
+        }
+    )
     assert resources.bundles == [
-        {"CPU": 1.0}, {"CPU": 2.0},
-        {"CPU": 0.5}, {"CPU": 0.5}, {"CPU": 0.25},
+        {"CPU": 1.0},
+        {"CPU": 2.0},
+        {"CPU": 0.5},
+        {"CPU": 0.5},
+        {"CPU": 0.25},
     ]

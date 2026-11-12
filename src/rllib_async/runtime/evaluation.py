@@ -135,7 +135,9 @@ class AsyncEvaluationGroup:
         self._num_cpus_per_runner = float(num_cpus_per_runner)
         self._latest_weights = initial_weights
         self._latest_weights_ref = (
-            initial_weights_ref if initial_weights_ref is not None else ray.put(initial_weights)
+            initial_weights_ref
+            if initial_weights_ref is not None
+            else ray.put(initial_weights)
         )
         self._actor_versions: dict[str, FrozenVersions] = {}
         self._actors: dict[str, Any] = {}
@@ -160,7 +162,8 @@ class AsyncEvaluationGroup:
                 if placement_group_bundle_start is not None:
                     options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
                         placement_group=get_current_placement_group(),
-                        placement_group_bundle_index=placement_group_bundle_start + index,
+                        placement_group_bundle_index=placement_group_bundle_start
+                        + index,
                     )
                 self._actors[runner_id] = EpisodeRolloutActor.options(
                     **options,

@@ -232,6 +232,80 @@ uv run --locked --extra cu118 --group dev \
   python examples/async_sac_throughput.py --runner-count 8
 ```
 
+## Hot path and network traffic
+
+The runtime trusts admitted, immutable replay data. It caches payload sizes
+(including across actor transport), decodes sampled transitions without
+revalidating the entire episode, and returns immediately for an unchanged replay
+cursor. Empty deltas still have to preserve the local cursor. Producer counts
+are built with the replay index instead of rescanning replay at report time.
+The controller pump reads scalar counters; percentile calculations and learner
+metric extraction run only when statistics or checkpoints are requested.
+Detailed losses are available through `get_stats()`/reports; the compatibility
+`LearnerHostTick.learner_metrics` field is empty, avoiding repeated metric traffic.
+
+| Runtime setting | Default | Effect |
+| --- | --- | --- |
+| `batch_queue_capacity` | `0` | Direct local batching, without a prefetch thread. |
+| `learner_updates_per_tick` | `8` | Up to eight local updates per learner RPC, bounded by sampled-step credit. |
+| `publication_interval_updates` | `8` | Publish inference weights after eight updates; drain forces the final version. |
+| `replay_sync_interval_s` | `0.05` | At most one periodic replay query per 50 ms per learner; a byte-limited backlog continues immediately. |
+| `validate_startup` | `False` | Opt into content/shape diagnostics on the first usable learner batch. |
+| `colocate_replay_and_learners` | `False` | Reserve replay and all learners in one Tune bundle on one node. |
+
+`validate_startup=True` checks the first real training batch, after learning
+starts. It does not install recurring scans. Standalone graph users can pass the
+same flag to `GraphBatchCollator` (or `MultiModuleBatchCollator` for flat
+hierarchies), `SACLearnerAdapter`, and the graph encoder's
+model configuration. Public validation helpers remain strict by default.
+Episode admission, versions, generation/order, deduplication, update budgets,
+backpressure, and checkpoint/restore guards remain active. Graph normalization
+still runs when a **new** observation enters the codec; trusted replay decoding
+and packed learner forwards do not repeat it. Padded graph inference still has
+to read graph lengths to remove padding.
+
+Rollout methods return two Ray references: an episode payload and a compact
+summary. The controller fetches only the summary and passes the payload
+reference directly to replay. Polling does not request payload locality.
+`RolloutCompletion.episode_metadata` is cheap; `.episode_ref` can be forwarded;
+accessing `.episode` explicitly fetches the full payload. Evaluation returns only
+summaries and never sends trajectories to the controller. Each weight publication
+is put in Ray's object store once, shared with rollout and evaluation actors, and
+sent only to actors whose installed version differs. Publications are immutable
+by contract: callers must copy their state before modifying it. One detached
+snapshot is retained per publication instead of copying it at every accessor.
+The learner-to-controller
+publication still crosses an actor boundary; Ray may inline small objects.
+
+If a learner makes no progress, it asks the controller to wait until the next
+sync opportunity, avoiding empty-tick RPC loops. Drain/checkpoint bypasses this
+throttle and catches up with authoritative replay. Existing checkpoints retain
+their saved queue/update/publication settings; legacy flat-payload sizes are
+reconstructed once, and v1 deduplication fingerprints stay compatible.
+
+Colocation is supported by `AsyncSACTrainable` and `PopulationTrainable`.
+The driver and rollout/evaluation workers have separate bundles, so they cannot
+consume CPUs reserved for learners. Bundle assignments survive PBT replacement
+and restore. Enable this only when one node can hold **all** learner GPUs, core
+CPUs, and replay memory; otherwise keep `PACK` placement across nodes. Direct
+controllers and the legacy two-trial launcher do not manage this reservation.
+Reports expose replay and learner `node_id` values for placement verification.
+The three Tune examples accept `--validate-startup` and
+`--colocate-replay-and-learners`, for example:
+
+```bash
+uv run --locked --extra cu118 --group dev \
+  python examples/population_single_trial.py \
+  --population-size 2 --num-gpus-per-member 1 \
+  --colocate-replay-and-learners --validate-startup
+```
+
+These changes reduce redundant work and transfers; they do not establish a
+measured speedup on a particular GPU or 1 Gbit network. Compare the same run
+budget, final policy quality, policy lag, learner throughput, synchronization
+counts and actual host interface bytes before making a throughput claim.
+Do not treat replay payload-size counters as measured network traffic.
+
 ## Phase 7 checkpoint and recovery
 
 Phase 7 provides:

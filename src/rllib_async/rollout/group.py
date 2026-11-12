@@ -152,7 +152,9 @@ class EpisodeRolloutActor:
         result = self._runner.collect_episode(weights, explore=explore)
         return result.episode, EpisodeRolloutSummary.from_result(result)
 
-    def evaluate(self, weights: WeightsDescriptor | None = None) -> EpisodeRolloutSummary:
+    def evaluate(
+        self, weights: WeightsDescriptor | None = None
+    ) -> EpisodeRolloutSummary:
         return EpisodeRolloutSummary.from_result(
             self._runner.collect_episode(weights, explore=False)
         )
@@ -633,7 +635,9 @@ class AsyncRolloutGroup:
             options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
                 placement_group=get_current_placement_group(),
                 placement_group_bundle_index=(
-                    self._placement_group_bundle_start + self._worker_indices[runner_id] - 1
+                    self._placement_group_bundle_start
+                    + self._worker_indices[runner_id]
+                    - 1
                 ),
             )
         actor = EpisodeRolloutActor.options(

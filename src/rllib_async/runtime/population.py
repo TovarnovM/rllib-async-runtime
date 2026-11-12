@@ -1628,6 +1628,7 @@ class PopulationAsyncSAC:
             "last_exploit_duration_s": self._last_exploit_duration_s,
         }
         replay_metrics = {
+            "node_id": replay.node_id,
             "store_generation": replay.cursor.store_generation,
             "cursor": replay.cursor.mutation_seq,
             "episodes": replay.episode_count,

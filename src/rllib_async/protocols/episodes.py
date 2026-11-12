@@ -80,12 +80,15 @@ class FlatEpisodePayload:
         object.__setattr__(self, "_estimated_bytes", sum(map(len, self.encoded_transitions)))
 
     def __getstate__(self) -> list[object]:
-        # Preserve the v1 pickle/fingerprint representation; the cache is derived.
-        return [self.encoded_transitions]
+        return [self.encoded_transitions, self._estimated_bytes]
 
     def __setstate__(self, state: list[object]) -> None:
         object.__setattr__(self, "encoded_transitions", state[0])
-        self.__post_init__()
+        if len(state) == 1:
+            # Old checkpoints predate the size cache. Reconstruct it once.
+            self.__post_init__()
+        else:
+            object.__setattr__(self, "_estimated_bytes", state[1])
 
     @property
     def estimated_bytes(self) -> int:

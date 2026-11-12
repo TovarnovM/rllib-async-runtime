@@ -684,7 +684,9 @@ class FastReplay:
             module_sampling_indices=MappingProxyType(module_sampling_indices),
             total_estimated_bytes=request.total_estimated_bytes,
             producer_episode_counts=tuple(sorted(producer_episode_counts.items())),
-            producer_transition_counts=tuple(sorted(producer_transition_counts.items())),
+            producer_transition_counts=tuple(
+                sorted(producer_transition_counts.items())
+            ),
         )
 
     def _schedule_rebuild_locked(self) -> None:

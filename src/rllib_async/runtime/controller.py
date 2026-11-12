@@ -254,7 +254,11 @@ class SingleMemberAsyncSAC:
                     num_cpus_per_runner=(self._config.num_cpus_per_evaluation_runner),
                     placement_group_bundle_start=(
                         worker_bundle_start
-                        + (self._config.runner_count if self._config.num_cpus_per_runner else 0)
+                        + (
+                            self._config.runner_count
+                            if self._config.num_cpus_per_runner
+                            else 0
+                        )
                         if self._config.colocate_replay_and_learners
                         and self._config.num_cpus_per_evaluation_runner
                         else None
@@ -1347,7 +1351,9 @@ class AsyncSACTrainable(Trainable):
         del sac_config
         if runtime.colocate_replay_and_learners:
             if shared_replay is not None:
-                raise ValueError("shared replay colocation requires PopulationTrainable")
+                raise ValueError(
+                    "shared replay colocation requires PopulationTrainable"
+                )
             return PlacementGroupFactory(
                 [
                     {"CPU": 1.0},

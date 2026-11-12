@@ -143,7 +143,7 @@ class MultiModuleEpisodeRunner:
                 WEIGHTS_SEQ_NO: next(iter(versions)),
             }
         )
-        self._weights = copy.deepcopy(weights)
+        self._weights = weights
         return True
 
     def collect_episode(

@@ -728,6 +728,10 @@ def test_single_trial_population_writes_expected_tensorboard_tags(
     assert len(result_list) == 1
     result = result_list[0]
     assert result.error is None
+    if colocate:
+        replay_node = result.metrics["replay"]["node_id"]
+        assert replay_node
+        assert all(member["learner"]["node_id"] == replay_node for member in result.metrics["members"].values())
     assert result.checkpoint is not None
     assert result.metrics["population"]["size"] == 2
     with result.checkpoint.as_directory() as checkpoint_directory:

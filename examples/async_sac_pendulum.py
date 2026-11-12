@@ -53,6 +53,8 @@ def build_sac_config(*, seed: int, num_gpus: int) -> SACConfig:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--validate-startup", action="store_true")
+    parser.add_argument("--colocate-replay-and-learners", action="store_true")
     parser.add_argument("--stop-timesteps", type=int, default=50_000)
     parser.add_argument("--runner-count", type=int, default=4)
     parser.add_argument("--num-gpus", type=int, choices=(0, 1), default=0)
@@ -76,13 +78,12 @@ def main() -> None:
                     num_gpus=args.num_gpus,
                 ),
                 "runtime": {
+                    "validate_startup": args.validate_startup,
+                    "colocate_replay_and_learners": args.colocate_replay_and_learners,
                     "runner_count": args.runner_count,
                     "max_episode_steps": 200,
                     "pending_commit_high_watermark": args.runner_count * 2,
                     "pending_commit_low_watermark": args.runner_count,
-                    "batch_queue_capacity": 8,
-                    "learner_updates_per_tick": 4,
-                    "publication_interval_updates": 10,
                     "evaluation_interval_env_steps": args.evaluation_interval,
                     "evaluation_num_episodes": args.evaluation_episodes,
                     "num_gpus_per_learner": args.num_gpus,

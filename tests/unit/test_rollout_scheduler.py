@@ -34,15 +34,22 @@ class FakeRemoteMethod:
         self._function = function
 
     def remote(self, *args, **kwargs) -> FakeRef:
-        args = tuple(value.value if isinstance(value, FakeRef) else value for value in args)
-        kwargs = {key: value.value if isinstance(value, FakeRef) else value for key, value in kwargs.items()}
+        args = tuple(
+            value.value if isinstance(value, FakeRef) else value for value in args
+        )
+        kwargs = {
+            key: value.value if isinstance(value, FakeRef) else value
+            for key, value in kwargs.items()
+        }
         return FakeRef(self._function(*args, **kwargs))
 
 
 class FakeSplitRemoteMethod(FakeRemoteMethod):
     def remote(self, *args, **kwargs):
         result = super().remote(*args, **kwargs).value
-        return FakeRef(result.episode), FakeRef(EpisodeRolloutSummary.from_result(result))
+        return FakeRef(result.episode), FakeRef(
+            EpisodeRolloutSummary.from_result(result)
+        )
 
 
 class FakeRolloutActor:
@@ -499,16 +506,21 @@ def test_checkpoint_recreates_runners_with_a_new_seed_range(monkeypatch) -> None
             restored.stop()
 
 
-def test_controller_never_fetches_payloads_and_reuses_publication_refs(monkeypatch) -> None:
+def test_controller_never_fetches_payloads_and_reuses_publication_refs(
+    monkeypatch,
+) -> None:
     group = make_group(monkeypatch, high=4, low=1)
     puts = []
+
     def put(value):
         ref = FakeRef(value)
         puts.append(ref)
         return ref
+
     def get(ref):
         assert not isinstance(ref.value, EpisodeEnvelope), "controller fetched payload"
         return ref.value
+
     monkeypatch.setattr(group_module.ray, "put", put)
     monkeypatch.setattr(group_module.ray, "get", get)
     try:
@@ -520,7 +532,9 @@ def test_controller_never_fetches_payloads_and_reuses_publication_refs(monkeypat
         completions = group.drain(timeout_s=1)
         assert len(completions) == 4
         assert all(item.acknowledgement.committed for item in completions)
-        assert all(isinstance(item.episode_ref.value, EpisodeEnvelope) for item in completions)
+        assert all(
+            isinstance(item.episode_ref.value, EpisodeEnvelope) for item in completions
+        )
         assert group.pending_sample_calls == group.pending_episode_commits == 0
         assert not group.update_weights(make_weights(1))
         assert len(puts) == 1

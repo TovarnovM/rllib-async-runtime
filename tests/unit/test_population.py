@@ -1169,14 +1169,23 @@ def test_partial_population_setup_stops_created_members_and_replay(
     assert population.state is RuntimeState.FAILED
 
 
-def test_population_colocation_uses_one_core_bundle_and_disjoint_worker_bundles() -> None:
+def test_population_colocation_uses_one_core_bundle_and_disjoint_worker_bundles() -> (
+    None
+):
     members = tuple(
-        replace(member, runtime_config=replace(member.runtime_config, colocate_replay_and_learners=True))
+        replace(
+            member,
+            runtime_config=replace(
+                member.runtime_config, colocate_replay_and_learners=True
+            ),
+        )
         for member in make_single_trial_specs()
     )
     resources = PopulationTrainable.default_resource_request({"members": members})
     assert resources.bundles == [
-        {"CPU": 1.0}, {"CPU": 3.0}, *[{"CPU": 0.5}] * 4,
+        {"CPU": 1.0},
+        {"CPU": 3.0},
+        *[{"CPU": 0.5}] * 4,
     ]
     population = object.__new__(PopulationAsyncSAC)
     population._slot_ids = tuple(member.runtime_config.member_id for member in members)

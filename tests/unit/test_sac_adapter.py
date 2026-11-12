@@ -627,25 +627,36 @@ def test_pbt_state_transfers_full_model_and_temperature_with_fresh_optimizer() -
 
 
 @pytest.mark.parametrize("validate_startup", [False, True])
-def test_adapter_runs_content_diagnostics_only_on_first_batch(monkeypatch, validate_startup) -> None:
+def test_adapter_runs_content_diagnostics_only_on_first_batch(
+    monkeypatch, validate_startup
+) -> None:
     import rllib_async.learner.sac_adapter as module
 
     config = make_sac_config().training(num_steps_sampled_before_learning_starts=0)
     runner = SingleAgentEnvRunner(config=config, worker_index=0)
     adapter = SACLearnerAdapter(
-        config, spaces=runner.get_spaces(), member_id="member-0",
-        publication_interval_updates=8, validate_startup=validate_startup,
+        config,
+        spaces=runner.get_spaces(),
+        member_id="member-0",
+        publication_interval_updates=8,
+        validate_startup=validate_startup,
     )
+    publication = adapter.get_published_weights()
+    frozen_state = copy.deepcopy(publication.state)
     calls = []
     original = module.build_rllib_sac_batch
+
     def build(batch, *, validate=True):
         calls.append(validate)
         return original(batch, validate=validate)
+
     monkeypatch.setattr(module, "build_rllib_sac_batch", build)
     try:
         for steps in (32, 64):
             assert adapter.update(make_fixed_batch(), sampled_env_steps=steps).performed
         assert calls == [validate_startup, False]
+        assert adapter.get_published_weights() is publication
+        assert_tree_close(publication.state, frozen_state)
     finally:
         adapter.close()
         runner.stop()

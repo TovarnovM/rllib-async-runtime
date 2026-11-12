@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import copyreg
 import hashlib
+import io
 import pickle
 import random
 import uuid
@@ -14,6 +16,7 @@ from dataclasses import dataclass
 from rllib_async.protocols.episodes import (
     EpisodeCodec,
     EpisodeEnvelope,
+    FlatEpisodePayload,
     ModuleEpisodeCodec,
     MultiModuleTransition,
 )
@@ -27,6 +30,13 @@ from rllib_async.protocols.replay import (
 )
 
 EPISODE_STORE_STATE_VERSION = 2
+
+
+def _fingerprint_flat_payload(payload: FlatEpisodePayload) -> tuple:
+    """Keep v1 deduplication hashes independent of the new transport size cache."""
+
+    reduction = payload.__reduce_ex__(pickle.HIGHEST_PROTOCOL)
+    return (*reduction[:2], [payload.encoded_transitions], *reduction[3:])
 
 
 class ReplayError(RuntimeError):
@@ -245,8 +255,11 @@ class EpisodeStore:
 
     @staticmethod
     def _fingerprint(episode: EpisodeEnvelope) -> bytes:
-        encoded = pickle.dumps(episode, protocol=pickle.HIGHEST_PROTOCOL)
-        return hashlib.sha256(encoded).digest()
+        encoded = io.BytesIO()
+        pickler = pickle.Pickler(encoded, protocol=pickle.HIGHEST_PROTOCOL)
+        pickler.dispatch_table = {**copyreg.dispatch_table, FlatEpisodePayload: _fingerprint_flat_payload}
+        pickler.dump(episode)
+        return hashlib.sha256(encoded.getbuffer()).digest()
 
     def get_snapshot(self, max_bytes: int | None = None) -> ReplaySnapshot:
         if max_bytes is not None:

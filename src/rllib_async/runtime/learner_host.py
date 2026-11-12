@@ -74,7 +74,7 @@ class LearnerHostState(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class LearnerHostTick:
-    """Finite progress made by one learner-host event-pump call."""
+    """Finite progress; detailed metrics are requested separately via get_stats."""
 
     synced_transactions: int
     sync_has_more: bool
@@ -563,7 +563,6 @@ class LearnerHost:
         updates_performed = 0
         skipped = 0
         publication: WeightsDescriptor | None = None
-        last_metrics = self._last_learner_metrics
         for batch in batches:
             update_started = time.monotonic()
             update = self._adapter.update(
@@ -587,14 +586,13 @@ class LearnerHost:
                     default=self._latest_module_version,
                 )
         self._updates_skipped_learning_start += skipped
-        self._last_learner_metrics = last_metrics
         return LearnerHostTick(
             synced_transactions=synced_transactions,
             sync_has_more=sync_has_more,
             updates_performed=updates_performed,
             updates_skipped_learning_start=skipped,
             published_weights=publication,
-            learner_metrics=last_metrics,
+            learner_metrics=(),
         )
 
     def _drain_queued_batches(

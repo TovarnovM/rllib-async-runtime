@@ -82,7 +82,9 @@ class BlockingSampleCodec(FlatEpisodeCodec):
         self.sample_started = threading.Event()
         self.release_sample = threading.Event()
 
-    def get_transition(self, episode: EpisodeEnvelope, index: int, *, validate: bool = True) -> object:
+    def get_transition(
+        self, episode: EpisodeEnvelope, index: int, *, validate: bool = True
+    ) -> object:
         if episode.episode_id == self.block_episode_id:
             self.sample_started.set()
             if not self.release_sample.wait(timeout=5):
