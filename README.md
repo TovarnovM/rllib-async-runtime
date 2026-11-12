@@ -274,8 +274,8 @@ is put in Ray's object store once, shared with rollout and evaluation actors, an
 sent only to actors whose installed version differs. Publications are immutable
 by contract: callers must copy their state before modifying it. One detached
 snapshot is retained per publication instead of copying it at every accessor.
-The learner-to-controller
-publication still crosses an actor boundary; Ray may inline small objects.
+The learner-to-controller publication still crosses an actor boundary; Ray may
+inline small objects.
 
 If a learner makes no progress, it asks the controller to wait until the next
 sync opportunity, avoiding empty-tick RPC loops. Drain/checkpoint bypasses this

@@ -1,8 +1,10 @@
 """Episode-boundary rollout components."""
 
 from rllib_async.rollout.episode_runner import (
+    EpisodeMetadata,
     EpisodeRolloutMetrics,
     EpisodeRolloutResult,
+    EpisodeRolloutSummary,
     EpisodeRunner,
     EpisodeRunnerError,
     WeightVersionError,
@@ -21,9 +23,11 @@ from rllib_async.rollout.multi_module import MultiModuleEpisodeRunner
 
 __all__ = [
     "AsyncRolloutGroup",
+    "EpisodeMetadata",
     "EpisodeRolloutActor",
     "EpisodeRolloutMetrics",
     "EpisodeRolloutResult",
+    "EpisodeRolloutSummary",
     "EpisodeRunner",
     "EpisodeRunnerError",
     "MultiModuleEpisodeRunner",

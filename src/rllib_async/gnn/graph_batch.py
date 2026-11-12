@@ -36,7 +36,8 @@ def pack_graph_observations(
     try:
         graphs = (
             [normalize_graph_observation(item) for item in observations]
-            if validate else observations
+            if validate
+            else observations
         )
     except ValueError as error:
         raise BatchCollationError(str(error)) from error
@@ -45,11 +46,17 @@ def pack_graph_observations(
     action_masks_present = ACTION_MASK in graphs[0]
     if validate:
         if len({graph[NODE_FEATURES].shape[1] for graph in graphs}) != 1:
-            raise BatchCollationError("all graphs must share one node feature dimension")
+            raise BatchCollationError(
+                "all graphs must share one node feature dimension"
+            )
         if any((EDGE_FEATURES in graph) != edge_features_present for graph in graphs):
-            raise BatchCollationError("edge_features must be present for every graph or for none")
+            raise BatchCollationError(
+                "edge_features must be present for every graph or for none"
+            )
         if any((ACTION_MASK in graph) != action_masks_present for graph in graphs):
-            raise BatchCollationError("action_mask must be present for every graph or for none")
+            raise BatchCollationError(
+                "action_mask must be present for every graph or for none"
+            )
 
     node_parts: list[np.ndarray] = []
     edge_parts: list[np.ndarray] = []

@@ -32,12 +32,6 @@ jobs:
       - name: Install locked CPU environment
         run: uv sync --locked --extra cpu --group dev
 
-      - name: Prepare formatting patch for review
-        run: |
-          uv run ruff check --fix --exit-zero .
-          uv run ruff format .
-          git diff
-
       - name: Lint
         run: uv run ruff check .
 

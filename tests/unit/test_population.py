@@ -826,6 +826,7 @@ def test_population_report_namespaces_members_and_shared_replay(
         }
 
     replay = ReplayStats(
+        node_id="replay-node",
         cursor=ReplayCursor("shared", 7),
         episode_count=4,
         total_transitions=16,
@@ -867,6 +868,7 @@ def test_population_report_namespaces_members_and_shared_replay(
     assert result["members"]["member-00"]["learner"]["updates"] == 3
     assert result["members"]["member-01"]["pbt"]["generation"] == 0
     assert result["replay"] == {
+        "node_id": "replay-node",
         "store_generation": "shared",
         "cursor": 7,
         "episodes": 4,

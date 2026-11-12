@@ -255,14 +255,21 @@ def test_evaluation_checkpoint_preserves_completed_round_metrics(monkeypatch) ->
 
 def test_evaluation_reuses_rollout_weight_refs_without_another_put(monkeypatch) -> None:
     install_fake_ray(monkeypatch)
+
     def unexpected_put(value):
         raise AssertionError("evaluation duplicated a shared publication")
+
     monkeypatch.setattr(evaluation_module.ray, "put", unexpected_put)
     initial = make_weights(0)
     group = AsyncEvaluationGroup(
-        make_sac_config(), FlatEpisodeCodec(), member_id="member-0",
-        initial_weights=initial, initial_weights_ref=FakeRef(initial),
-        episode_count=2, max_episode_steps=10, num_cpus_per_runner=0,
+        make_sac_config(),
+        FlatEpisodeCodec(),
+        member_id="member-0",
+        initial_weights=initial,
+        initial_weights_ref=FakeRef(initial),
+        episode_count=2,
+        max_episode_steps=10,
+        num_cpus_per_runner=0,
     )
     try:
         group.start_round(initial)
@@ -270,6 +277,9 @@ def test_evaluation_reuses_rollout_weight_refs_without_another_put(monkeypatch) 
         newer = make_weights(1)
         group.start_round(newer, weights_ref=FakeRef(newer))
         group.drain(timeout_s=1)
-        assert all(actor.weight_arguments == [None, newer] for actor in FakeEvaluationActorClass.created)
+        assert all(
+            actor.weight_arguments == [None, newer]
+            for actor in FakeEvaluationActorClass.created
+        )
     finally:
         group.stop()

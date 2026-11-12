@@ -1335,7 +1335,7 @@ class PopulationAsyncSAC:
                         pbt_state,
                         replay_actor=self._replay_actor,
                         reward_window_episodes=reward_window_episodes,
-                            worker_bundle_start=self._worker_bundle_start(slot_id),
+                        worker_bundle_start=self._worker_bundle_start(slot_id),
                     )
                 else:
                     self._members[slot_id] = SingleMemberAsyncSAC(
@@ -1343,7 +1343,7 @@ class PopulationAsyncSAC:
                         member.runtime_config,
                         replay_actor=self._replay_actor,
                         reward_window_episodes=reward_window_episodes,
-                            worker_bundle_start=self._worker_bundle_start(slot_id),
+                        worker_bundle_start=self._worker_bundle_start(slot_id),
                     )
             self._checkpoint_member_states = None
             self._warm_start_source_states = None

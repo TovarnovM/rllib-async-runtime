@@ -257,7 +257,10 @@ class EpisodeStore:
     def _fingerprint(episode: EpisodeEnvelope) -> bytes:
         encoded = io.BytesIO()
         pickler = pickle.Pickler(encoded, protocol=pickle.HIGHEST_PROTOCOL)
-        pickler.dispatch_table = {**copyreg.dispatch_table, FlatEpisodePayload: _fingerprint_flat_payload}
+        pickler.dispatch_table = {
+            **copyreg.dispatch_table,
+            FlatEpisodePayload: _fingerprint_flat_payload,
+        }
         pickler.dump(episode)
         return hashlib.sha256(encoded.getbuffer()).digest()
 

@@ -698,11 +698,17 @@ def test_single_trial_population_writes_expected_tensorboard_tags(
     members = make_single_trial_population_specs()
     if colocate:
         members = tuple(
-            replace(member, runtime_config=replace(
-                member.runtime_config, colocate_replay_and_learners=True,
-                runner_count=2, num_cpus_per_replay=0.25,
-                num_cpus_per_learner=0.25, num_cpus_per_runner=0.05,
-            ))
+            replace(
+                member,
+                runtime_config=replace(
+                    member.runtime_config,
+                    colocate_replay_and_learners=True,
+                    runner_count=2,
+                    num_cpus_per_replay=0.25,
+                    num_cpus_per_learner=0.25,
+                    num_cpus_per_runner=0.05,
+                ),
+            )
             for member in members
         )
     results = tune.Tuner(
@@ -731,7 +737,10 @@ def test_single_trial_population_writes_expected_tensorboard_tags(
     if colocate:
         replay_node = result.metrics["replay"]["node_id"]
         assert replay_node
-        assert all(member["learner"]["node_id"] == replay_node for member in result.metrics["members"].values())
+        assert all(
+            member["learner"]["node_id"] == replay_node
+            for member in result.metrics["members"].values()
+        )
     assert result.checkpoint is not None
     assert result.metrics["population"]["size"] == 2
     with result.checkpoint.as_directory() as checkpoint_directory:

@@ -302,7 +302,9 @@ def test_graph_batch_collates_empty_edges_one_node_and_different_sizes() -> None
         ),
     ]
     with pytest.raises(BatchCollationError, match="action_mask"):
-        GraphBatchCollator(module_id=SHARED_GNN_MODULE_ID, validate_startup=True).collate(mixed)
+        GraphBatchCollator(
+            module_id=SHARED_GNN_MODULE_ID, validate_startup=True
+        ).collate(mixed)
 
 
 def test_packed_graph_batch_rejects_cross_graph_edges() -> None:
@@ -362,8 +364,12 @@ def test_graph_encoder_batches_graphs_and_backpropagates() -> None:
 
 
 @pytest.mark.parametrize("validate_startup", [False, True])
-def test_graph_encoder_scans_contents_only_at_opted_in_startup(monkeypatch, validate_startup) -> None:
-    encoder = TorchGraphEncoder(GraphEncoderConfig(node_feature_dim=4, validate_startup=validate_startup))
+def test_graph_encoder_scans_contents_only_at_opted_in_startup(
+    monkeypatch, validate_startup
+) -> None:
+    encoder = TorchGraphEncoder(
+        GraphEncoderConfig(node_feature_dim=4, validate_startup=validate_startup)
+    )
     batch = {
         NODE_FEATURES: np.zeros((2, 4), dtype=np.float32),
         EDGE_INDEX: np.empty((2, 0), dtype=np.int64),
@@ -372,9 +378,11 @@ def test_graph_encoder_scans_contents_only_at_opted_in_startup(monkeypatch, vali
     }
     calls = []
     original = torch.isfinite
+
     def finite(value):
         calls.append(value)
         return original(value)
+
     monkeypatch.setattr(torch, "isfinite", finite)
     encoder({Columns.OBS: batch})
     assert len(calls) == int(validate_startup)
@@ -382,19 +390,31 @@ def test_graph_encoder_scans_contents_only_at_opted_in_startup(monkeypatch, vali
     assert len(calls) == int(validate_startup)
 
 
-def test_graph_replay_decode_and_collation_do_not_repeat_normalization(monkeypatch) -> None:
+def test_graph_replay_decode_and_collation_do_not_repeat_normalization(
+    monkeypatch,
+) -> None:
     import rllib_async.gnn.episodes as episodes_module
     import rllib_async.gnn.graph_batch as batch_module
 
     env = EgoGraphCoordinationEnv({"agent_count": 4, "episode_length": 4})
     observations, _ = env.reset(seed=20260726)
-    transition = _transition(env_t=0, agent_t=0, agent_id="agent_0", observation=observations["agent_0"])
-    codec = GraphEpisodeCodec(node_feature_dim=GRAPH_NODE_FEATURE_DIM, edge_feature_dim=GRAPH_EDGE_FEATURE_DIM)
+    transition = _transition(
+        env_t=0, agent_t=0, agent_id="agent_0", observation=observations["agent_0"]
+    )
+    codec = GraphEpisodeCodec(
+        node_feature_dim=GRAPH_NODE_FEATURE_DIM, edge_feature_dim=GRAPH_EDGE_FEATURE_DIM
+    )
     episode = _episode(codec, [transition])
+
     def unexpected_normalization(value):
         raise AssertionError("trusted replay graph was normalized again")
-    monkeypatch.setattr(episodes_module, "normalize_graph_observation", unexpected_normalization)
-    monkeypatch.setattr(batch_module, "normalize_graph_observation", unexpected_normalization)
+
+    monkeypatch.setattr(
+        episodes_module, "normalize_graph_observation", unexpected_normalization
+    )
+    monkeypatch.setattr(
+        batch_module, "normalize_graph_observation", unexpected_normalization
+    )
     sampled = codec.get_module_transition(episode, SHARED_GNN_MODULE_ID, 0)
     batch = GraphBatchCollator(module_id=SHARED_GNN_MODULE_ID).collate([sampled])
     assert batch[SHARED_GNN_MODULE_ID][Columns.REWARDS].shape == (1,)

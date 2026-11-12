@@ -77,7 +77,9 @@ class FlatEpisodePayload:
             raise EpisodeValidationError("an episode must contain a transition")
         if any(type(item) is not bytes for item in self.encoded_transitions):
             raise EpisodeValidationError("encoded transitions must be bytes")
-        object.__setattr__(self, "_estimated_bytes", sum(map(len, self.encoded_transitions)))
+        object.__setattr__(
+            self, "_estimated_bytes", sum(map(len, self.encoded_transitions))
+        )
 
     def __getstate__(self) -> list[object]:
         return [self.encoded_transitions, self._estimated_bytes]

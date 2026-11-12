@@ -112,9 +112,10 @@ def test_envelope_requires_a_completed_episode_and_behavior_version() -> None:
         replace(episode, behavior_versions=FrozenVersions({}))
 
 
-def test_cached_payload_size_preserves_legacy_pickle_and_fingerprint(monkeypatch) -> None:
+def test_cached_payload_size_preserves_legacy_pickle_and_fingerprint(
+    monkeypatch,
+) -> None:
     import rllib_async.protocols.episodes as module
-
     from rllib_async.replay.reference import EpisodeStore
 
     current_type = module.FlatEpisodePayload
@@ -129,17 +130,28 @@ def test_cached_payload_size_preserves_legacy_pickle_and_fingerprint(monkeypatch
     episode = make_episode(FlatEpisodeCodec())
     with monkeypatch.context() as patch:
         patch.setattr(module, "FlatEpisodePayload", legacy_type)
-        legacy_episode = replace(episode, payload=legacy_type(transitions), estimated_bytes=sum(map(len, transitions)))
+        legacy_episode = replace(
+            episode,
+            payload=legacy_type(transitions),
+            estimated_bytes=sum(map(len, transitions)),
+        )
         legacy_bytes = pickle.dumps(legacy_episode, protocol=5)
     restored_episode = pickle.loads(legacy_bytes)
     restored = restored_episode.payload
     assert isinstance(restored, current_type)
     assert restored.estimated_bytes == sum(map(len, transitions))
-    assert EpisodeStore._fingerprint(restored_episode) == hashlib.sha256(legacy_bytes).digest()
+    assert (
+        EpisodeStore._fingerprint(restored_episode)
+        == hashlib.sha256(legacy_bytes).digest()
+    )
+
     def unexpected_recount(self):
         raise AssertionError("transport recalculated payload size")
+
     monkeypatch.setattr(current_type, "__post_init__", unexpected_recount)
-    assert pickle.loads(pickle.dumps(restored)).estimated_bytes == restored.estimated_bytes
+    assert (
+        pickle.loads(pickle.dumps(restored)).estimated_bytes == restored.estimated_bytes
+    )
 
     # A cached read must not touch the encoded transition sequence again.
     class Unreadable:
