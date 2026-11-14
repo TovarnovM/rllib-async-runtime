@@ -5,6 +5,10 @@
 `b0ba209ca066d882046a986f14f5b437ff1edd81`, включая локальную GPU-приёмку этапа 1.
 Зависимости не изменены: Ray/RLlib 2.56.1, PyTorch 2.7.0, Python 3.11.
 
+**Статус на 2026-11-14:** реализация и CPU gate завершены. Полная приёмка
+этапа 2 ещё требует реального GPU compatibility run; результаты этапа 1
+не подменяют проверку новых recurrent/mixed путей.
+
 ## Что реализовано
 
 | Возможность | Реализация и граница |
@@ -108,6 +112,8 @@ batch одноимённая колонка RLlib содержит сумму ф
 - Пустые delta не декодируют опыт и не перестраивают индексы.
 - В controller приходят summaries и ссылки, а не полные episode payload.
 - Счётчики решений модулей передаются существующим rollout RPC.
+- Завершившие подзадачу агенты исключаются из inference через штатный
+  connector seam; их реальные final observations остаются в replay.
 - Публикация полного inference bundle выполняется с заданным интервалом.
 - Дорогие структурные проверки не выполняются на каждом event-loop tick.
 
@@ -126,6 +132,15 @@ Temporal environment предоставляет целый `world_t`. Один `
 подзадача с отдельным agent ID. Её окончание не завершает задачу менеджера.
 Time-limit truncation сохраняет bootstrap; граница выбранного окна не
 становится terminal.
+
+В provenance эпизода перечисляются только реально участвовавшие модули;
+публикация и checkpoint при этом содержат полную команду. Evaluation проверяет
+версии участвовавших модулей относительно своего замороженного bundle.
+
+Seed задаётся один раз на экземпляр temporal environment. При последующих
+эпизодах RNG продолжает последовательность, поэтому скрытая подсказка
+DEMO-03 меняется. Повторный запуск с тем же seed воспроизводит эту
+последовательность; это проверено через настоящий collector.
 
 Epsilon использует реальные решения конкретного модуля. На границах эпизодов
 runner получает накопленные member-wide counts завершённых эпизодов, затем
@@ -155,6 +170,39 @@ CLI поддерживает `--seed`, `--steps`, `--updates`, `--timeout-s`, `-
 сравнение качества на строго одинаковом объёме данных.
 
 ## Проверки
+
+Проверенный код:
+[`6d22868bc1a9d04754409aabc4b0c9192648ca58`](https://github.com/TovarnovM/rllib-async-runtime/commit/6d22868bc1a9d04754409aabc4b0c9192648ca58).
+Полный [CI run 43617814875](https://github.com/TovarnovM/rllib-async-runtime/actions/runs/43617814875)
+завершился успешно на Ubuntu 24.04, Python 3.11.15, PyTorch 2.7.0+cpu.
+
+| Проверка | Результат |
+| --- | --- |
+| `ruff check .` | PASS |
+| `ruff format --check --diff .` | PASS, 106 файлов |
+| Полный CPU pytest с `--durations=20` | 427 passed, 15 deselected, 0 skipped, 24 warnings |
+| Время CPU pytest | 366.59 с |
+| Реальный GPU gate этапа 2 | Не запускался в этой среде |
+
+Сквозные integration cases подтвердили joint recurrent DQN/DQN/SAC,
+frozen workers, публикацию, evaluation и checkpoint/resume. Задача памяти
+проверена через основной runtime для graph DQN и vector SAC. CLI-команды
+отдельно не запускались; команды для локальной проверки приведены в
+разделе «Демонстраторы».
+
+Сохранён session-scoped Ray cluster; тесты владеют своими actors и проверяют
+их завершение. Новый mixed checkpoint/resume case занял 15.89 с, frozen
+workers — 7.60 с, две задачи памяти — 7.42 и 7.50 с. Самыми дорогими остались
+существующие population checkpoint cases: 62.13 и 59.60 с.
+
+Предыдущий прогон функционально того же кода до форматирования одной строки
+дал 427 passed за 294.26 с. Исторический CPU baseline этапа 1 — 335 passed
+за 255.80 с, см. [отчёт этапа 1](DQN_STAGE1_STATUS_RU.md).
+Эти GitHub-hosted runs выполнены на разных экземплярах runner. Парный
+baseline на одной машине здесь не выполнялся, поэтому эти timings не
+доказывают ни ускорение, ни величину регрессии. Полный список длительностей
+сохранён в CI log; network/memory/throughput и learning-quality кампании
+остаются отдельными работами этапа 3.
 
 Новые focused tests расположены в `test_replay_sequences.py`,
 `test_recurrent_algorithms.py`, `test_temporal_hierarchy.py`,
