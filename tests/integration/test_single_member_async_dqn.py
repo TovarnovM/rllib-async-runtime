@@ -160,9 +160,10 @@ def test_dqn_runtime_publishes_evaluates_and_resumes(
         assert source_learner.fast_replay.cursor == saved.replay_cursor
         assert source_learner.fast_replay.active_cursor == saved.replay_cursor
         assert len(source_learner.accelerator_ids) == num_gpus_per_learner
-        assert source_learner.learner_updates == saved.controller[
-            "learner_updates_completed"
-        ]
+        assert (
+            source_learner.learner_updates
+            == saved.controller["learner_updates_completed"]
+        )
         replay = ray.get(runtime._replay_actor.get_stats.remote(), timeout=10)
         assert replay.cursor == saved.replay_cursor
         source_clock, source_epsilon = exploration_state(runtime)
