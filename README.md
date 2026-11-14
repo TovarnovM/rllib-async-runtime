@@ -55,8 +55,15 @@ All remaining commands in this README run inside the devcontainer:
 uv run --locked --extra cu118 --group dev ruff check .
 uv run --locked --extra cu118 --group dev ruff format --check .
 uv run --locked --extra cu118 --group dev \
-  pytest -m "not gpu and not cluster and not stress"
+  pytest --durations=20 -m "not gpu and not cluster and not stress"
 ```
+
+Ray-backed tests share one local Ray cluster per pytest session; individual
+tests still create and stop their own actors. Population lifecycle tests use
+one rollout runner per member, while single-member recovery retains two
+runner generations. Dedicated four-runner integration tests continue to cover
+asynchronous completion, weight lag, runner restart, and commit backpressure.
+The duration report includes setup and teardown costs as well as test calls.
 
 The CPU-only GitHub Actions job uses the same lock file with the mutually
 exclusive `cpu` PyTorch extra. Keep the selected extra on the `uv run` command,

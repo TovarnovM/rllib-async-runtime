@@ -36,9 +36,9 @@ jobs:
         run: uv run ruff check .
 
       - name: Check formatting
-        run: uv run ruff format --check .
+        run: uv run ruff format --check --diff .
 
       - name: Run CPU tests
         run: >-
           uv run --locked --extra cpu --group dev
-          pytest -m "not gpu and not cluster and not stress"
+          pytest --durations=20 -m "not gpu and not cluster and not stress"

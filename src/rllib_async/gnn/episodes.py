@@ -247,6 +247,25 @@ class GraphEpisodeCodec(MultiModuleEpisodeCodec):
             action_mask_dim=self._action_mask_dim,
         )
 
+    def get_transition(
+        self, episode: EpisodeEnvelope, index: int, *, validate: bool = True
+    ) -> object:
+        transition = super().get_transition(episode, index, validate=validate)
+        return self._normalize_transition(transition) if validate else transition
+
+    def get_module_transition(
+        self,
+        episode: EpisodeEnvelope,
+        module_id: str,
+        index: int,
+        *,
+        validate: bool = True,
+    ) -> MultiModuleTransition:
+        transition = super().get_module_transition(
+            episode, module_id, index, validate=validate
+        )
+        return self._normalize_transition(transition) if validate else transition
+
     def _payload(self, episode: EpisodeEnvelope) -> GraphEpisodePayload:
         if not isinstance(episode.payload, GraphEpisodePayload):
             raise EpisodeValidationError(
@@ -264,7 +283,7 @@ class GraphEpisodeCodec(MultiModuleEpisodeCodec):
 
     def _normalize_transition(
         self,
-        transition: MultiModuleTransition,
+        transition: object,
     ) -> MultiModuleTransition:
         if not isinstance(transition, MultiModuleTransition):
             raise EpisodeValidationError(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pickle
 import random
 from dataclasses import replace
 
@@ -307,6 +308,93 @@ def test_graph_batch_collates_empty_edges_one_node_and_different_sizes() -> None
         ).collate(mixed)
 
 
+def test_graph_startup_checks_scalars_and_retries_until_batch_succeeds(
+    monkeypatch,
+) -> None:
+    import rllib_async.gnn.graph_batch as batch_module
+
+    transition = _transition(
+        env_t=0,
+        agent_t=0,
+        agent_id="agent_0",
+        observation={
+            NODE_FEATURES: np.zeros((1, 1), dtype=np.float32),
+            EDGE_INDEX: np.empty((2, 0), dtype=np.int64),
+            CONTROLLED_NODE: 0,
+        },
+    )
+    collator = GraphBatchCollator(module_id=SHARED_GNN_MODULE_ID, validate_startup=True)
+    invalid_reward = replace(
+        transition, data={**transition.data, Columns.REWARDS: "bad"}
+    )
+    with pytest.raises(BatchCollationError, match="numeric or boolean"):
+        collator.collate([invalid_reward])
+
+    invalid_graph = replace(
+        transition,
+        data={
+            **transition.data,
+            Columns.NEXT_OBS: {**transition.data[Columns.NEXT_OBS], CONTROLLED_NODE: 1},
+        },
+    )
+    with pytest.raises(BatchCollationError, match="controlled_node"):
+        collator.collate([invalid_graph])
+    # A failure after scalar validation must not consume the startup check either.
+    with pytest.raises(BatchCollationError, match="numeric or boolean"):
+        collator.collate([invalid_reward])
+    batch = collator.collate([transition])[SHARED_GNN_MODULE_ID]
+    np.testing.assert_array_equal(batch[Columns.REWARDS], [0.0])
+
+    scalar_collate = batch_module.FlatBatchCollator.collate
+
+    def unchecked_scalars_only(self, rows):
+        assert not self._validate, "scalar validation repeated after startup"
+        return scalar_collate(self, rows)
+
+    def unexpected_normalization(value):
+        raise AssertionError("graph validation repeated after startup")
+
+    monkeypatch.setattr(
+        batch_module.FlatBatchCollator, "collate", unchecked_scalars_only
+    )
+    monkeypatch.setattr(
+        batch_module, "normalize_graph_observation", unexpected_normalization
+    )
+    for _ in range(2):
+        batch = collator.collate([transition])[SHARED_GNN_MODULE_ID]
+        np.testing.assert_array_equal(batch[Columns.REWARDS], [0.0])
+
+
+@pytest.mark.parametrize("decoder", ["get_transition", "get_module_transition"])
+def test_public_graph_decode_rejects_malformed_contents(decoder: str) -> None:
+    codec = GraphEpisodeCodec(node_feature_dim=1)
+    transition = _transition(
+        env_t=0,
+        agent_t=0,
+        agent_id="agent_0",
+        observation={
+            NODE_FEATURES: np.zeros((1, 1), dtype=np.float32),
+            EDGE_INDEX: np.empty((2, 0), dtype=np.int64),
+            CONTROLLED_NODE: 0,
+        },
+    )
+    episode = _episode(codec, [transition])
+    module_id, transitions = episode.payload.encoded_module_transitions[0]
+    data = pickle.loads(transitions[0].encoded_data)
+    data[Columns.OBS][CONTROLLED_NODE] = 1
+    encoded = replace(transitions[0], encoded_data=pickle.dumps(data, protocol=5))
+    payload = replace(
+        episode.payload, encoded_module_transitions=((module_id, (encoded,)),)
+    )
+    malformed = replace(
+        episode, payload=payload, estimated_bytes=payload.estimated_bytes
+    )
+    codec.validate(malformed)  # Valid metadata does not imply valid graph contents.
+    args = (malformed, 0) if decoder == "get_transition" else (malformed, module_id, 0)
+    with pytest.raises(EpisodeValidationError, match="controlled_node"):
+        getattr(codec, decoder)(*args)
+
+
 def test_packed_graph_batch_rejects_cross_graph_edges() -> None:
     batch = {
         NODE_FEATURES: np.zeros((2, 4), dtype=np.float32),
@@ -390,8 +478,10 @@ def test_graph_encoder_scans_contents_only_at_opted_in_startup(
     assert len(calls) == int(validate_startup)
 
 
+@pytest.mark.parametrize("decoder", ["get_transition", "get_module_transition"])
 def test_graph_replay_decode_and_collation_do_not_repeat_normalization(
     monkeypatch,
+    decoder: str,
 ) -> None:
     import rllib_async.gnn.episodes as episodes_module
     import rllib_async.gnn.graph_batch as batch_module
@@ -415,6 +505,11 @@ def test_graph_replay_decode_and_collation_do_not_repeat_normalization(
     monkeypatch.setattr(
         batch_module, "normalize_graph_observation", unexpected_normalization
     )
-    sampled = codec.get_module_transition(episode, SHARED_GNN_MODULE_ID, 0)
+    args = (
+        (episode, 0)
+        if decoder == "get_transition"
+        else (episode, SHARED_GNN_MODULE_ID, 0)
+    )
+    sampled = getattr(codec, decoder)(*args, validate=False)
     batch = GraphBatchCollator(module_id=SHARED_GNN_MODULE_ID).collate([sampled])
     assert batch[SHARED_GNN_MODULE_ID][Columns.REWARDS].shape == (1,)

@@ -50,7 +50,8 @@ def make_configs() -> tuple[SACConfig, AsyncSACRuntimeConfig]:
         .debugging(seed=20260725)
     )
     runtime_config = AsyncSACRuntimeConfig(
-        runner_count=4,
+        # Keep multiple runner generations in restore tests without four workers.
+        runner_count=2,
         max_episode_steps=4,
         replay_capacity_transitions=1_024,
         replay_capacity_bytes=10_000_000,
