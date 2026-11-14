@@ -12,7 +12,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import gymnasium as gym
 import ray
+from ray.rllib.algorithms.dqn import DQNConfig
 from ray.rllib.algorithms.sac import SACConfig
 from ray.rllib.env.single_agent_env_runner import SingleAgentEnvRunner
 from ray.tune import Trainable
@@ -61,9 +63,12 @@ class RuntimeState(str, Enum):
 class SingleMemberAsyncSAC:
     """Compose rollout, replay, learner, evaluation, and lifecycle explicitly."""
 
+    _algorithm = "sac"
+    _algorithm_config_type = SACConfig
+
     def __init__(
         self,
-        sac_config: SACConfig,
+        sac_config: SACConfig | DQNConfig,
         runtime_config: AsyncSACRuntimeConfig,
         *,
         checkpoint_dir: str | os.PathLike[str] | None = None,
@@ -74,9 +79,12 @@ class SingleMemberAsyncSAC:
         worker_bundle_start: int = 2,
     ) -> None:
         if not ray.is_initialized():
-            raise RuntimeError("Ray must be initialized before SingleMemberAsyncSAC")
-        if not isinstance(sac_config, SACConfig):
-            raise TypeError("sac_config must be an SACConfig")
+            raise RuntimeError(f"Ray must be initialized before {type(self).__name__}")
+        if not isinstance(sac_config, self._algorithm_config_type):
+            raise TypeError(
+                f"{self._algorithm}_config must be an "
+                f"{self._algorithm_config_type.__name__}"
+            )
         if not isinstance(runtime_config, AsyncSACRuntimeConfig):
             raise TypeError("runtime_config must be an AsyncSACRuntimeConfig")
         if sac_config.num_learners != 0:
@@ -84,7 +92,9 @@ class SingleMemberAsyncSAC:
         if float(sac_config.num_gpus_per_learner) != (
             runtime_config.num_gpus_per_learner
         ):
-            raise ValueError("SAC and runtime num_gpus_per_learner settings must match")
+            raise ValueError(
+                "algorithm and runtime num_gpus_per_learner settings must match"
+            )
         if checkpoint_dir is not None and replay_actor is not None:
             raise ValueError(
                 "standalone checkpoint restore cannot replace an external replay"
@@ -101,6 +111,10 @@ class SingleMemberAsyncSAC:
             raise ValueError("PBT construction requires an external replay")
         if pbt_state is not None and not isinstance(pbt_state, PBTModelState):
             raise TypeError("pbt_state must be PBTModelState")
+        if self._algorithm == "dqn" and (
+            pbt_state is not None or replay_actor is not None
+        ):
+            raise ValueError("DQN population and PBT runtime support is not available")
         if (
             not isinstance(reward_window_episodes, int)
             or isinstance(reward_window_episodes, bool)
@@ -1036,6 +1050,7 @@ class SingleMemberAsyncSAC:
         learner_update_budget = self._learner_update_budget(rollout)
         return {
             "member_id": self._config.member_id,
+            "algorithm": self._algorithm,
             "state": self._state.value,
             "owns_replay_actor": self._owns_replay_actor,
             "pump_iterations": self._pump_iterations,
@@ -1074,6 +1089,7 @@ class SingleMemberAsyncSAC:
     ) -> dict[str, Any]:
         return {
             "state_version": RUNTIME_CHECKPOINT_STATE_VERSION,
+            "algorithm": self._algorithm,
             "pump_iterations": self._pump_iterations,
             "reports": self._reports,
             "pending_rpc_high_watermark": self._pending_rpc_high_watermark,
@@ -1122,6 +1138,9 @@ class SingleMemberAsyncSAC:
         state = checkpoint.controller
         if state.get("state_version") != RUNTIME_CHECKPOINT_STATE_VERSION:
             raise ValueError("unsupported controller checkpoint state version")
+        # Version-1 checkpoints predating DQN contain SAC state only.
+        if state.get("algorithm", "sac") != self._algorithm:
+            raise ValueError("runtime checkpoint algorithm does not match")
         self._pump_iterations = self._checkpoint_counter(
             state,
             "pump_iterations",
@@ -1308,7 +1327,7 @@ class SingleMemberAsyncSAC:
             or value < 0
         ):
             raise ValueError(
-                "SAC training_intensity must be finite and non-negative or None"
+                "training_intensity must be finite and non-negative or None"
             )
         if value == 0:
             return float(batch_size)
@@ -1316,7 +1335,7 @@ class SingleMemberAsyncSAC:
 
     @staticmethod
     def _resolve_spaces(
-        config: SACConfig,
+        config: SACConfig | DQNConfig,
     ) -> Mapping[str, tuple[Any, Any]]:
         probe = SingleAgentEnvRunner(config=config, worker_index=0)
         try:
@@ -1339,8 +1358,47 @@ class SingleMemberAsyncSAC:
         return max(deadline - time.monotonic(), 0.0)
 
 
+class SingleMemberAsyncDQN(SingleMemberAsyncSAC):
+    """One-step vector DQN using the same replay and lifecycle as SAC."""
+
+    _algorithm = "dqn"
+    _algorithm_config_type = DQNConfig
+
+    def __init__(
+        self,
+        dqn_config: DQNConfig,
+        runtime_config: AsyncSACRuntimeConfig,
+        **kwargs: Any,
+    ) -> None:
+        from rllib_async.learner.dqn_adapter import prepare_dqn_config
+
+        super().__init__(prepare_dqn_config(dqn_config), runtime_config, **kwargs)
+
+    @staticmethod
+    def _resolve_spaces(config: DQNConfig) -> Mapping[str, tuple[Any, Any]]:
+        spaces = SingleMemberAsyncSAC._resolve_spaces(config)
+        for observation_space, action_space in spaces.values():
+            if not isinstance(observation_space, gym.spaces.Box):
+                raise ValueError("DQN runtime currently requires flat Box observations")
+            if not isinstance(action_space, gym.spaces.Discrete):
+                raise ValueError("DQN runtime requires a Discrete action space")
+        return spaces
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        dqn_config: DQNConfig,
+        runtime_config: AsyncSACRuntimeConfig,
+        checkpoint_dir: str | os.PathLike[str],
+    ) -> SingleMemberAsyncDQN:
+        return cls(dqn_config, runtime_config, checkpoint_dir=checkpoint_dir)
+
+
 class AsyncSACTrainable(Trainable):
     """Thin Tune controller around `SingleMemberAsyncSAC`."""
+
+    _runtime_type = SingleMemberAsyncSAC
+    _algorithm_config_key = "sac_config"
 
     @classmethod
     def default_resource_request(
@@ -1438,14 +1496,14 @@ class AsyncSACTrainable(Trainable):
         if member_checkpoint_state is not None:
             if replay_actor is None:
                 raise ValueError("population member checkpoint requires shared replay")
-            self._runtime = SingleMemberAsyncSAC.from_member_checkpoint_state(
+            self._runtime = self._runtime_type.from_member_checkpoint_state(
                 self._sac_config,
                 self._runtime_config,
                 member_checkpoint_state,
                 replay_actor=replay_actor,
             )
         else:
-            self._runtime = SingleMemberAsyncSAC(
+            self._runtime = self._runtime_type(
                 self._sac_config,
                 self._runtime_config,
                 replay_actor=replay_actor,
@@ -1464,11 +1522,11 @@ class AsyncSACTrainable(Trainable):
 
     def load_checkpoint(self, checkpoint: object) -> None:
         if not isinstance(checkpoint, str | os.PathLike):
-            raise TypeError("AsyncSACTrainable requires a directory checkpoint")
+            raise TypeError(f"{type(self).__name__} requires a directory checkpoint")
         previous = self._runtime
         previous.stop(graceful=False)
         if previous.owns_replay_actor:
-            restored = SingleMemberAsyncSAC.from_checkpoint(
+            restored = self._runtime_type.from_checkpoint(
                 self._sac_config,
                 self._runtime_config,
                 checkpoint,
@@ -1480,7 +1538,7 @@ class AsyncSACTrainable(Trainable):
                 self._shared_replay.actor_name,
                 namespace=self._shared_replay.namespace,
             )
-            restored = SingleMemberAsyncSAC.from_member_checkpoint(
+            restored = self._runtime_type.from_member_checkpoint(
                 self._sac_config,
                 self._runtime_config,
                 checkpoint,
@@ -1494,11 +1552,12 @@ class AsyncSACTrainable(Trainable):
         if runtime is not None:
             runtime.stop()
 
-    @staticmethod
+    @classmethod
     def _parse_config(
+        cls,
         config: Mapping[str, Any],
     ) -> tuple[
-        SACConfig,
+        SACConfig | DQNConfig,
         AsyncSACRuntimeConfig,
         SharedReplayDescriptor | None,
         RuntimeCheckpointState | None,
@@ -1507,7 +1566,7 @@ class AsyncSACTrainable(Trainable):
             raise TypeError("Trainable config must be a mapping")
         unknown = set(config) - {
             "member",
-            "sac_config",
+            cls._algorithm_config_key,
             "runtime",
             "shared_replay",
             "member_checkpoint_state",
@@ -1519,12 +1578,12 @@ class AsyncSACTrainable(Trainable):
         if member is not None:
             if not isinstance(member, Mapping):
                 raise TypeError("config['member'] must be a mapping")
-            if "sac_config" in config or "runtime" in config:
+            if cls._algorithm_config_key in config or "runtime" in config:
                 raise ValueError(
                     "population member config cannot mix nested and top-level values"
                 )
             member_unknown = set(member) - {
-                "sac_config",
+                cls._algorithm_config_key,
                 "runtime",
                 "member_checkpoint_state",
             }
@@ -1536,9 +1595,13 @@ class AsyncSACTrainable(Trainable):
         else:
             member_values = config
 
-        sac_config = member_values.get("sac_config")
-        if not isinstance(sac_config, SACConfig):
-            raise TypeError("config['sac_config'] must be an SACConfig")
+        sac_config = member_values.get(cls._algorithm_config_key)
+        config_type = cls._runtime_type._algorithm_config_type
+        if not isinstance(sac_config, config_type):
+            raise TypeError(
+                f"config[{cls._algorithm_config_key!r}] must be an "
+                f"{config_type.__name__}"
+            )
         runtime = AsyncSACRuntimeConfig.from_mapping(
             member_values.get("runtime"),
             sac_config=sac_config,
@@ -1569,3 +1632,26 @@ class AsyncSACTrainable(Trainable):
                 "config['member_checkpoint_state'] must be RuntimeCheckpointState"
             )
         return sac_config, runtime, shared_replay, member_checkpoint_state
+
+
+class AsyncDQNTrainable(AsyncSACTrainable):
+    """Tune entry point for the single-member DQN runtime."""
+
+    _runtime_type = SingleMemberAsyncDQN
+    _algorithm_config_key = "dqn_config"
+
+    @classmethod
+    def _parse_config(
+        cls, config: Mapping[str, Any]
+    ) -> tuple[
+        SACConfig | DQNConfig,
+        AsyncSACRuntimeConfig,
+        SharedReplayDescriptor | None,
+        RuntimeCheckpointState | None,
+    ]:
+        if isinstance(config, Mapping) and any(
+            config.get(key) is not None
+            for key in ("member", "shared_replay", "member_checkpoint_states")
+        ):
+            raise ValueError("DQN population runtime support is not available")
+        return super()._parse_config(config)

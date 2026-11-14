@@ -79,7 +79,9 @@ class GraphEpisodePayload(MultiModuleEpisodePayload):
         )
 
 
-def normalize_graph_observation(observation: object) -> dict[str, Any]:
+def normalize_graph_observation(
+    observation: object, *, terminated: bool = False
+) -> dict[str, Any]:
     """Validate one graph and strip optional fixed-space transport padding."""
 
     if not isinstance(observation, Mapping):
@@ -189,7 +191,7 @@ def normalize_graph_observation(observation: object) -> dict[str, Any]:
         if (
             not action_mask.size
             or not np.all((action_mask == 0) | (action_mask == 1))
-            or not np.any(action_mask > 0)
+            or (not terminated and not np.any(action_mask > 0))
         ):
             raise EpisodeValidationError(
                 "action_mask must be binary and enable at least one action"
@@ -294,8 +296,13 @@ class GraphEpisodeCodec(MultiModuleEpisodeCodec):
                 "graph transitions must contain the exact SAC transition columns"
             )
         data = dict(transition.data)
+        terminated = data[Columns.TERMINATEDS]
+        if not isinstance(terminated, (bool, np.bool_)):
+            raise EpisodeValidationError("terminateds must be boolean")
         data[Columns.OBS] = normalize_graph_observation(data[Columns.OBS])
-        data[Columns.NEXT_OBS] = normalize_graph_observation(data[Columns.NEXT_OBS])
+        data[Columns.NEXT_OBS] = normalize_graph_observation(
+            data[Columns.NEXT_OBS], terminated=bool(terminated)
+        )
         self._validate_feature_schema(data[Columns.OBS])
         self._validate_feature_schema(data[Columns.NEXT_OBS])
         return MultiModuleTransition(

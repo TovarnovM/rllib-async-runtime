@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import ClassVar
 
+from ray.rllib.algorithms.dqn import DQNConfig
 from ray.rllib.core import DEFAULT_MODULE_ID
 from ray.rllib.core.columns import Columns
 
@@ -71,6 +72,7 @@ class FakeRolloutActor:
         self._weights = initial_weights
         self.effective_seed = effective_seed
         self.weight_arguments: list[WeightsDescriptor | None] = []
+        self.exploration_clocks: list[int | None] = []
         self.collect_episode = FakeRemoteMethod(self._collect_episode)
         self.collect_episode_refs = FakeSplitRemoteMethod(self._collect_episode)
 
@@ -79,7 +81,9 @@ class FakeRolloutActor:
         weights: WeightsDescriptor | None,
         *,
         explore: bool,
+        sampled_env_steps: int | None = None,
     ) -> EpisodeRolloutResult:
+        self.exploration_clocks.append(sampled_env_steps)
         self.weight_arguments.append(weights)
         if weights is not None:
             self._weights = weights
@@ -233,6 +237,48 @@ def make_group(
         num_cpus_per_runner=0,
         checkpoint_state=checkpoint_state,
     )
+
+
+def test_dqn_exploration_clock_survives_rollout_restore(monkeypatch) -> None:
+    install_fake_ray(monkeypatch)
+    codec = FlatEpisodeCodec()
+    config = DQNConfig().environment("CartPole-v1")
+
+    def create_group(checkpoint_state=None):
+        return AsyncRolloutGroup(
+            config,
+            codec,
+            FakeReplayActor(codec),
+            member_id="member-0",
+            initial_weights=make_weights(0),
+            runner_count=1,
+            max_episode_steps=10,
+            pending_commit_high_watermark=1,
+            pending_commit_low_watermark=0,
+            num_cpus_per_runner=0,
+            checkpoint_state=checkpoint_state,
+        )
+
+    group = create_group()
+    try:
+        group.start()
+        group.pause()
+        group.drain(timeout_s=1)
+        state = group.get_checkpoint_state()
+        assert state["env_steps"] == 1
+        assert FakeRolloutActorClass.created["runner-0"].exploration_clocks == [0]
+    finally:
+        group.stop()
+
+    restored = create_group(state)
+    try:
+        restored.start()
+        restored.pause()
+        restored.drain(timeout_s=1)
+        assert FakeRolloutActorClass.created["runner-0"].exploration_clocks == [1]
+        assert restored.get_checkpoint_state()["env_steps"] == 2
+    finally:
+        restored.stop()
 
 
 def test_watermark_reserves_commit_capacity_before_sampling(monkeypatch) -> None:

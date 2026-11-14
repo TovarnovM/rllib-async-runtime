@@ -1,5 +1,18 @@
 """RLlib learner adapters owned by the asynchronous runtime."""
 
+from rllib_async.learner.dqn_adapter import (
+    DQN_ADAPTER_STATE_VERSION,
+    DQN_TARGET_UPDATE_STATE,
+    CheckpointableDQNTorchLearner,
+    DQNBatchError,
+    DQNLearnerAdapter,
+    DQNLearnerAdapterError,
+    DQNUpdateResult,
+    build_rllib_dqn_batch,
+    build_rllib_multi_module_dqn_batch,
+    prepare_dqn_config,
+    validate_dqn_config,
+)
 from rllib_async.learner.sac_adapter import (
     PBT_MODEL_STATE_VERSION,
     SAC_ADAPTER_STATE_VERSION,
@@ -16,16 +29,27 @@ from rllib_async.learner.sac_adapter import (
 )
 
 __all__ = [
+    "DQN_ADAPTER_STATE_VERSION",
+    "DQN_TARGET_UPDATE_STATE",
     "PBT_MODEL_STATE_VERSION",
     "SAC_ADAPTER_STATE_VERSION",
     "SAC_TARGET_UPDATE_STATE",
     "SAC_TEMPERATURE_STATE",
+    "CheckpointableDQNTorchLearner",
     "CheckpointableSACTorchLearner",
+    "DQNBatchError",
+    "DQNLearnerAdapter",
+    "DQNLearnerAdapterError",
+    "DQNUpdateResult",
     "PBTModelState",
     "SACBatchError",
     "SACLearnerAdapter",
     "SACLearnerAdapterError",
     "SACUpdateResult",
+    "build_rllib_dqn_batch",
+    "build_rllib_multi_module_dqn_batch",
     "build_rllib_multi_module_sac_batch",
     "build_rllib_sac_batch",
+    "prepare_dqn_config",
+    "validate_dqn_config",
 ]

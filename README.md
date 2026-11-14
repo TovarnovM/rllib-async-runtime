@@ -25,6 +25,14 @@ rollout, replay-isolated evaluation, and a Tune-compatible end-to-end event
 pump. It does **not** yet implement PBT exploit/explore or centralized
 full-graph inference.
 
+The `feature/dqn-hierarchy-gnn` branch starts the next development stage:
+one-step DQN on the existing asynchronous runtime, packed graph DQN, and
+continuous graph SAC with separate actor/critic encoders. The
+[stage 1 capability report](docs/DQN_STAGE1_STATUS_RU.md) distinguishes the
+implemented component and runtime paths from the remaining hierarchy,
+sequence replay, and Rainbow work in the
+[technical specification](docs/DQN_HIERARCHY_GNN_SPEC_RU.md).
+
 ## Development contract
 
 Local development, dependency installation, linting, tests, and debugging are

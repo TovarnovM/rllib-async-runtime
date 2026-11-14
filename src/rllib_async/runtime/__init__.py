@@ -15,10 +15,16 @@ from rllib_async.runtime.checkpoint import (
     read_runtime_checkpoint,
     read_runtime_member_checkpoint,
 )
-from rllib_async.runtime.config import AsyncSACRuntimeConfig, SharedReplayDescriptor
+from rllib_async.runtime.config import (
+    AsyncRuntimeConfig,
+    AsyncSACRuntimeConfig,
+    SharedReplayDescriptor,
+)
 from rllib_async.runtime.controller import (
+    AsyncDQNTrainable,
     AsyncSACTrainable,
     RuntimeState,
+    SingleMemberAsyncDQN,
     SingleMemberAsyncSAC,
 )
 from rllib_async.runtime.evaluation import (
@@ -49,7 +55,9 @@ from rllib_async.runtime.population import (
 
 __all__ = [
     "PBT_STATE_FILENAME",
+    "AsyncDQNTrainable",
     "AsyncEvaluationGroup",
+    "AsyncRuntimeConfig",
     "AsyncSACRuntimeConfig",
     "AsyncSACTrainable",
     "EvaluationGroupError",
@@ -79,6 +87,7 @@ __all__ = [
     "RuntimeState",
     "SharedReplayDescriptor",
     "SimplePBTConfig",
+    "SingleMemberAsyncDQN",
     "SingleMemberAsyncSAC",
     "make_runtime_member_id",
     "read_pbt_checkpoint_metadata",

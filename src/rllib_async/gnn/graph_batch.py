@@ -28,14 +28,21 @@ def pack_graph_observations(
     observations: Sequence[object],
     *,
     validate: bool = True,
+    terminated: Sequence[bool] | None = None,
 ) -> GraphBatch:
     """Pack validated ego-graphs without padding or copied per-graph models."""
 
     if not observations:
         raise BatchCollationError("graph collation requires at least one observation")
+    terminal_rows = (
+        _terminal_rows(terminated, len(observations)) if validate else None
+    )
     try:
         graphs = (
-            [normalize_graph_observation(item) for item in observations]
+            [
+                normalize_graph_observation(item, terminated=bool(terminal_rows[index]))
+                for index, item in enumerate(observations)
+            ]
             if validate
             else observations
         )
@@ -103,10 +110,16 @@ def pack_graph_observations(
             np.stack(masks, axis=0),
             dtype=np.float32,
         )
-    return validate_packed_graph_batch(packed) if validate else packed
+    return (
+        validate_packed_graph_batch(packed, terminated=terminal_rows)
+        if validate
+        else packed
+    )
 
 
-def validate_packed_graph_batch(batch: object) -> GraphBatch:
+def validate_packed_graph_batch(
+    batch: object, *, terminated: Sequence[bool] | None = None
+) -> GraphBatch:
     """Validate and normalize the NumPy packed-graph learner boundary."""
 
     if not isinstance(batch, Mapping):
@@ -186,6 +199,7 @@ def validate_packed_graph_batch(batch: object) -> GraphBatch:
             dtype=np.float32,
         )
     if ACTION_MASK in batch:
+        terminal_rows = _terminal_rows(terminated, graph_count)
         action_mask = _batch_array(
             batch[ACTION_MASK],
             name=ACTION_MASK,
@@ -195,7 +209,7 @@ def validate_packed_graph_batch(batch: object) -> GraphBatch:
             action_mask.shape[0] != graph_count
             or action_mask.shape[1] < 1
             or not np.all((action_mask == 0) | (action_mask == 1))
-            or np.any(np.sum(action_mask > 0, axis=1) < 1)
+            or np.any((np.sum(action_mask > 0, axis=1) < 1) & ~terminal_rows)
         ):
             raise BatchCollationError(
                 "packed action_mask must be binary and enable an action per graph"
@@ -262,10 +276,21 @@ class GraphBatchCollator:
             observations, validate=self._validate_next_batch
         )
         batch[Columns.NEXT_OBS] = pack_graph_observations(
-            next_observations, validate=self._validate_next_batch
+            next_observations,
+            validate=self._validate_next_batch,
+            terminated=batch[Columns.TERMINATEDS],
         )
         self._validate_next_batch = False
         return batch
+
+
+def _terminal_rows(value: Sequence[bool] | None, graph_count: int) -> np.ndarray:
+    if value is None:
+        return np.zeros(graph_count, dtype=np.bool_)
+    rows = np.asarray(value)
+    if rows.dtype.kind != "b" or rows.shape != (graph_count,):
+        raise BatchCollationError("terminateds must contain one boolean per graph")
+    return rows
 
 
 def _batch_array(value: object, *, name: str, ndim: int) -> np.ndarray:

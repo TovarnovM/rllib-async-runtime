@@ -1,4 +1,4 @@
-"""Pure-PyTorch ego-graph encoder exposed through RLlib's SAC catalog seam."""
+"""Pure-PyTorch graph encoder exposed through RLlib's catalog seams."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Any
 
 import gymnasium as gym
 import torch
+from ray.rllib.algorithms.dqn.dqn_catalog import DQNCatalog
 from ray.rllib.algorithms.sac.sac_catalog import SACCatalog
 from ray.rllib.core.columns import Columns
 from ray.rllib.core.models.base import ENCODER_OUT, Encoder
@@ -15,6 +16,7 @@ from ray.rllib.core.models.configs import ModelConfig
 from ray.rllib.core.models.torch.base import TorchModel
 
 from rllib_async.gnn.episodes import (
+    ACTION_MASK,
     CONTROLLED_NODE,
     EDGE_COUNT,
     EDGE_FEATURES,
@@ -32,11 +34,13 @@ class GraphEncoderConfig(ModelConfig):
     edge_feature_dim: int = 0
     hidden_dim: int = 32
     message_layers: int = 2
+    output_dim: int | None = None
+    readout: str = "controlled_node_and_mean"
     validate_startup: bool = False
 
     @property
     def output_dims(self) -> tuple[int, ...]:
-        return (self.hidden_dim,)
+        return (self.hidden_dim if self.output_dim is None else self.output_dim,)
 
     def build(self, framework: str = "torch") -> Encoder:
         if framework != "torch":
@@ -45,6 +49,7 @@ class GraphEncoderConfig(ModelConfig):
             ("node_feature_dim", self.node_feature_dim),
             ("hidden_dim", self.hidden_dim),
             ("message_layers", self.message_layers),
+            ("output_dim", self.output_dims[0]),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -56,6 +61,8 @@ class GraphEncoderConfig(ModelConfig):
             raise ValueError("edge_feature_dim must be a non-negative integer")
         if not isinstance(self.validate_startup, bool):
             raise TypeError("validate_startup must be a bool")
+        if self.readout not in ("controlled_node_and_mean", "mean"):
+            raise ValueError("readout must be controlled_node_and_mean or mean")
         return TorchGraphEncoder(self)
 
 
@@ -90,7 +97,10 @@ class TorchGraphEncoder(TorchModel, Encoder):
             if config.edge_feature_dim
             else None
         )
-        self.readout = torch.nn.Linear(2 * config.hidden_dim, config.hidden_dim)
+        readout_width = 2 if config.readout == "controlled_node_and_mean" else 1
+        self.readout = torch.nn.Linear(
+            readout_width * config.hidden_dim, config.output_dims[0]
+        )
 
     def _forward(self, inputs: dict[str, Any], **kwargs: object) -> dict[str, Any]:
         del kwargs
@@ -102,7 +112,6 @@ class TorchGraphEncoder(TorchModel, Encoder):
         node_features = packed[NODE_FEATURES]
         edge_index = packed[EDGE_INDEX]
         graph_ptr = packed["graph_ptr"]
-        controlled = packed[CONTROLLED_NODE]
         edge_features = packed.get(EDGE_FEATURES)
 
         hidden = torch.relu(self.node_projection(node_features))
@@ -152,12 +161,9 @@ class TorchGraphEncoder(TorchModel, Encoder):
         )
         pooled.index_add_(0, graph_ids, hidden)
         pooled = pooled / graph_lengths.to(hidden.dtype).unsqueeze(-1)
-        controlled_hidden = hidden[controlled]
-        return {
-            ENCODER_OUT: torch.relu(
-                self.readout(torch.cat((controlled_hidden, pooled), dim=-1))
-            )
-        }
+        if self.config.readout == "controlled_node_and_mean":
+            pooled = torch.cat((hidden[packed[CONTROLLED_NODE]], pooled), dim=-1)
+        return {ENCODER_OUT: torch.relu(self.readout(pooled))}
 
     def _packed_tensors(
         self,
@@ -187,10 +193,12 @@ class TorchGraphEncoder(TorchModel, Encoder):
             dtype=torch.long,
             device=device,
         )
-        controlled = self._tensor(
-            observations.get(CONTROLLED_NODE),
-            dtype=torch.long,
-            device=device,
+        controlled = (
+            self._tensor(
+                observations.get(CONTROLLED_NODE), dtype=torch.long, device=device
+            )
+            if self.config.readout == "controlled_node_and_mean"
+            else None
         )
         if self._validate_next_batch:
             if (
@@ -200,7 +208,10 @@ class TorchGraphEncoder(TorchModel, Encoder):
                 or edges.shape[0] != 2
                 or graph_ptr.ndim != 1
                 or len(graph_ptr) < 2
-                or controlled.shape != (len(graph_ptr) - 1,)
+                or (
+                    controlled is not None
+                    and controlled.shape != (len(graph_ptr) - 1,)
+                )
             ):
                 raise ValueError("invalid packed graph tensor shapes")
             if (
@@ -223,8 +234,9 @@ class TorchGraphEncoder(TorchModel, Encoder):
                     raise ValueError(
                         "edge_index cannot connect different packed graphs"
                     )
-            if torch.any(controlled < graph_ptr[:-1]) or torch.any(
-                controlled >= graph_ptr[1:]
+            if controlled is not None and (
+                torch.any(controlled < graph_ptr[:-1])
+                or torch.any(controlled >= graph_ptr[1:])
             ):
                 raise ValueError("controlled_node is outside its packed graph")
             if not torch.isfinite(nodes).all():
@@ -234,8 +246,9 @@ class TorchGraphEncoder(TorchModel, Encoder):
             NODE_FEATURES: nodes,
             EDGE_INDEX: edges,
             "graph_ptr": graph_ptr,
-            CONTROLLED_NODE: controlled,
         }
+        if controlled is not None:
+            packed[CONTROLLED_NODE] = controlled
         edge_features_raw = observations.get(EDGE_FEATURES)
         if self.config.edge_feature_dim:
             edge_features = self._tensor(
@@ -280,10 +293,12 @@ class TorchGraphEncoder(TorchModel, Encoder):
             dtype=torch.long,
             device=device,
         )
-        controlled = self._tensor(
-            observations.get(CONTROLLED_NODE),
-            dtype=torch.long,
-            device=device,
+        controlled = (
+            self._tensor(
+                observations.get(CONTROLLED_NODE), dtype=torch.long, device=device
+            ).reshape(-1)
+            if self.config.readout == "controlled_node_and_mean"
+            else None
         )
         if nodes.ndim == 2:
             nodes = nodes.unsqueeze(0)
@@ -291,7 +306,6 @@ class TorchGraphEncoder(TorchModel, Encoder):
             edges = edges.unsqueeze(0)
         node_counts = node_counts.reshape(-1)
         edge_counts = edge_counts.reshape(-1)
-        controlled = controlled.reshape(-1)
         batch_size = nodes.shape[0]
         if self._validate_next_batch:
             if (
@@ -301,7 +315,7 @@ class TorchGraphEncoder(TorchModel, Encoder):
                 or edges.shape[:2] != (batch_size, 2)
                 or node_counts.shape != (batch_size,)
                 or edge_counts.shape != (batch_size,)
-                or controlled.shape != (batch_size,)
+                or (controlled is not None and controlled.shape != (batch_size,))
             ):
                 raise ValueError("invalid padded graph tensor shapes")
             if not torch.isfinite(nodes).all():
@@ -311,8 +325,13 @@ class TorchGraphEncoder(TorchModel, Encoder):
                 or torch.any(node_counts > nodes.shape[1])
                 or torch.any(edge_counts < 0)
                 or torch.any(edge_counts > edges.shape[2])
-                or torch.any(controlled < 0)
-                or torch.any(controlled >= node_counts)
+                or (
+                    controlled is not None
+                    and (
+                        torch.any(controlled < 0)
+                        or torch.any(controlled >= node_counts)
+                    )
+                )
             ):
                 raise ValueError("invalid padded graph counts or controlled nodes")
 
@@ -363,9 +382,11 @@ class TorchGraphEncoder(TorchModel, Encoder):
                 dtype=torch.long,
                 device=device,
             ),
-            CONTROLLED_NODE: controlled
-            + torch.tensor(graph_ptr[:-1], dtype=torch.long, device=device),
         }
+        if controlled is not None:
+            packed[CONTROLLED_NODE] = controlled + torch.tensor(
+                graph_ptr[:-1], dtype=torch.long, device=device
+            )
         if edge_features is not None:
             packed[EDGE_FEATURES] = torch.cat(edge_feature_parts, dim=0)
         return packed
@@ -395,13 +416,18 @@ class SharedGraphSACCatalog(SACCatalog):
         super().__init__(
             observation_space=observation_space,
             action_space=action_space,
-            model_config_dict=model_config_dict,
+            model_config_dict=graph_model_config_for_role(model_config_dict, "actor"),
             view_requirements=view_requirements,
         )
-        if not isinstance(action_space, gym.spaces.Discrete):
+        if isinstance(action_space, gym.spaces.Box) and len(action_space.shape) != 1:
             raise ValueError(
-                "the Phase 10 shared-graph SAC example requires a Discrete action space"
+                "continuous graph SAC requires a one-dimensional Box action space"
             )
+        if (
+            isinstance(action_space, gym.spaces.Box)
+            and ACTION_MASK in observation_space.spaces
+        ):
+            raise ValueError("action_mask requires a Discrete action space")
 
     @classmethod
     def _get_encoder_config(
@@ -411,53 +437,106 @@ class SharedGraphSACCatalog(SACCatalog):
         action_space: gym.Space | None = None,
     ) -> ModelConfig:
         del action_space
-        if not isinstance(observation_space, gym.spaces.Dict):
-            raise ValueError("shared graph observations require a Gymnasium Dict")
-        spaces = observation_space.spaces
-        required = {
-            NODE_FEATURES,
-            EDGE_INDEX,
-            CONTROLLED_NODE,
-            NODE_COUNT,
-            EDGE_COUNT,
-        }
-        if not required.issubset(spaces):
-            raise ValueError("graph observation space is missing transport fields")
-        node_space = spaces[NODE_FEATURES]
-        edge_space = spaces[EDGE_INDEX]
-        if (
-            not isinstance(node_space, gym.spaces.Box)
-            or len(node_space.shape) != 2
-            or not isinstance(edge_space, gym.spaces.Box)
-            or len(edge_space.shape) != 2
-            or edge_space.shape[0] != 2
-        ):
-            raise ValueError("invalid graph node_features or edge_index space")
-        edge_feature_dim = 0
-        if EDGE_FEATURES in spaces:
-            edge_feature_space = spaces[EDGE_FEATURES]
-            if (
-                not isinstance(edge_feature_space, gym.spaces.Box)
-                or len(edge_feature_space.shape) != 2
-                or edge_feature_space.shape[0] != edge_space.shape[1]
-            ):
-                raise ValueError("invalid graph edge_features space")
-            edge_feature_dim = edge_feature_space.shape[1]
-        hidden_dims = model_config_dict["fcnet_hiddens"]
-        if (
-            not isinstance(hidden_dims, list | tuple)
-            or not hidden_dims
-            or any(
-                not isinstance(value, int) or isinstance(value, bool) or value < 1
-                for value in hidden_dims
+        return graph_encoder_config(observation_space, model_config_dict)
+
+
+class GraphDQNCatalog(DQNCatalog):
+    """Reuse RLlib's DQN heads with the same graph observation encoder."""
+
+    @classmethod
+    def _get_encoder_config(
+        cls,
+        observation_space: gym.Space,
+        model_config_dict: dict[str, Any],
+        action_space: gym.Space | None = None,
+    ) -> ModelConfig:
+        if not isinstance(action_space, gym.spaces.Discrete):
+            raise ValueError("graph DQN requires a Discrete action space")
+        if model_config_dict.get("graph_encoders"):
+            raise ValueError("graph DQN uses graph_encoder, not SAC graph_encoders")
+        return graph_encoder_config(observation_space, model_config_dict)
+
+
+def graph_model_config_for_role(
+    model_config: Mapping[str, Any], role: str
+) -> dict[str, Any]:
+    """Select an explicit SAC encoder role without depending on build order."""
+    result = dict(model_config)
+    encoders = result.pop("graph_encoders", {})
+    if not isinstance(encoders, Mapping):
+        raise ValueError("graph_encoders must map actor, q1, or q2 to encoder specs")
+    if set(encoders) - {"actor", "q1", "q2"}:
+        raise ValueError("graph_encoders supports only actor, q1, and q2")
+    common = result.get("graph_encoder", {})
+    if not isinstance(common, Mapping):
+        raise ValueError("graph_encoder must be an encoder spec mapping")
+    for spec in encoders.values():
+        if not isinstance(spec, Mapping):
+            raise ValueError(
+                "each graph_encoders value must be an encoder spec mapping"
             )
-        ):
-            raise ValueError("fcnet_hiddens must configure graph message layers")
-        return GraphEncoderConfig(
-            input_dims=node_space.shape,
-            node_feature_dim=node_space.shape[1],
-            edge_feature_dim=edge_feature_dim,
-            hidden_dim=hidden_dims[-1],
-            message_layers=len(hidden_dims),
-            validate_startup=model_config_dict.get("validate_startup", False),
+    result["graph_encoder"] = {**common, **encoders.get(role, {})}
+    return result
+
+
+def graph_encoder_config(
+    observation_space: gym.Space, model_config: Mapping[str, Any]
+) -> GraphEncoderConfig:
+    """Validate static graph dimensions once while constructing a catalog."""
+    if model_config.get("use_lstm") or model_config.get("use_attention"):
+        raise ValueError(
+            "graph encoders are stateless; recurrence is not supported yet"
         )
+    spec = model_config.get("graph_encoder", {})
+    if not isinstance(spec, Mapping):
+        raise ValueError("graph_encoder must be an encoder spec mapping")
+    if set(spec) - {"hidden_dim", "message_layers", "output_dim", "readout"}:
+        raise ValueError("unknown graph_encoder architecture field")
+    if not isinstance(observation_space, gym.spaces.Dict):
+        raise ValueError("shared graph observations require a Gymnasium Dict")
+    spaces = observation_space.spaces
+    required = {NODE_FEATURES, EDGE_INDEX, NODE_COUNT, EDGE_COUNT}
+    if spec.get("readout", "controlled_node_and_mean") == "controlled_node_and_mean":
+        required.add(CONTROLLED_NODE)
+    if not required.issubset(spaces):
+        raise ValueError("graph observation space is missing transport fields")
+    node_space = spaces[NODE_FEATURES]
+    edge_space = spaces[EDGE_INDEX]
+    if (
+        not isinstance(node_space, gym.spaces.Box)
+        or len(node_space.shape) != 2
+        or not isinstance(edge_space, gym.spaces.Box)
+        or len(edge_space.shape) != 2
+        or edge_space.shape[0] != 2
+    ):
+        raise ValueError("invalid graph node_features or edge_index space")
+    edge_feature_dim = 0
+    if EDGE_FEATURES in spaces:
+        edge_feature_space = spaces[EDGE_FEATURES]
+        if (
+            not isinstance(edge_feature_space, gym.spaces.Box)
+            or len(edge_feature_space.shape) != 2
+            or edge_feature_space.shape[0] != edge_space.shape[1]
+        ):
+            raise ValueError("invalid graph edge_features space")
+        edge_feature_dim = edge_feature_space.shape[1]
+    hidden_dims = model_config["fcnet_hiddens"]
+    if (
+        not isinstance(hidden_dims, list | tuple)
+        or not hidden_dims
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+            for value in hidden_dims
+        )
+    ):
+        raise ValueError("fcnet_hiddens must configure graph message layers")
+    return GraphEncoderConfig(
+        input_dims=node_space.shape,
+        node_feature_dim=node_space.shape[1],
+        edge_feature_dim=edge_feature_dim,
+        hidden_dim=spec.get("hidden_dim", hidden_dims[-1]),
+        message_layers=spec.get("message_layers", len(hidden_dims)),
+        output_dim=spec.get("output_dim"),
+        readout=spec.get("readout", "controlled_node_and_mean"),
+        validate_startup=model_config.get("validate_startup", False),
+    )

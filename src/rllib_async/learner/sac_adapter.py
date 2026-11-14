@@ -112,7 +112,7 @@ class PBTModelState:
 
 
 @dataclass(frozen=True, slots=True)
-class SACUpdateResult:
+class LearnerUpdateResult:
     """Outcome of one adapter update request."""
 
     performed: bool
@@ -121,6 +121,10 @@ class SACUpdateResult:
     sampled_agent_steps: int
     learner_results: list[dict[str, Any]] | None
     published_weights: WeightsDescriptor | None
+
+
+# Preserve the public SAC result type and checkpoint import path.
+SACUpdateResult = LearnerUpdateResult
 
 
 class CheckpointableSACTorchLearner(SACTorchLearner):
@@ -256,7 +260,9 @@ def _build_sac_sample_batch(
     if graph_observations:
         try:
             packed_observations = validate_packed_graph_batch(observations)
-            packed_next_observations = validate_packed_graph_batch(next_observations)
+            packed_next_observations = validate_packed_graph_batch(
+                next_observations, terminated=batch[Columns.TERMINATEDS]
+            )
         except ValueError as error:
             raise SACBatchError(str(error)) from error
         batch_size = len(packed_observations["graph_ptr"]) - 1
@@ -403,8 +409,16 @@ def build_rllib_multi_module_sac_batch(
     )
 
 
-class SACLearnerAdapter:
-    """Own one local RLlib SAC LearnerGroup and its runtime counters."""
+class _LocalOffPolicyLearnerAdapter:
+    """Shared local learner lifecycle; algorithm subclasses own batch/config hooks."""
+
+    _algorithm = "SAC"
+    _config_type = SACConfig
+    _stock_learner_class = SACTorchLearner
+    _checkpointable_learner_class = CheckpointableSACTorchLearner
+    _config_contract_fields = _CONFIG_CONTRACT_FIELDS
+    _batch_error = SACBatchError
+    _adapter_error = SACLearnerAdapterError
 
     def __init__(
         self,
@@ -419,8 +433,8 @@ class SACLearnerAdapter:
         if not isinstance(validate_startup, bool):
             raise TypeError("validate_startup must be a bool")
         self._validate_next_batch = validate_startup
-        if not isinstance(config, SACConfig):
-            raise TypeError("config must be an SACConfig")
+        if not isinstance(config, self._config_type):
+            raise TypeError(f"config must be a {self._config_type.__name__}")
         if not isinstance(member_id, str) or not member_id:
             raise ValueError("member_id must be a non-empty string")
         if (
@@ -430,27 +444,32 @@ class SACLearnerAdapter:
         ):
             raise ValueError("publication_interval_updates must be positive")
         if config.framework_str != "torch":
-            raise ValueError("SACLearnerAdapter supports PyTorch only")
+            raise ValueError(f"{self._algorithm}LearnerAdapter supports PyTorch only")
         if not config.enable_rl_module_and_learner:
             raise ValueError(
-                "SACLearnerAdapter requires the RLModule/Learner API stack"
+                f"{self._algorithm}LearnerAdapter requires "
+                "the RLModule/Learner API stack"
             )
         if not config.enable_env_runner_and_connector_v2:
-            raise ValueError("SACLearnerAdapter requires ConnectorV2")
+            raise ValueError(f"{self._algorithm}LearnerAdapter requires ConnectorV2")
         if config.num_learners != 0:
-            raise ValueError("SACLearnerAdapter requires one local RLlib learner")
+            raise ValueError(
+                f"{self._algorithm}LearnerAdapter requires one local RLlib learner"
+            )
         if not isinstance(learning_starts_satisfied, bool):
             raise TypeError("learning_starts_satisfied must be a bool")
         resolved_learner_class = config.learner_class
         if resolved_learner_class not in {
             None,
-            SACTorchLearner,
-            CheckpointableSACTorchLearner,
+            self._stock_learner_class,
+            self._checkpointable_learner_class,
         }:
-            raise ValueError("custom SAC learner classes are not supported in v0.1")
+            raise ValueError(
+                f"custom {self._algorithm} learner classes are not supported in v0.1"
+            )
 
         adapter_config = config.copy(copy_frozen=False)
-        adapter_config.learners(learner_class=CheckpointableSACTorchLearner)
+        adapter_config.learners(learner_class=self._checkpointable_learner_class)
 
         self._config = adapter_config
         self._member_id = member_id
@@ -459,16 +478,24 @@ class SACLearnerAdapter:
         self._learning_starts_satisfied = learning_starts_satisfied
         self._config_contract = {
             name: copy.deepcopy(getattr(adapter_config, name))
-            for name in _CONFIG_CONTRACT_FIELDS
+            for name in self._config_contract_fields
+        }
+        self._module_config_contract = {
+            name: copy.deepcopy(getattr(adapter_config, name))
+            for name in (
+                "model_config",
+                "rl_module_spec",
+                "algorithm_config_overrides_per_module",
+            )
         }
         try:
             pickle.dumps(
-                self._config_contract,
+                (self._config_contract, self._module_config_contract),
                 protocol=pickle.HIGHEST_PROTOCOL,
             )
         except (pickle.PickleError, TypeError) as error:
             raise ValueError(
-                "SAC configuration contract must be pickle-safe"
+                f"{self._algorithm} configuration contract must be pickle-safe"
             ) from error
         self._spaces_fingerprint = self._fingerprint_spaces(spaces)
         self._learner_group = adapter_config.build_learner_group(spaces=dict(spaces))
@@ -482,7 +509,7 @@ class SACLearnerAdapter:
         if not set(module_state).issubset(spaces):
             self._learner_group.shutdown()
             self._closed = True
-            raise SACLearnerAdapterError(
+            raise self._adapter_error(
                 "RLlib learner module IDs are missing configured spaces"
             )
         self._module_versions = {module_id: 0 for module_id in sorted(module_state)}
@@ -514,12 +541,12 @@ class SACLearnerAdapter:
         *,
         sampled_env_steps: int,
         sampled_agent_steps: int | None = None,
-    ) -> SACUpdateResult:
+    ) -> LearnerUpdateResult:
         """Perform at most one RLlib update at absolute sampled-step counters."""
 
         self._require_open()
         if set(self._module_versions) != {DEFAULT_MODULE_ID}:
-            raise SACBatchError(
+            raise self._batch_error(
                 "update() requires a single default module; "
                 "use update_modules() for a heterogeneous learner"
             )
@@ -532,7 +559,7 @@ class SACLearnerAdapter:
                 sampled_env_steps=sampled_env_steps,
                 sampled_agent_steps=sampled_agent_steps,
             )
-        rllib_batch = build_rllib_sac_batch(batch, validate=self._validate_next_batch)
+        rllib_batch = self._build_batch(batch, validate=self._validate_next_batch)
         self._validate_next_batch = False
         return self._perform_update(
             rllib_batch,
@@ -546,14 +573,16 @@ class SACLearnerAdapter:
         *,
         sampled_env_steps: int,
         sampled_agent_steps: int,
-    ) -> SACUpdateResult:
-        """Update every configured SAC module from its own sampled batch view."""
+    ) -> LearnerUpdateResult:
+        """Update every configured module from its own sampled batch view."""
 
         self._require_open()
         if not isinstance(batches, Mapping) or not batches:
-            raise SACBatchError("multi-module SAC batches must be a non-empty mapping")
+            raise self._batch_error(
+                f"multi-module {self._algorithm} batches must be a non-empty mapping"
+            )
         if set(batches) != set(self._module_versions):
-            raise SACBatchError(
+            raise self._batch_error(
                 "multi-module batch IDs must match the learner module IDs"
             )
         sampled_agent_steps, should_update = self._begin_update(
@@ -565,7 +594,7 @@ class SACLearnerAdapter:
                 sampled_env_steps=sampled_env_steps,
                 sampled_agent_steps=sampled_agent_steps,
             )
-        rllib_batch = build_rllib_multi_module_sac_batch(
+        rllib_batch = self._build_multi_module_batch(
             batches, validate=self._validate_next_batch
         )
         self._validate_next_batch = False
@@ -613,7 +642,7 @@ class SACLearnerAdapter:
         *,
         sampled_env_steps: int,
         sampled_agent_steps: int,
-    ) -> SACUpdateResult:
+    ) -> LearnerUpdateResult:
         learner_results = self._learner_group.update(
             batch=learner_batch,
             timesteps={
@@ -623,7 +652,7 @@ class SACLearnerAdapter:
         )
         self._learner_updates += 1
         published_weights = self.maybe_publish_weights()
-        return SACUpdateResult(
+        return LearnerUpdateResult(
             performed=True,
             learner_updates=self._learner_updates,
             sampled_env_steps=sampled_env_steps,
@@ -637,8 +666,8 @@ class SACLearnerAdapter:
         *,
         sampled_env_steps: int,
         sampled_agent_steps: int,
-    ) -> SACUpdateResult:
-        return SACUpdateResult(
+    ) -> LearnerUpdateResult:
+        return LearnerUpdateResult(
             performed=False,
             learner_updates=self._learner_updates,
             sampled_env_steps=sampled_env_steps,
@@ -682,87 +711,6 @@ class SACLearnerAdapter:
         self._require_open()
         return self._latest_weights
 
-    def export_pbt_state(self) -> PBTModelState:
-        """Export model state without optimizer, RNG, counters, or member identity."""
-
-        self._require_open()
-        learner_group_state = self._learner_group.get_state(
-            components=f"{COMPONENT_LEARNER}/{COMPONENT_RL_MODULE}",
-        )
-        learner_state = learner_group_state.get(COMPONENT_LEARNER)
-        if not isinstance(learner_state, Mapping):
-            raise SACLearnerAdapterError("learner state is missing")
-        module_state = learner_state.get(COMPONENT_RL_MODULE)
-        learner = getattr(self._learner_group, "_learner", None)
-        if not isinstance(learner, CheckpointableSACTorchLearner):
-            raise SACLearnerAdapterError("checkpointable SAC learner is missing")
-        temperature_state = learner.get_temperature_state()
-        if not isinstance(module_state, Mapping):
-            raise SACLearnerAdapterError("learner PBT state is incomplete")
-        return PBTModelState(
-            state_version=PBT_MODEL_STATE_VERSION,
-            spaces_fingerprint=self._spaces_fingerprint,
-            model_fingerprint=self._fingerprint_model_state(module_state),
-            module_state=module_state,
-            temperature_state=temperature_state,
-        )
-
-    def load_pbt_state(self, state: PBTModelState) -> WeightsDescriptor:
-        """Import model state into a fresh learner and publish target-owned weights."""
-
-        self._require_open()
-        if not isinstance(state, PBTModelState):
-            raise TypeError("state must be PBTModelState")
-        if state.spaces_fingerprint != self._spaces_fingerprint:
-            raise ValueError("PBT observation/action spaces do not match")
-        if any(
-            value != 0
-            for value in (
-                self._learner_updates,
-                self._sampled_env_steps,
-                self._sampled_agent_steps,
-                self._last_published_update,
-            )
-        ):
-            raise SACLearnerAdapterError("PBT state requires a fresh learner")
-        if state.model_fingerprint != self._fingerprint_model_state(state.module_state):
-            raise ValueError("PBT model state fingerprint is invalid")
-
-        learner_group_state = self._learner_group.get_state(
-            components=f"{COMPONENT_LEARNER}/{COMPONENT_RL_MODULE}",
-        )
-        learner_state = learner_group_state.get(COMPONENT_LEARNER)
-        if not isinstance(learner_state, Mapping):
-            raise SACLearnerAdapterError("fresh learner state is missing")
-        current_module_state = learner_state.get(COMPONENT_RL_MODULE)
-        if not isinstance(current_module_state, Mapping):
-            raise SACLearnerAdapterError("fresh learner model state is missing")
-        if state.model_fingerprint != self._fingerprint_model_state(
-            current_module_state
-        ):
-            raise ValueError("PBT model structure does not match")
-
-        imported_state = {
-            COMPONENT_LEARNER: {
-                COMPONENT_RL_MODULE: copy.deepcopy(state.module_state),
-                SAC_TEMPERATURE_STATE: copy.deepcopy(state.temperature_state),
-            }
-        }
-        self._learner_group.set_state(imported_state)
-
-        module_versions = {
-            module_id: version + 1
-            for module_id, version in self._module_versions.items()
-        }
-        descriptor = self._new_descriptor(
-            self._get_inference_module_state(),
-            module_versions=module_versions,
-            learner_updates=0,
-        )
-        self._module_versions = module_versions
-        self._latest_weights = descriptor
-        return copy.deepcopy(descriptor)
-
     def get_state(self) -> dict[str, Any]:
         """Return a complete in-memory member checkpoint."""
 
@@ -784,6 +732,7 @@ class SACLearnerAdapter:
             "learning_starts": self._learning_starts,
             "learning_starts_satisfied": self._learning_starts_satisfied,
             "config_contract": copy.deepcopy(self._config_contract),
+            "module_config_contract": copy.deepcopy(self._module_config_contract),
             "spaces_fingerprint": self._spaces_fingerprint,
             "learner_updates": self._learner_updates,
             "sampled_env_steps": self._sampled_env_steps,
@@ -803,7 +752,7 @@ class SACLearnerAdapter:
         if not isinstance(state, Mapping):
             raise ValueError("adapter state must be a mapping")
         if state.get("state_version") != SAC_ADAPTER_STATE_VERSION:
-            raise ValueError("unsupported SAC adapter state version")
+            raise ValueError(f"unsupported {self._algorithm} adapter state version")
         if state.get("member_id") != self._member_id:
             raise ValueError("checkpoint member_id does not match this adapter")
         if (
@@ -828,7 +777,16 @@ class SACLearnerAdapter:
         if not isinstance(learning_starts_satisfied, bool):
             raise ValueError("learning_starts_satisfied must be a bool")
         if state.get("config_contract") != self._config_contract:
-            raise ValueError("checkpoint SAC configuration does not match")
+            raise ValueError(
+                f"checkpoint {self._algorithm} configuration does not match"
+            )
+        if (
+            self._algorithm != "SAC" and "module_config_contract" not in state
+        ) or (
+            "module_config_contract" in state
+            and state["module_config_contract"] != self._module_config_contract
+        ):
+            raise ValueError("checkpoint module configuration does not match")
         if state.get("spaces_fingerprint") != self._spaces_fingerprint:
             raise ValueError("checkpoint observation/action spaces do not match")
 
@@ -928,7 +886,7 @@ class SACLearnerAdapter:
         self._learner_group.shutdown()
         self._closed = True
 
-    def __enter__(self) -> SACLearnerAdapter:
+    def __enter__(self) -> _LocalOffPolicyLearnerAdapter:
         self._require_open()
         return self
 
@@ -959,7 +917,7 @@ class SACLearnerAdapter:
 
     def _require_open(self) -> None:
         if self._closed:
-            raise SACLearnerAdapterError("SAC learner adapter is closed")
+            raise self._adapter_error(f"{self._algorithm} learner adapter is closed")
 
     @staticmethod
     def _fingerprint_spaces(
@@ -971,8 +929,8 @@ class SACLearnerAdapter:
             signature = tuple(
                 (
                     key,
-                    SACLearnerAdapter._space_signature(spaces[key][0]),
-                    SACLearnerAdapter._space_signature(spaces[key][1]),
+                    _LocalOffPolicyLearnerAdapter._space_signature(spaces[key][0]),
+                    _LocalOffPolicyLearnerAdapter._space_signature(spaces[key][1]),
                 )
                 for key in sorted(spaces)
             )
@@ -1057,7 +1015,7 @@ class SACLearnerAdapter:
                 tuple(
                     (
                         key,
-                        SACLearnerAdapter._space_signature(child),
+                        _LocalOffPolicyLearnerAdapter._space_signature(child),
                     )
                     for key, child in space.spaces.items()
                 ),
@@ -1066,7 +1024,8 @@ class SACLearnerAdapter:
             return (
                 "tuple",
                 tuple(
-                    SACLearnerAdapter._space_signature(child) for child in space.spaces
+                    _LocalOffPolicyLearnerAdapter._space_signature(child)
+                    for child in space.spaces
                 ),
             )
         raise ValueError(f"unsupported Gymnasium space type {type(space).__name__!r}")
@@ -1106,3 +1065,135 @@ class SACLearnerAdapter:
         cls._validate_counter(name, value)
         assert isinstance(value, int)
         return value
+
+
+class SACLearnerAdapter(_LocalOffPolicyLearnerAdapter):
+    """Own one local RLlib SAC LearnerGroup and its runtime counters."""
+
+    def __init__(
+        self,
+        config: SACConfig,
+        *,
+        spaces: Mapping[str, tuple[gym.Space, gym.Space]],
+        member_id: str,
+        publication_interval_updates: int,
+        learning_starts_satisfied: bool = False,
+        validate_startup: bool = False,
+    ) -> None:
+        for module_id, (observation_space, action_space) in spaces.items():
+            if (
+                isinstance(action_space, gym.spaces.Discrete)
+                and isinstance(observation_space, gym.spaces.Dict)
+                and "action_mask" in observation_space.spaces
+            ):
+                module_config = config.get_config_for_module(module_id)
+                if (
+                    not isinstance(module_config.target_entropy, int | float)
+                    or isinstance(module_config.target_entropy, bool)
+                    or not np.isfinite(module_config.target_entropy)
+                ):
+                    raise ValueError(
+                        "masked discrete SAC requires an explicit finite target_entropy"
+                    )
+                if not module_config.twin_q:
+                    raise ValueError("masked discrete SAC requires twin_q=True")
+        super().__init__(
+            config,
+            spaces=spaces,
+            member_id=member_id,
+            publication_interval_updates=publication_interval_updates,
+            learning_starts_satisfied=learning_starts_satisfied,
+            validate_startup=validate_startup,
+        )
+
+    @staticmethod
+    def _build_batch(batch: Mapping[str, Any], *, validate: bool) -> MultiAgentBatch:
+        return build_rllib_sac_batch(batch, validate=validate)
+
+    @staticmethod
+    def _build_multi_module_batch(
+        batches: Mapping[str, Mapping[str, Any]], *, validate: bool
+    ) -> MultiAgentBatch:
+        return build_rllib_multi_module_sac_batch(batches, validate=validate)
+
+    def export_pbt_state(self) -> PBTModelState:
+        """Export model state without optimizer, RNG, counters, or member identity."""
+
+        self._require_open()
+        learner_group_state = self._learner_group.get_state(
+            components=f"{COMPONENT_LEARNER}/{COMPONENT_RL_MODULE}",
+        )
+        learner_state = learner_group_state.get(COMPONENT_LEARNER)
+        if not isinstance(learner_state, Mapping):
+            raise SACLearnerAdapterError("learner state is missing")
+        module_state = learner_state.get(COMPONENT_RL_MODULE)
+        learner = getattr(self._learner_group, "_learner", None)
+        if not isinstance(learner, CheckpointableSACTorchLearner):
+            raise SACLearnerAdapterError("checkpointable SAC learner is missing")
+        temperature_state = learner.get_temperature_state()
+        if not isinstance(module_state, Mapping):
+            raise SACLearnerAdapterError("learner PBT state is incomplete")
+        return PBTModelState(
+            state_version=PBT_MODEL_STATE_VERSION,
+            spaces_fingerprint=self._spaces_fingerprint,
+            model_fingerprint=self._fingerprint_model_state(module_state),
+            module_state=module_state,
+            temperature_state=temperature_state,
+        )
+
+    def load_pbt_state(self, state: PBTModelState) -> WeightsDescriptor:
+        """Import model state into a fresh learner and publish target-owned weights."""
+
+        self._require_open()
+        if not isinstance(state, PBTModelState):
+            raise TypeError("state must be PBTModelState")
+        if state.spaces_fingerprint != self._spaces_fingerprint:
+            raise ValueError("PBT observation/action spaces do not match")
+        if any(
+            value != 0
+            for value in (
+                self._learner_updates,
+                self._sampled_env_steps,
+                self._sampled_agent_steps,
+                self._last_published_update,
+            )
+        ):
+            raise SACLearnerAdapterError("PBT state requires a fresh learner")
+        if state.model_fingerprint != self._fingerprint_model_state(state.module_state):
+            raise ValueError("PBT model state fingerprint is invalid")
+
+        learner_group_state = self._learner_group.get_state(
+            components=f"{COMPONENT_LEARNER}/{COMPONENT_RL_MODULE}",
+        )
+        learner_state = learner_group_state.get(COMPONENT_LEARNER)
+        if not isinstance(learner_state, Mapping):
+            raise SACLearnerAdapterError("fresh learner state is missing")
+        current_module_state = learner_state.get(COMPONENT_RL_MODULE)
+        if not isinstance(current_module_state, Mapping):
+            raise SACLearnerAdapterError("fresh learner model state is missing")
+        if state.model_fingerprint != self._fingerprint_model_state(
+            current_module_state
+        ):
+            raise ValueError("PBT model structure does not match")
+
+        imported_state = {
+            COMPONENT_LEARNER: {
+                COMPONENT_RL_MODULE: copy.deepcopy(state.module_state),
+                SAC_TEMPERATURE_STATE: copy.deepcopy(state.temperature_state),
+            }
+        }
+        self._learner_group.set_state(imported_state)
+
+        module_versions = {
+            module_id: version + 1
+            for module_id, version in self._module_versions.items()
+        }
+        descriptor = self._new_descriptor(
+            self._get_inference_module_state(),
+            module_versions=module_versions,
+            learner_updates=0,
+        )
+        self._module_versions = module_versions
+        self._latest_weights = descriptor
+        return copy.deepcopy(descriptor)
+

@@ -15,9 +15,10 @@ from typing import Any
 import gymnasium as gym
 import numpy as np
 import ray
+from ray.rllib.algorithms.dqn import DQNConfig
 from ray.rllib.algorithms.sac import SACConfig
 
-from rllib_async.learner import PBTModelState, SACLearnerAdapter
+from rllib_async.learner import DQNLearnerAdapter, PBTModelState, SACLearnerAdapter
 from rllib_async.protocols import (
     FlatEpisodeCodec,
     ReplayCursor,
@@ -130,7 +131,7 @@ class LearnerHost:
 
     def __init__(
         self,
-        config: SACConfig,
+        config: SACConfig | DQNConfig,
         spaces: Mapping[str, tuple[gym.Space, gym.Space]],
         replay_actor: Any,
         codec: FlatEpisodeCodec,
@@ -148,8 +149,17 @@ class LearnerHost:
         pbt_state: PBTModelState | None = None,
         learning_starts_satisfied: bool = False,
     ) -> None:
-        if not isinstance(config, SACConfig):
-            raise TypeError("config must be an SACConfig")
+        if not isinstance(config, SACConfig | DQNConfig):
+            raise TypeError("config must be an SACConfig or DQNConfig")
+        adapter_type = (
+            SACLearnerAdapter if isinstance(config, SACConfig) else DQNLearnerAdapter
+        )
+        if adapter_type is DQNLearnerAdapter:
+            from rllib_async.learner.dqn_adapter import validate_dqn_config
+
+            validate_dqn_config(config, spaces=spaces)
+        if pbt_state is not None and adapter_type is DQNLearnerAdapter:
+            raise ValueError("DQN PBT transfer is not supported")
         if not isinstance(codec, FlatEpisodeCodec):
             raise TypeError("LearnerHost requires FlatEpisodeCodec")
         if (
@@ -190,10 +200,10 @@ class LearnerHost:
             raise LearnerHostError("replay actor returned an invalid snapshot")
         self._fast_replay.load_snapshot(snapshot)
 
-        self._adapter: SACLearnerAdapter | None = None
+        self._adapter: SACLearnerAdapter | DQNLearnerAdapter | None = None
         self._producer: BatchProducer[FlatBatch] | None = None
         try:
-            self._adapter = SACLearnerAdapter(
+            self._adapter = adapter_type(
                 config,
                 spaces=spaces,
                 member_id=member_id,
@@ -387,6 +397,8 @@ class LearnerHost:
     def export_pbt_state(self) -> PBTModelState:
         self._require_not_stopped()
         assert self._adapter is not None
+        if not isinstance(self._adapter, SACLearnerAdapter):
+            raise ValueError("DQN PBT transfer is not supported")
         return self._adapter.export_pbt_state()
 
     def get_stats(self) -> LearnerHostStats:

@@ -13,6 +13,8 @@ from typing import Any
 import numpy as np
 import ray
 from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
+from ray.rllib.algorithms.dqn import DQNConfig
+from ray.rllib.algorithms.sac import SACConfig
 from ray.rllib.core import DEFAULT_MODULE_ID
 from ray.util import get_current_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -148,8 +150,11 @@ class EpisodeRolloutActor:
         weights: WeightsDescriptor | None = None,
         *,
         explore: bool = True,
+        sampled_env_steps: int | None = None,
     ) -> tuple[EpisodeEnvelope, EpisodeRolloutSummary]:
-        result = self._runner.collect_episode(weights, explore=explore)
+        result = self._runner.collect_episode(
+            weights, explore=explore, sampled_env_steps=sampled_env_steps
+        )
         return result.episode, EpisodeRolloutSummary.from_result(result)
 
     def evaluate(
@@ -270,6 +275,9 @@ class AsyncRolloutGroup:
         self._num_cpus_per_runner = float(num_cpus_per_runner)
         self._placement_group_bundle_start = placement_group_bundle_start
         self._explore = explore
+        self._member_exploration_clock = isinstance(config, DQNConfig) and (
+            not isinstance(config, SACConfig)
+        )
         self._state = RolloutGroupState.CREATED
         self._runners: dict[str, Any] = {}
         self._runner_weight_versions: dict[str, FrozenVersions] = {}
@@ -626,6 +634,9 @@ class AsyncRolloutGroup:
     def _new_actor(self, runner_id: str) -> Any:
         runner_generation = self._runner_generations[runner_id]
         runner_config = self._config.copy(copy_frozen=False)
+        if self._member_exploration_clock:
+            # RLlib otherwise scales the supplied clock by num_env_runners.
+            runner_config.num_env_runners = 0
         if runner_config.seed is not None:
             runner_config.seed = int(runner_config.seed) + (
                 runner_generation * self._runner_count
@@ -803,6 +814,11 @@ class AsyncRolloutGroup:
             episode_ref, ref = actor.collect_episode_refs.remote(
                 weights,
                 explore=self._explore,
+                **(
+                    {"sampled_env_steps": self._env_steps}
+                    if self._member_exploration_clock
+                    else {}
+                ),
             )
             if weights is not None:
                 self._runner_weight_versions[runner_id] = FrozenVersions(

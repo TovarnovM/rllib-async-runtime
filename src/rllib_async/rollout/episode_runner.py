@@ -15,7 +15,7 @@ from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
 from ray.rllib.core import COMPONENT_RL_MODULE, DEFAULT_MODULE_ID
 from ray.rllib.core.columns import Columns
 from ray.rllib.env.single_agent_env_runner import SingleAgentEnvRunner
-from ray.rllib.utils.metrics import WEIGHTS_SEQ_NO
+from ray.rllib.utils.metrics import NUM_ENV_STEPS_SAMPLED_LIFETIME, WEIGHTS_SEQ_NO
 from ray.tune.registry import ENV_CREATOR, _global_registry
 
 from rllib_async.protocols.episodes import (
@@ -306,6 +306,7 @@ class EpisodeRunner:
         weights: WeightsDescriptor | None = None,
         *,
         explore: bool = True,
+        sampled_env_steps: int | None = None,
     ) -> EpisodeRolloutResult:
         """Apply optional fresh weights, then collect one complete episode."""
 
@@ -313,6 +314,24 @@ class EpisodeRunner:
         if weights is not None:
             self.install_weights(weights)
         assert self._weights is not None
+
+        if sampled_env_steps is not None:
+            if (
+                not isinstance(sampled_env_steps, int)
+                or isinstance(sampled_env_steps, bool)
+                or sampled_env_steps < 0
+            ):
+                raise ValueError("sampled_env_steps must be a non-negative integer")
+            # RLlib's epsilon scheduler reads this supported EnvRunner clock.
+            # Member progress is delayed until completed episodes reach the group;
+            # each runner keeps its own floor between those updates.
+            exploration_steps = max(
+                self._env_runner.num_env_steps_sampled_lifetime,
+                sampled_env_steps,
+            )
+            self._env_runner.set_state(
+                {NUM_ENV_STEPS_SAMPLED_LIFETIME: exploration_steps}
+            )
 
         started = time.monotonic()
         episodes = self._env_runner.sample(num_episodes=1, explore=explore)
@@ -404,6 +423,12 @@ class EpisodeRunner:
             agent_steps=step_count,
         )
         self._local_episode_seq += 1
+        if sampled_env_steps is not None:
+            # RLlib 2.56.1 uses base + step within sample(), but does not advance
+            # this externally managed lifetime counter when sample() returns.
+            self._env_runner.set_state(
+                {NUM_ENV_STEPS_SAMPLED_LIFETIME: exploration_steps + step_count}
+            )
         return EpisodeRolloutResult(episode=envelope, metrics=metrics)
 
     def close(self) -> None:

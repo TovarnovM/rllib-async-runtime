@@ -73,6 +73,24 @@ def test_episode_runner_collects_flat_time_limited_episode() -> None:
     assert transitions[-1][Columns.TRUNCATEDS]
 
 
+def test_member_exploration_clock_never_moves_backwards() -> None:
+    config, initial = make_weights()
+    with EpisodeRunner(
+        config,
+        FlatEpisodeCodec(),
+        member_id="member-0",
+        runner_id="runner-0",
+        runner_generation=1,
+        max_episode_steps=5,
+        initial_weights=initial,
+        worker_index=1,
+    ) as runner:
+        runner.collect_episode(sampled_env_steps=40)
+        assert runner._env_runner.num_env_steps_sampled_lifetime == 45
+        runner.collect_episode(sampled_env_steps=2)
+        assert runner._env_runner.num_env_steps_sampled_lifetime == 50
+
+
 def test_weights_change_only_between_episodes_and_ignore_stale_publication() -> None:
     config, initial = make_weights()
     newer = WeightsDescriptor(

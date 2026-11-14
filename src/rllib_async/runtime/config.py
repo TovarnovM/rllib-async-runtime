@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from typing import Any
 
+from ray.rllib.algorithms.dqn import DQNConfig
 from ray.rllib.algorithms.sac import SACConfig
 
 
@@ -199,9 +200,9 @@ class AsyncSACRuntimeConfig:
         cls,
         values: Mapping[str, Any] | None,
         *,
-        sac_config: SACConfig,
+        sac_config: SACConfig | DQNConfig,
     ) -> AsyncSACRuntimeConfig:
-        """Build a strict runtime config, defaulting batch size from SAC."""
+        """Build a strict runtime config, defaulting from the RLlib config."""
 
         if values is None:
             values = {}
@@ -246,3 +247,7 @@ class AsyncSACRuntimeConfig:
             or value < 0
         ):
             raise ValueError(f"{name} must be finite and non-negative")
+
+
+# Keep the original class identity for existing checkpoints and callers.
+AsyncRuntimeConfig = AsyncSACRuntimeConfig

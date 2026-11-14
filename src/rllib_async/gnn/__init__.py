@@ -1,6 +1,7 @@
 """Shared-policy graph observation, batching, and encoder components."""
 
 from rllib_async.gnn.encoder import (
+    GraphDQNCatalog,
     GraphEncoderConfig,
     SharedGraphSACCatalog,
     TorchGraphEncoder,
@@ -19,6 +20,7 @@ from rllib_async.gnn.graph_batch import (
 )
 
 __all__ = [
+    "GraphDQNCatalog",
     "GraphBatch",
     "GraphBatchCollator",
     "GraphEncoderConfig",

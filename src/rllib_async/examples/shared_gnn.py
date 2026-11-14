@@ -8,9 +8,6 @@ from typing import Any
 import gymnasium as gym
 import numpy as np
 from ray.rllib.algorithms.sac import SACConfig
-from ray.rllib.algorithms.sac.torch.default_sac_torch_rl_module import (
-    DefaultSACTorchRLModule,
-)
 from ray.rllib.core.rl_module.multi_rl_module import MultiRLModuleSpec
 from ray.rllib.core.rl_module.rl_module import RLModuleSpec
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
@@ -25,6 +22,7 @@ from rllib_async.gnn.episodes import (
     NODE_COUNT,
     NODE_FEATURES,
 )
+from rllib_async.gnn.rl_modules import GraphSACTorchRLModule
 
 SHARED_GNN_MODULE_ID = "shared_graph"
 DEFAULT_GRAPH_AGENT_COUNT = 4
@@ -355,7 +353,7 @@ def build_shared_gnn_sac_config(
             rl_module_spec=MultiRLModuleSpec(
                 rl_module_specs={
                     SHARED_GNN_MODULE_ID: RLModuleSpec(
-                        module_class=DefaultSACTorchRLModule,
+                        module_class=GraphSACTorchRLModule,
                         catalog_class=SharedGraphSACCatalog,
                     )
                 }

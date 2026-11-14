@@ -365,6 +365,65 @@ def test_graph_startup_checks_scalars_and_retries_until_batch_succeeds(
         np.testing.assert_array_equal(batch[Columns.REWARDS], [0.0])
 
 
+@pytest.mark.parametrize("terminated,truncated", [(True, False), (False, False), (False, True)])
+def test_empty_graph_action_mask_is_allowed_only_for_terminal_next_observation(
+    terminated: bool, truncated: bool
+) -> None:
+    from rllib_async.learner.sac_adapter import build_rllib_multi_module_sac_batch
+
+    transition = _transition(
+        env_t=0,
+        agent_t=0,
+        agent_id="agent_0",
+        observation={
+            NODE_FEATURES: np.zeros((1, 1), dtype=np.float32),
+            EDGE_INDEX: np.empty((2, 0), dtype=np.int64),
+            CONTROLLED_NODE: 0,
+        },
+        action_mask=True,
+    )
+    empty_next = {
+        **transition.data[Columns.NEXT_OBS],
+        ACTION_MASK: np.zeros(3, dtype=np.float32),
+    }
+    transition = replace(
+        transition,
+        data={
+            **transition.data,
+            Columns.NEXT_OBS: empty_next,
+            Columns.TERMINATEDS: terminated,
+            Columns.TRUNCATEDS: truncated,
+        },
+    )
+    codec = GraphEpisodeCodec(node_feature_dim=1, action_mask_dim=3)
+    collator = GraphBatchCollator(
+        module_id=SHARED_GNN_MODULE_ID, validate_startup=True
+    )
+    if not terminated:
+        with pytest.raises(EpisodeValidationError, match="action_mask"):
+            codec.encode([transition])
+        with pytest.raises(BatchCollationError, match="action_mask"):
+            collator.collate([transition])
+        return
+
+    episode = _episode(codec, [transition])
+    restored = codec.get_module_transition(episode, SHARED_GNN_MODULE_ID, 0)
+    batch = collator.collate([restored])
+    learner_batch = build_rllib_multi_module_sac_batch(batch)
+    assert learner_batch.policy_batches[SHARED_GNN_MODULE_ID].count == 1
+    np.testing.assert_array_equal(
+        batch[SHARED_GNN_MODULE_ID][Columns.NEXT_OBS][ACTION_MASK], [[0, 0, 0]]
+    )
+
+    # Termination permits an empty target mask, never an empty behavior mask.
+    with pytest.raises(EpisodeValidationError, match="action_mask"):
+        codec.encode(
+            [replace(transition, data={**transition.data, Columns.OBS: empty_next})]
+        )
+    with pytest.raises(BatchCollationError, match="action_mask"):
+        validate_packed_graph_batch(batch[SHARED_GNN_MODULE_ID][Columns.NEXT_OBS])
+
+
 @pytest.mark.parametrize("decoder", ["get_transition", "get_module_transition"])
 def test_public_graph_decode_rejects_malformed_contents(decoder: str) -> None:
     codec = GraphEpisodeCodec(node_feature_dim=1)

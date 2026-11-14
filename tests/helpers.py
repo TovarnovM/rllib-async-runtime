@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from ray.rllib.algorithms.dqn import DQNConfig
 from ray.rllib.algorithms.sac import SACConfig
 from ray.rllib.algorithms.sac.torch.sac_torch_learner import SACTorchLearner
 from ray.rllib.core import (
@@ -67,6 +68,34 @@ def make_sac_config(
         )
     )
 
+
+def make_dqn_config() -> DQNConfig:
+    return (
+        DQNConfig()
+        .environment("CartPole-v1")
+        .framework("torch")
+        .api_stack(
+            enable_rl_module_and_learner=True,
+            enable_env_runner_and_connector_v2=True,
+        )
+        .env_runners(
+            num_env_runners=0,
+            create_local_env_runner=True,
+            num_envs_per_env_runner=1,
+            batch_mode="complete_episodes",
+            episodes_to_numpy=True,
+        )
+        .learners(num_learners=0, num_gpus_per_learner=0)
+        .rl_module(model_config={"fcnet_hiddens": [16], "head_fcnet_hiddens": [16]})
+        .training(
+            lr=3e-4,
+            n_step=1,
+            num_steps_sampled_before_learning_starts=0,
+            train_batch_size_per_learner=8,
+            target_network_update_freq=16,
+            replay_buffer_config={"type": "EpisodeReplayBuffer", "capacity": 128},
+        )
+    )
 
 def update_learner(learner_group: Any, episodes: Sequence[Any]) -> list[dict[str, Any]]:
     steps = sum(len(episode) for episode in episodes)
