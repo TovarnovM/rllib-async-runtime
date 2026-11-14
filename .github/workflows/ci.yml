@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - feature/dqn-hierarchy-gnn
 
 permissions:
   contents: read
