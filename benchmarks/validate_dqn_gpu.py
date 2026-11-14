@@ -11,9 +11,11 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -204,56 +206,83 @@ def main():
             ),
         )
         for name, marker, paths, visible, expected_count in blocks:
-            env = {
-                **environment,
-                "CUDA_VISIBLE_DEVICES": visible,
-                "RAY_TMPDIR": str((args.output / f"{name}-ray").resolve()),
-            }
-            selection = [sys.executable, "-m", "pytest", "-m", marker, *paths]
-            collected = run_command(
-                [*selection, "--collect-only", "-q"],
-                environment=env,
-                log_path=args.output / f"{name}-collection.log",
-                timeout_s=300,
-            )
-            block = {"name": name, "collection": collected, "status": "running"}
+            block = {"name": name, "status": "running"}
             manifest["blocks"].append(block)
             save()
-            if collected["exit_code"]:
-                raise RuntimeError(f"{name}: collection failed")
-            expected = {
-                line.strip()
-                for line in Path(collected["log"]).read_text().splitlines()
-                if line.startswith("tests/") and "::" in line
-            }
-            if not expected or (
-                expected_count is not None and len(expected) != expected_count
-            ):
-                raise RuntimeError(
-                    f"{name}: unexpected collected case count {len(expected)}"
-                )
-            block["expected_node_ids"] = sorted(expected)
-            junit = args.output / f"{name}.xml"
-            execution = run_command(
-                [
-                    *selection,
-                    "-vv",
-                    "--durations=20",
-                    "-o",
-                    "junit_family=xunit1",
-                    f"--junitxml={junit}",
-                ],
-                environment=env,
-                log_path=args.output / f"{name}.log",
-                timeout_s=args.block_timeout_s,
-            )
-            block["execution"] = execution
-            save()
-            if execution["exit_code"]:
-                raise RuntimeError(f"{name}: pytest exit code {execution['exit_code']}")
-            block["junit"] = validate_junit(
-                junit, expected, require_devices=name != "cpu"
-            )
+            # Ray appends session/socket names. Keep their live path short even
+            # when the checkout, evidence directory or inherited TMPDIR is long.
+            with tempfile.TemporaryDirectory(prefix="r23-", dir="/tmp") as ray_tmp:
+                logs_output = args.output / f"{name}-ray"
+                block["ray_tmpdir"] = ray_tmp
+                block["ray_logs"] = str(logs_output)
+                env = {
+                    **environment,
+                    "CUDA_VISIBLE_DEVICES": visible,
+                    "RAY_TMPDIR": ray_tmp,
+                }
+                save()
+                try:
+                    selection = [sys.executable, "-m", "pytest", "-m", marker, *paths]
+                    collected = run_command(
+                        [*selection, "--collect-only", "-q"],
+                        environment=env,
+                        log_path=args.output / f"{name}-collection.log",
+                        timeout_s=300,
+                    )
+                    block["collection"] = collected
+                    save()
+                    if collected["exit_code"]:
+                        raise RuntimeError(f"{name}: collection failed")
+                    expected = {
+                        line.strip()
+                        for line in Path(collected["log"]).read_text().splitlines()
+                        if line.startswith("tests/") and "::" in line
+                    }
+                    if not expected or (
+                        expected_count is not None and len(expected) != expected_count
+                    ):
+                        raise RuntimeError(
+                            f"{name}: unexpected collected case count {len(expected)}"
+                        )
+                    block["expected_node_ids"] = sorted(expected)
+                    junit = args.output / f"{name}.xml"
+                    execution = run_command(
+                        [
+                            *selection,
+                            "-vv",
+                            "--durations=20",
+                            "-o",
+                            "junit_family=xunit1",
+                            f"--junitxml={junit}",
+                        ],
+                        environment=env,
+                        log_path=args.output / f"{name}.log",
+                        timeout_s=args.block_timeout_s,
+                    )
+                    block["execution"] = execution
+                    save()
+                    if execution["exit_code"]:
+                        raise RuntimeError(
+                            f"{name}: pytest exit code {execution['exit_code']}"
+                        )
+                    block["junit"] = validate_junit(
+                        junit, expected, require_devices=name != "cpu"
+                    )
+                finally:
+                    failure_pending = sys.exc_info()[0] is not None
+                    try:
+                        for session in Path(ray_tmp).glob("ray/session_*"):
+                            logs = session / "logs"
+                            if not session.is_symlink() and logs.is_dir():
+                                shutil.copytree(
+                                    logs,
+                                    logs_output / "ray" / session.name / "logs",
+                                    symlinks=True,
+                                )
+                    except OSError as error:
+                        block["ray_log_error"] = str(error)
+                        if not failure_pending:
+                            raise
             block["status"] = "passed"
             save()
             print(f"{name}: {block['junit']['passed']} passed, 0 skipped", flush=True)
@@ -261,6 +290,10 @@ def main():
     except Exception as error:
         manifest["status"] = "failed"
         manifest["failure"] = str(error)
+        for block in manifest["blocks"]:
+            if block["status"] == "running":
+                block["status"] = "failed"
+                block["failure"] = str(error)
         raise
     finally:
         save()

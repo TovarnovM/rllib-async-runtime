@@ -43,6 +43,8 @@ jobs:
 
       - name: Run CPU tests
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
-        run: >-
-          uv run --locked --extra cpu --group dev
-          pytest --durations=20 -m "not gpu and not cluster and not stress"
+        run: |
+          # These unit tests must not borrow Ray initialized by integration tests.
+          uv run --locked --extra cpu --group dev pytest tests/unit/test_dqn_runtime.py
+          uv run --locked --extra cpu --group dev \
+            pytest --durations=20 -m "not gpu and not cluster and not stress"

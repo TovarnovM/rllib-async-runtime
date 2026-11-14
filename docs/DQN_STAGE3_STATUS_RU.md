@@ -103,6 +103,32 @@ eviction и reader leases, точный следующий sample/update пос�
 whole-team preflight и lifecycle популяции. Обычный CI сохраняет весь прежний
 CPU набор; GPU/cluster/stress не входят в ежедневный запуск.
 
+### Локальная кампания 14 ноября 2026
+
+Проверен архив `rllib-dqn-stage23-b7fe415-20261114T185104Z.tar.gz`,
+SHA-256 `eeb97434b5cb6ae25a3715606a6abd0e89ff2672b14056f7ff62fb5d0fb90410`.
+Проверяемый commit: `b7fe415117a3ec09ef0b8b4232d99da245f293de`, чистое дерево,
+совпадающий `uv.lock`; два RTX 3090, driver 550.144.03, Python 3.11.13,
+Ray 2.56.1, Torch 2.7.0+cu118. В JUnit найдены все 479 собранных CPU cases:
+**456 passed, 1 failed, 22 errors, 0 skipped**; 18 deselected, 24.37 s.
+
+Все 22 errors вызваны одним сбоем session fixture: runner размещал `RAY_TMPDIR`
+в длинном каталоге evidence, и путь `plasma_store` превышал лимит Unix-сокета
+107 байт. Отдельный failed unit-тест создавал настоящий runtime и зависел
+от Ray, запущенного предшествующими integration tests. Manifest корректно
+помечал кампанию `failed`, но оставлял текущий блок `running`.
+
+Исправлены короткий изолированный каталог Ray с сохранением session logs,
+терминальный статус блока и unit-тест на границе подготовки DQN config без
+создания акторов. Регрессия runner проверяет настоящий Unix socket bind,
+сохранение журналов, очистку только собственных каталогов, ошибки collection,
+pytest/timeout и сохранение первичной ошибки при сбое копирования журналов.
+CI также запускает DQN unit-тесты отдельным процессом перед полным набором.
+
+GPU-блоки 11/2/1, component benchmarks и GPU quality **не запускались**:
+агент остановился после CPU prerequisite. Это не доказательство ошибки
+CUDA или алгоритма; вся кампания требует повторения на исправленном SHA.
+
 ## Результаты первого CPU-эксперимента
 
 Исходный код: `5ae907e8d7728008b9b4a174cbedfaf023fe7c52`.
@@ -211,7 +237,9 @@ Workflow `Stage 3 CPU experiments` запускается вручную или 
 
 ## Открытая приёмка
 
-- GPU этапов 2 и 3: **не запускалась в этой среде**. Единый runner требует
+- GPU этапов 2 и 3: **результата нет**; локальная кампания остановилась
+  на CPU prerequisite из-за описанных выше дефектов runner/unit-теста.
+  Единый runner требует
   сначала CPU prerequisite, затем 11 GPU cases этапа 2, 2 алгоритмических
   cases этапа 3 и 1 двух-GPU lifecycle case. Skips не принимаются за PASS.
 - CPU memory quality на пяти seeds и парный flat-SAC time regression gate
