@@ -92,9 +92,7 @@ class TeamActor:
                 )
         payload = self.codec.encode(transitions)
         episode = EpisodeEnvelope(
-            episode_id=(
-                f"member-0/{self.runner_id}/{self.generation}/{self.sequence}"
-            ),
+            episode_id=(f"member-0/{self.runner_id}/{self.generation}/{self.sequence}"),
             schema_version=self.codec.schema_version,
             producer_member_id="member-0",
             runner_id=self.runner_id,

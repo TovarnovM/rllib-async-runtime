@@ -10,8 +10,13 @@ from ray.rllib.core.columns import Columns
 from ray.rllib.core.rl_module.multi_rl_module import MultiRLModuleSpec
 from ray.rllib.core.rl_module.rl_module import RLModuleSpec
 from ray.rllib.core.rl_module.torch.torch_rl_module import TorchRLModule
+from ray.rllib.policy.policy import PolicySpec
 
-from rllib_async.examples.temporal_hierarchy import build_temporal_hierarchy_configs
+from rllib_async.examples.temporal_hierarchy import (
+    CueMemoryEnv,
+    build_memory_configs,
+    build_temporal_hierarchy_configs,
+)
 from rllib_async.gnn.episodes import NODE_FEATURES
 from rllib_async.protocols.episodes import RawMultiModuleEpisodeCodec
 from rllib_async.protocols.weights import WeightsDescriptor
@@ -27,13 +32,21 @@ class _ScriptedModule(TorchRLModule):
     def _forward_inference(self, batch, **kwargs):
         del kwargs
         observations = batch[Columns.OBS]
-        features = observations[NODE_FEATURES][:, 0] if isinstance(observations, dict) else observations
+        features = (
+            observations[NODE_FEATURES][:, 0]
+            if isinstance(observations, dict)
+            else observations
+        )
         if self.model_config["role"] == "manager":
             actions = (features[:, 2] > 0).long()
         elif isinstance(self.action_space, gym.spaces.Discrete):
             actions = torch.zeros(features.shape[0], dtype=torch.int64)
         else:
-            actions = torch.ones((features.shape[0], 1), dtype=torch.float32)
+            actions = torch.full(
+                (features.shape[0], 1),
+                self.model_config.get("action", 1.0),
+                dtype=torch.float32,
+            )
         return {Columns.ACTIONS: actions}
 
     def _forward_exploration(self, batch, t, **kwargs):
@@ -99,27 +112,119 @@ def test_raw_collector_preserves_actual_step_rewards_and_decision_clocks(time_li
                 step.rewards["manager"]
                 for step in raw_steps
                 if step.next_world_t > step.world_t
-                and data["world_t"] < step.next_world_t <= data["world_t"] + data["duration"]
+                and data["world_t"]
+                < step.next_world_t
+                <= data["world_t"] + data["duration"]
             )
             assert data["raw_rewards"] == rewards
             assert data[Columns.REWARDS] == pytest.approx(sum(rewards))
             assert not data["subtask_terminated"]
         assert manager[-1].data[Columns.TRUNCATEDS] is time_limit
         assert manager[-1].data[Columns.TERMINATEDS] is not time_limit
-        all_transitions = [codec.get_transition(result.episode, index) for index in range(result.episode.agent_steps)]
+        all_transitions = [
+            codec.get_transition(result.episode, index)
+            for index in range(result.episode.agent_steps)
+        ]
         assert result.metrics.world_steps == 8
         assert result.episode.env_steps == 11
         assert result.episode.agent_steps == 11
-        assert dict(result.metrics.module_steps) == {"manager": 3, "worker_0": 5, "worker_1": 3}
+        assert dict(result.metrics.module_steps) == {
+            "manager": 3,
+            "worker_0": 5,
+            "worker_1": 3,
+        }
         assert Counter(item.agent_id for item in all_transitions) == {
-            "manager": 3, "worker_0:0": 2, "worker_0:1": 3, "worker_1:2": 3
+            "manager": 3,
+            "worker_0:0": 2,
+            "worker_0:1": 3,
+            "worker_1:2": 3,
         }
         modules = runner._env_runner.module
+        assert all(modules[module_id].inference_only for module_id in spaces)
         assert modules["manager"].observed_clocks == [10, 11, 12]
         assert modules["worker_0"].observed_clocks == list(range(100, 105))
         assert modules["worker_1"].observed_clocks == list(range(200, 203))
         final_obs = manager[-1].data[Columns.NEXT_OBS][NODE_FEATURES]
         assert final_obs[0, 3] == pytest.approx(1.0)
-        assert not np.array_equal(final_obs, manager[0].data[Columns.OBS][NODE_FEATURES])
+        assert not np.array_equal(
+            final_obs, manager[0].data[Columns.OBS][NODE_FEATURES]
+        )
+    finally:
+        runner.close()
+
+
+class _ScaledActionEnv(CueMemoryEnv):
+    def __init__(self, config=None):
+        super().__init__({"continuous": True, "episode_length": 3})
+        self.action_spaces["memory"] = gym.spaces.Box(-2.0, 2.0, (1,), np.float32)
+        self.executed = []
+
+    def reset(self, **kwargs):
+        self.executed = []
+        return super().reset(**kwargs)
+
+    def step(self, actions):
+        self.executed.append(np.array(actions["memory"], copy=True))
+        return super().step(actions)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("normalize", "proposal", "physical", "training"),
+    [(True, 0.25, 0.5, 0.25), (True, 2.0, 2.0, 1.0), (False, 3.0, 2.0, 2.0)],
+)
+def test_raw_collector_maps_executed_actions_back_to_the_learner_domain(
+    normalize, proposal, physical, training
+):
+    config, _, _ = build_memory_configs(algorithm="sac", recurrent=False)
+    observation_space = gym.spaces.Box(-2.0, 2.0, (4,), np.float32)
+    action_space = gym.spaces.Box(-2.0, 2.0, (1,), np.float32)
+    config.environment(_ScaledActionEnv, normalize_actions=normalize, clip_actions=True)
+    config.multi_agent(
+        policies={
+            "memory": PolicySpec(
+                observation_space=observation_space, action_space=action_space
+            )
+        }
+    )
+    config.rl_module(
+        rl_module_spec=MultiRLModuleSpec(
+            rl_module_specs={
+                "memory": RLModuleSpec(
+                    module_class=_ScriptedModule,
+                    observation_space=observation_space,
+                    action_space=action_space,
+                    model_config={"role": "memory", "action": proposal},
+                )
+            }
+        )
+    )
+    codec = RawMultiModuleEpisodeCodec()
+    runner = MultiModuleEpisodeRunner(
+        config,
+        codec,
+        member_id="scaled-actions",
+        runner_id="runner",
+        runner_generation=0,
+        max_episode_steps=3,
+        module_ids=("memory",),
+        initial_weights=WeightsDescriptor(
+            member_id="scaled-actions",
+            module_versions={"memory": 0},
+            learner_updates=0,
+            published_at_monotonic=0,
+            state={"memory": {}},
+        ),
+        worker_index=0,
+    )
+    try:
+        result = runner.collect_episode(explore=False)
+        env = runner._env_runner.env.envs[0].unwrapped
+        assert len(env.executed) == 3
+        for index, executed in enumerate(env.executed):
+            np.testing.assert_array_equal(executed, [physical])
+            data = codec.get_transition(result.episode, index).data
+            np.testing.assert_array_equal(data["executed_actions"], [physical])
+            np.testing.assert_array_equal(data[Columns.ACTIONS], [training])
     finally:
         runner.close()

@@ -309,7 +309,9 @@ def _module_config(
     config = DQNConfig() if algorithm == "dqn" else SACConfig()
     config = (
         config.framework("torch")
-        .api_stack(enable_rl_module_and_learner=True, enable_env_runner_and_connector_v2=True)
+        .api_stack(
+            enable_rl_module_and_learner=True, enable_env_runner_and_connector_v2=True
+        )
         .learners(num_learners=0, num_gpus_per_learner=0)
         .training(
             n_step=1,
@@ -322,7 +324,9 @@ def _module_config(
     model_config: dict[str, Any] = {"fcnet_hiddens": [16], "head_fcnet_hiddens": [16]}
     module_class = None
     if graph:
-        module_class = GraphDQNTorchRLModule if algorithm == "dqn" else GraphSACTorchRLModule
+        module_class = (
+            GraphDQNTorchRLModule if algorithm == "dqn" else GraphSACTorchRLModule
+        )
         model_config["graph_encoder"] = {"hidden_dim": 16, "message_layers": 1}
         if algorithm == "sac":
             model_config["graph_encoders"] = {
@@ -339,14 +343,20 @@ def _module_config(
         )
 
         module_class = (
-            RecurrentDQNTorchRLModule if algorithm == "dqn" else RecurrentSACTorchRLModule
+            RecurrentDQNTorchRLModule
+            if algorithm == "dqn"
+            else RecurrentSACTorchRLModule
         )
         model_config["recurrent_hidden_dim"] = 16
     config.rl_module(
-        rl_module_spec=RLModuleSpec(module_class=module_class, model_config=model_config)
+        rl_module_spec=RLModuleSpec(
+            module_class=module_class, model_config=model_config
+        )
     )
     if algorithm == "dqn":
-        config.training(dueling=True, double_q=True, num_atoms=1, epsilon=[(0, 1.0), (100, 0.1)])
+        config.training(
+            dueling=True, double_q=True, num_atoms=1, epsilon=[(0, 1.0), (100, 0.1)]
+        )
     else:
         config.training(actor_lr=3e-4, critic_lr=3e-4, alpha_lr=3e-4, twin_q=True)
     return config
@@ -363,7 +373,9 @@ def _rollout_config(
         SACConfig()
         .environment(env, env_config=env_config)
         .framework("torch")
-        .api_stack(enable_rl_module_and_learner=True, enable_env_runner_and_connector_v2=True)
+        .api_stack(
+            enable_rl_module_and_learner=True, enable_env_runner_and_connector_v2=True
+        )
         .env_runners(
             num_env_runners=0,
             create_local_env_runner=True,
@@ -384,10 +396,14 @@ def _rollout_config(
             rl_module_spec=MultiRLModuleSpec(
                 rl_module_specs={
                     module_id: RLModuleSpec(
-                        module_class=module_configs[module_id].rl_module_spec.module_class,
+                        module_class=module_configs[
+                            module_id
+                        ].rl_module_spec.module_class,
                         observation_space=obs,
                         action_space=act,
-                        model_config=module_configs[module_id].rl_module_spec.model_config,
+                        model_config=module_configs[
+                            module_id
+                        ].rl_module_spec.model_config,
                     )
                     for module_id, (obs, act) in spaces.items()
                 }
@@ -406,7 +422,9 @@ def build_temporal_hierarchy_configs(
     recurrent: bool = False,
     time_limit: bool = False,
     seed: int = 20261114,
-) -> tuple[AlgorithmConfig, dict[str, AlgorithmConfig], dict[str, tuple[gym.Space, gym.Space]]]:
+) -> tuple[
+    AlgorithmConfig, dict[str, AlgorithmConfig], dict[str, tuple[gym.Space, gym.Space]]
+]:
     """Build DEMO-02; pass trainable_modules=('manager',) to freeze workers."""
 
     spaces = temporal_hierarchy_spaces(vector_worker=vector_worker)
@@ -436,15 +454,31 @@ def build_temporal_hierarchy_configs(
 
 
 def build_memory_configs(
-    *, graph: bool = False, algorithm: str = "dqn", episode_length: int = 5,
-    recurrent: bool = True, seed: int = 20261114
-) -> tuple[AlgorithmConfig, dict[str, AlgorithmConfig], dict[str, tuple[gym.Space, gym.Space]]]:
+    *,
+    graph: bool = False,
+    algorithm: str = "dqn",
+    episode_length: int = 5,
+    recurrent: bool = True,
+    seed: int = 20261114,
+) -> tuple[
+    AlgorithmConfig, dict[str, AlgorithmConfig], dict[str, tuple[gym.Space, gym.Space]]
+]:
     """Build DEMO-03 or its memoryless baseline with the same observations."""
 
     if algorithm not in ("dqn", "sac"):
         raise ValueError("memory algorithm must be dqn or sac")
-    env_config = {"graph": graph, "continuous": algorithm == "sac", "episode_length": episode_length}
+    env_config = {
+        "graph": graph,
+        "continuous": algorithm == "sac",
+        "episode_length": episode_length,
+    }
     env = CueMemoryEnv(env_config)
     spaces = {"memory": (env.observation_spaces["memory"], env.action_spaces["memory"])}
-    configs = {"memory": _module_config(algorithm, graph=graph, recurrent=recurrent, seed=seed)}
-    return _rollout_config(CueMemoryEnv, env_config, spaces, configs, seed), configs, spaces
+    configs = {
+        "memory": _module_config(algorithm, graph=graph, recurrent=recurrent, seed=seed)
+    }
+    return (
+        _rollout_config(CueMemoryEnv, env_config, spaces, configs, seed),
+        configs,
+        spaces,
+    )

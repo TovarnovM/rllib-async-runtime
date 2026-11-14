@@ -12,11 +12,13 @@ from rllib_async.examples.temporal_hierarchy import (
     temporal_policy_mapping_fn,
 )
 from rllib_async.gnn.episodes import NODE_FEATURES
-from rllib_async.rollout.multi_module import _RawStep, _raw_decisions
+from rllib_async.rollout.multi_module import _raw_decisions, _RawStep
 
 
 def _features(observation):
-    return observation[NODE_FEATURES][0] if isinstance(observation, dict) else observation
+    return (
+        observation[NODE_FEATURES][0] if isinstance(observation, dict) else observation
+    )
 
 
 def _run_scripted_environment(env):
@@ -30,10 +32,14 @@ def _run_scripted_environment(env):
         action = (
             int(_features(observations[agent])[2] > 0)
             if role == "manager"
-            else 0 if role == "worker_0" else np.asarray([1.0], np.float32)
+            else 0
+            if role == "worker_0"
+            else np.asarray([1.0], np.float32)
         )
         world_t = env.world_t
-        observations, rewards, terminateds, truncateds, infos = env.step({agent: action})
+        observations, rewards, terminateds, truncateds, infos = env.step(
+            {agent: action}
+        )
         steps.append(
             _RawStep(
                 world_t,
@@ -73,9 +79,15 @@ def test_causal_hierarchy_manager_routes_before_the_first_worker_action():
 
 
 @pytest.mark.parametrize("variable_duration", [False, True])
-def test_raw_manager_intervals_keep_physical_rewards_and_local_boundaries(variable_duration):
+def test_raw_manager_intervals_keep_physical_rewards_and_local_boundaries(
+    variable_duration,
+):
     env = CausalHierarchyEnv(
-        {"episode_length": 8, "manager_period": 3, "variable_duration": variable_duration}
+        {
+            "episode_length": 8,
+            "manager_period": 3,
+            "variable_duration": variable_duration,
+        }
     )
     steps, decisions = _run_scripted_environment(env)
     manager = [value for (agent, _), value in decisions.items() if agent == "manager"]
@@ -83,7 +95,9 @@ def test_raw_manager_intervals_keep_physical_rewards_and_local_boundaries(variab
     assert [value["duration"] for value in manager] == (
         [2, 3, 3] if variable_duration else [3, 3, 2]
     )
-    assert all(value["state_reset"] == (index == 0) for index, value in enumerate(manager))
+    assert all(
+        value["state_reset"] == (index == 0) for index, value in enumerate(manager)
+    )
     assert all(not value["subtask_terminated"] for value in manager)
     assert all(not value[Columns.TERMINATEDS] for value in manager[:-1])
     assert manager[-1][Columns.TERMINATEDS]
@@ -93,7 +107,9 @@ def test_raw_manager_intervals_keep_physical_rewards_and_local_boundaries(variab
         expected = tuple(
             step.rewards.get("manager", 0.0)
             for step in steps
-            if value["world_t"] < step.next_world_t <= value["world_t"] + value["duration"]
+            if value["world_t"]
+            < step.next_world_t
+            <= value["world_t"] + value["duration"]
             and step.next_world_t > step.world_t
         )
         assert value["raw_rewards"] == expected
@@ -101,13 +117,18 @@ def test_raw_manager_intervals_keep_physical_rewards_and_local_boundaries(variab
     assert len(workers) == 8
     assert all(value["duration"] == 1 for _, value in workers)
     assert all(value["state_reset"] == (key[1] == 0) for key, value in workers)
-    assert any(value["subtask_terminated"] and not value[Columns.TERMINATEDS] for _, value in workers)
+    assert any(
+        value["subtask_terminated"] and not value[Columns.TERMINATEDS]
+        for _, value in workers
+    )
     ids = Counter(key[0] for key, _ in workers)
     assert len(ids) == len(manager)
 
 
 def test_time_limit_keeps_real_final_state_and_manager_bootstrap():
-    env = CausalHierarchyEnv({"episode_length": 4, "manager_period": 3, "time_limit": True})
+    env = CausalHierarchyEnv(
+        {"episode_length": 4, "manager_period": 3, "time_limit": True}
+    )
     _, decisions = _run_scripted_environment(env)
     final = decisions[("manager", 1)]
     assert final[Columns.TRUNCATEDS]
@@ -138,7 +159,9 @@ def test_delayed_cue_does_not_leak_into_query_observation(graph):
         returns[cue] = rewards["memory"]
     assert set(observations_by_cue) == {-1.0, 1.0}
     assert returns == {-1.0: 1.0, 1.0: 1.0}
-    for negative, positive in zip(observations_by_cue[-1.0], observations_by_cue[1.0], strict=True):
+    for negative, positive in zip(
+        observations_by_cue[-1.0], observations_by_cue[1.0], strict=True
+    ):
         if graph:
             for key in negative:
                 np.testing.assert_array_equal(negative[key], positive[key])

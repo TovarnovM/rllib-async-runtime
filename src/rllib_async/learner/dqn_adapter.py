@@ -1,4 +1,4 @@
-"""One-step DQN learner adapter using RLlib's losses and target networks."""
+"""DQN learner adapter consuming replay-prepared targets with RLlib losses."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ DQNUpdateResult = LearnerUpdateResult
 
 
 class DQNBatchError(ValueError):
-    """A batch does not satisfy the one-step discrete DQN contract."""
+    """A batch does not satisfy the prepared discrete DQN contract."""
 
 
 class DQNLearnerAdapterError(RuntimeError):
@@ -72,9 +72,7 @@ def validate_dqn_config(
             or isinstance(module_config.n_step, bool)
             or module_config.n_step < 1
         ):
-            raise ValueError(
-                "DQN n_step must be a positive integer"
-            )
+            raise ValueError("DQN n_step must be a positive integer")
         if module_config.noisy:
             raise ValueError("noisy DQN is not supported by the pinned RLlib module")
         if module_config.burn_in_len:
@@ -200,21 +198,21 @@ def _validate_dqn_columns(
         if actions.ndim != 1 or actions.dtype.kind not in "iu":
             raise DQNBatchError("DQN actions must be a one-dimensional integer array")
         sample[Columns.ACTIONS] = np.ascontiguousarray(actions, dtype=np.int64)
-        if validate:
-            if np.any(actions < 0) or (
+        if validate and (
+            np.any(actions < 0)
+            or (
                 action_spaces is not None
                 and np.any(actions >= action_spaces[module_id].n)
-            ):
-                raise DQNBatchError(
-                    "DQN actions must be within the Discrete action space"
-                )
+            )
+        ):
+            raise DQNBatchError("DQN actions must be within the Discrete action space")
     return batch
 
 
 def build_rllib_dqn_batch(
     batch: Mapping[str, Any], *, validate: bool = True
 ) -> MultiAgentBatch:
-    """Build RLlib's one-step input while sharing the SAC column conversion."""
+    """Build RLlib's prepared-target input with the common column conversion."""
 
     try:
         converted = build_rllib_sac_batch(batch, validate=validate)

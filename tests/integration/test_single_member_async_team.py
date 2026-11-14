@@ -120,6 +120,20 @@ def _assert_bundle(weights, module_ids):
     )
 
 
+def _frozen_learner_states(runtime):
+    return ray.get(
+        runtime._learner_actor.__ray_call__.remote(
+            lambda actor: {
+                module_id: actor._host._adapters[module_id].get_state()[
+                    "learner_group"
+                ]
+                for module_id in ("worker_0", "worker_1")
+            }
+        ),
+        timeout=10,
+    )
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "num_gpus",
@@ -171,6 +185,7 @@ def test_mixed_recurrent_runtime_publishes_evaluates_and_resumes(
         checkpoint_dir.mkdir()
         checkpoint = runtime.save_checkpoint(checkpoint_dir, timeout_s=10)
         saved = read_runtime_checkpoint(checkpoint_dir)
+        assert saved.controller["algorithm"] == "team"
         source_counters = _counters(runtime)
         source_stats = ray.get(runtime._learner_actor.get_stats.remote(), timeout=10)
         source_weights = ray.get(
@@ -275,6 +290,7 @@ def test_frozen_workers_keep_weights_while_manager_learns(ray_runtime) -> None:
                 runtime._learner_actor.get_published_weights.remote(), timeout=10
             ).state
         )
+        frozen_states = _frozen_learner_states(runtime)
         runtime.start()
         _train_until(runtime, {"manager": 2})
         runtime.drain(timeout_s=10)
@@ -288,6 +304,7 @@ def test_frozen_workers_keep_weights_while_manager_learns(ray_runtime) -> None:
             assert counters[module_id]["optimizer_updates"] == 0
             assert counters[module_id]["learned_positions"] == 0
             assert_tree_close(initial[module_id], final.state[module_id])
+        assert_tree_close(frozen_states, _frozen_learner_states(runtime))
     finally:
         runtime.stop(graceful=False)
         _assert_stopped(actors)

@@ -196,6 +196,29 @@ def test_multi_module_adapter_updates_discrete_manager_and_continuous_workers() 
             restored.get_published_weights().module_versions
             == adapter.get_published_weights().module_versions
         )
+
+        # A sparse worker update must not touch the manager's temperature,
+        # target cursor, optimizer state, or online/target parameters.
+        before = copy.deepcopy(adapter.get_state()["learner_group"]["learner"])
+        result = adapter.update_modules(
+            {WORKER_0_MODULE_ID: worker_0_batch},
+            sampled_env_steps=16,
+            sampled_agent_steps=32,
+        )
+        assert result.performed
+        after = adapter.get_state()["learner_group"]["learner"]
+        for mid in (MANAGER_MODULE_ID, WORKER_1_MODULE_ID):
+            assert_tree_close(after[COMPONENT_RL_MODULE][mid], before[COMPONENT_RL_MODULE][mid])
+            assert_tree_close(after[SAC_TEMPERATURE_STATE][mid], before[SAC_TEMPERATURE_STATE][mid])
+            assert after[SAC_TARGET_UPDATE_STATE][mid] == before[SAC_TARGET_UPDATE_STATE][mid]
+        for key, value in before[COMPONENT_OPTIMIZER].items():
+            if not key.startswith(WORKER_0_MODULE_ID):
+                assert_tree_close(after[COMPONENT_OPTIMIZER][key], value)
+        count = adapter.learner_updates
+        assert not adapter.update_modules(
+            {}, sampled_env_steps=16, sampled_agent_steps=32
+        ).performed
+        assert adapter.learner_updates == count
     finally:
         adapter.close()
         if restored is not None:

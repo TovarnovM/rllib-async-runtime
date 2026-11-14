@@ -79,6 +79,29 @@ class GraphEpisodePayload(MultiModuleEpisodePayload):
         )
 
 
+def compact_graph_observation(observation: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Remove fixed-space transport padding without scanning graph contents."""
+
+    if NODE_COUNT not in observation and EDGE_COUNT not in observation:
+        return observation
+    if NODE_COUNT not in observation or EDGE_COUNT not in observation:
+        raise EpisodeValidationError(
+            "padded graph observations require node_count and edge_count together"
+        )
+    graph = dict(observation)
+    node_count = _integer_scalar(graph.pop(NODE_COUNT), name=NODE_COUNT)
+    edge_count = _integer_scalar(graph.pop(EDGE_COUNT), name=EDGE_COUNT)
+    if not 1 <= node_count <= len(graph[NODE_FEATURES]):
+        raise EpisodeValidationError("node_count is outside node_features padding")
+    if not 0 <= edge_count <= graph[EDGE_INDEX].shape[1]:
+        raise EpisodeValidationError("edge_count is outside edge_index padding")
+    graph[NODE_FEATURES] = graph[NODE_FEATURES][:node_count]
+    graph[EDGE_INDEX] = graph[EDGE_INDEX][:, :edge_count]
+    if EDGE_FEATURES in graph:
+        graph[EDGE_FEATURES] = graph[EDGE_FEATURES][:edge_count]
+    return graph
+
+
 def normalize_graph_observation(
     observation: object, *, terminated: bool = False
 ) -> dict[str, Any]:

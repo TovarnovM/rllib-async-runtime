@@ -1069,22 +1069,33 @@ class ReferenceFastReplay:
         batch_size: int,
         *,
         rng: random.Random,
-        sequence_config: SequenceConfig = SequenceConfig(),
+        sequence_config: SequenceConfig | None = None,
         n_step: int = 1,
     ) -> list[SequenceWindow]:
-        """Reference oracle: locate each uniformly selected start by scanning histories."""
+        """Locate uniformly selected starts by scanning the reference histories."""
 
         if not isinstance(self._codec, SequenceEpisodeCodec):
             raise TypeError("sequence sampling requires raw physical-time episode data")
+        if sequence_config is None:
+            sequence_config = SequenceConfig()
         windows = []
-        for episode_id, index in self.sample_module_coordinates(module_id, batch_size, rng=rng):
+        for episode_id, index in self.sample_module_coordinates(
+            module_id, batch_size, rng=rng
+        ):
             episode = self._episodes[episode_id]
             for history in self._codec.module_histories(episode, module_id):
                 if index in history:
-                    windows.append(make_sequence_window(
-                        self._codec, episode, module_id, history, history.index(index),
-                        sequence_config=sequence_config, n_step=n_step,
-                    ))
+                    windows.append(
+                        make_sequence_window(
+                            self._codec,
+                            episode,
+                            module_id,
+                            history,
+                            history.index(index),
+                            sequence_config=sequence_config,
+                            n_step=n_step,
+                        )
+                    )
                     break
         return windows
 

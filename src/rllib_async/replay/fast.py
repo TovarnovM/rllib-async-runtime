@@ -554,23 +554,34 @@ class FastReplay:
         batch_size: int,
         *,
         rng: random.Random,
-        sequence_config: SequenceConfig = SequenceConfig(),
+        sequence_config: SequenceConfig | None = None,
         n_step: int = 1,
     ) -> list[SequenceWindow]:
         """Sample uniformly over real decisions, retaining short window tails."""
 
         if not isinstance(self._codec, SequenceEpisodeCodec):
             raise TypeError("sequence sampling requires raw physical-time episode data")
+        if sequence_config is None:
+            sequence_config = SequenceConfig()
         view = self._capture_active_view()
         windows = []
         for episode_index, transition_index in self._sample_module_positions(
             view, module_id, batch_size, rng=rng
         ):
-            history, start = view.sequence_positions[episode_index, module_id][transition_index]
-            windows.append(make_sequence_window(
-                self._codec, view.episodes[episode_index], module_id, history, start,
-                sequence_config=sequence_config, n_step=n_step,
-            ))
+            history, start = view.sequence_positions[episode_index, module_id][
+                transition_index
+            ]
+            windows.append(
+                make_sequence_window(
+                    self._codec,
+                    view.episodes[episode_index],
+                    module_id,
+                    history,
+                    start,
+                    sequence_config=sequence_config,
+                    n_step=n_step,
+                )
+            )
         return windows
 
     def close(
@@ -695,7 +706,9 @@ class FastReplay:
                     )
                     if isinstance(module_codec, SequenceEpisodeCodec):
                         by_position = {}
-                        for history in module_codec.module_histories(record.episode, module_id):
+                        for history in module_codec.module_histories(
+                            record.episode, module_id
+                        ):
                             for position, index in enumerate(history):
                                 by_position[index] = (history, position)
                         sequence_positions[episode_index, module_id] = tuple(

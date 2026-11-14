@@ -176,7 +176,11 @@ class TorchHistoryEncoder(TorchModel, Encoder):
             if prefix:
                 with torch.no_grad():
                     features = self.observation_encoder(
-                        {Columns.OBS: _slice_observations(observations, offset, offset + prefix)}
+                        {
+                            Columns.OBS: _slice_observations(
+                                observations, offset, offset + prefix
+                            )
+                        }
                     )[ENCODER_OUT]
                     encoded, hidden = self.gru(features.unsqueeze(0), hidden)
                 parts.append(encoded[0])
@@ -201,7 +205,10 @@ def _history_encoder_config(
         raise ValueError("recurrent modules use an observation-history GRU")
     if isinstance(observation_space, gym.spaces.Dict):
         base = graph_encoder_config(observation_space, model_config)
-    elif isinstance(observation_space, gym.spaces.Box) and len(observation_space.shape) == 1:
+    elif (
+        isinstance(observation_space, gym.spaces.Box)
+        and len(observation_space.shape) == 1
+    ):
         base = Catalog._get_encoder_config(observation_space, dict(model_config))
     else:
         raise ValueError("recurrent observations require a vector Box or graph Dict")
@@ -236,7 +243,9 @@ class RecurrentSACCatalog(SACCatalog):
         action_space: gym.Space | None = None,
     ) -> ModelConfig:
         del action_space
-        return _history_encoder_config(observation_space, model_config_dict)
+        return _history_encoder_config(
+            observation_space, _role_config(model_config_dict, "actor")
+        )
 
 
 def _role_config(model_config: Mapping[str, Any], role: str) -> dict[str, Any]:
@@ -311,18 +320,19 @@ class RecurrentSACTorchRLModule(ActionMaskedSACTorchRLModule):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         if kwargs.get("catalog_class") is None:
             kwargs["catalog_class"] = RecurrentSACCatalog
-        model_config = kwargs.get("model_config")
-        if model_config is not None:
-            self._role_model_config = dict(model_config)
-            kwargs["model_config"] = _role_config(model_config, "actor")
         super().__init__(*args, **kwargs)
 
     def setup(self) -> None:
         self.twin_q = self.model_config["twin_q"]
         if isinstance(self.action_space, gym.spaces.Discrete) and not self.twin_q:
             raise ValueError("Ray 2.56.1 discrete SAC requires twin_q=True")
-        if isinstance(self.action_space, gym.spaces.Box) and len(self.action_space.shape) != 1:
-            raise ValueError("recurrent continuous SAC requires a vector Box action space")
+        if (
+            isinstance(self.action_space, gym.spaces.Box)
+            and len(self.action_space.shape) != 1
+        ):
+            raise ValueError(
+                "recurrent continuous SAC requires a vector Box action space"
+            )
         if (
             isinstance(self.action_space, gym.spaces.Box)
             and isinstance(self.observation_space, gym.spaces.Dict)
@@ -337,7 +347,7 @@ class RecurrentSACTorchRLModule(ActionMaskedSACTorchRLModule):
                 self.qf_twin_encoder, self.qf_twin = self._build_critic("q2")
 
     def _build_critic(self, role: str) -> tuple[Encoder, torch.nn.Module]:
-        config = _role_config(getattr(self, "_role_model_config", self.model_config), role)
+        config = _role_config(self.model_config, role)
         catalog = RecurrentSACCatalog(
             observation_space=self.observation_space,
             action_space=self.action_space,
@@ -386,7 +396,11 @@ class RecurrentSACTorchRLModule(ActionMaskedSACTorchRLModule):
         following = history["next_indices"].long()
         actor = self.pi_encoder.encode_history(history)
         q1 = self.qf_encoder.encode_history(history)[current]
-        q2 = self.qf_twin_encoder.encode_history(history)[current] if self.twin_q else None
+        q2 = (
+            self.qf_twin_encoder.encode_history(history)[current]
+            if self.twin_q
+            else None
+        )
         logits = self.pi(actor[current])
         with torch.no_grad():
             logits_next = self.pi(actor[following])
@@ -397,13 +411,22 @@ class RecurrentSACTorchRLModule(ActionMaskedSACTorchRLModule):
                 else None
             )
         if isinstance(self.action_space, gym.spaces.Discrete):
-            return self._discrete_outputs(batch, logits, logits_next, q1, q2, target_q1, target_q2)
-        return self._continuous_outputs(batch, logits, logits_next, q1, q2, target_q1, target_q2)
+            return self._discrete_outputs(
+                batch, logits, logits_next, q1, q2, target_q1, target_q2
+            )
+        return self._continuous_outputs(
+            batch, logits, logits_next, q1, q2, target_q1, target_q2
+        )
 
     def _discrete_outputs(
-        self, batch: dict[str, Any], logits: torch.Tensor, logits_next: torch.Tensor,
-        q1: torch.Tensor, q2: torch.Tensor | None,
-        target_q1: torch.Tensor, target_q2: torch.Tensor | None,
+        self,
+        batch: dict[str, Any],
+        logits: torch.Tensor,
+        logits_next: torch.Tensor,
+        q1: torch.Tensor,
+        q2: torch.Tensor | None,
+        target_q1: torch.Tensor,
+        target_q2: torch.Tensor | None,
     ) -> dict[str, Any]:
         probs, logs = masked_action_probabilities(logits, batch[Columns.OBS])
         next_probs, next_logs = masked_action_probabilities(
@@ -414,18 +437,26 @@ class RecurrentSACTorchRLModule(ActionMaskedSACTorchRLModule):
             if self.twin_q:
                 target = torch.minimum(target, self.target_qf_twin(target_q2))
         output = {
-            ACTION_PROBS: probs, ACTION_LOG_PROBS: logs,
-            ACTION_PROBS_NEXT: next_probs, ACTION_LOG_PROBS_NEXT: next_logs,
-            QF_TARGET_NEXT: target, QF_PREDS: self.qf(q1),
+            ACTION_PROBS: probs,
+            ACTION_LOG_PROBS: logs,
+            ACTION_PROBS_NEXT: next_probs,
+            ACTION_LOG_PROBS_NEXT: next_logs,
+            QF_TARGET_NEXT: target,
+            QF_PREDS: self.qf(q1),
         }
         if self.twin_q:
             output[QF_TWIN_PREDS] = self.qf_twin(q2)
         return output
 
     def _continuous_outputs(
-        self, batch: dict[str, Any], logits: torch.Tensor, logits_next: torch.Tensor,
-        q1: torch.Tensor, q2: torch.Tensor | None,
-        target_q1: torch.Tensor, target_q2: torch.Tensor | None,
+        self,
+        batch: dict[str, Any],
+        logits: torch.Tensor,
+        logits_next: torch.Tensor,
+        q1: torch.Tensor,
+        q2: torch.Tensor | None,
+        target_q1: torch.Tensor,
+        target_q2: torch.Tensor | None,
     ) -> dict[str, Any]:
         dist_class = self.get_train_action_dist_cls()
         distribution = dist_class.from_logits(logits)
@@ -437,7 +468,9 @@ class RecurrentSACTorchRLModule(ActionMaskedSACTorchRLModule):
             ACTION_DIST_INPUTS_NEXT: logits_next,
             "logp_resampled": distribution.logp(actions),
             "logp_next_resampled": next_distribution.logp(next_actions).detach(),
-            QF_PREDS: self.qf(torch.cat((q1, batch[Columns.ACTIONS]), dim=-1)).squeeze(-1),
+            QF_PREDS: self.qf(torch.cat((q1, batch[Columns.ACTIONS]), dim=-1)).squeeze(
+                -1
+            ),
         }
         if self.twin_q:
             output[QF_TWIN_PREDS] = self.qf_twin(
@@ -463,11 +496,15 @@ class RecurrentSACTorchRLModule(ActionMaskedSACTorchRLModule):
             for parameter, enabled in zip(parameters, requires_grad, strict=True):
                 parameter.requires_grad_(enabled)
         with torch.no_grad():
-            target = self.target_qf(torch.cat((target_q1, next_actions), dim=-1)).squeeze(-1)
+            target = self.target_qf(
+                torch.cat((target_q1, next_actions), dim=-1)
+            ).squeeze(-1)
             if self.twin_q:
                 target = torch.minimum(
                     target,
-                    self.target_qf_twin(torch.cat((target_q2, next_actions), dim=-1)).squeeze(-1),
+                    self.target_qf_twin(
+                        torch.cat((target_q2, next_actions), dim=-1)
+                    ).squeeze(-1),
                 )
             output["q_target_next"] = target
         return output

@@ -124,7 +124,9 @@ class LearnerHostStats:
     batch_producer: BatchProducerStats
     node_id: str = ""
     accelerator_ids: tuple[str, ...] = ()
-    module_counters: tuple[tuple[str, tuple[tuple[str, int | float | bool], ...]], ...] = ()
+    module_counters: tuple[
+        tuple[str, tuple[tuple[str, int | float | bool], ...]], ...
+    ] = ()
 
 
 class LearnerHost:
@@ -532,7 +534,9 @@ class LearnerHost:
                 raise LearnerHostError("replay actor returned an invalid snapshot")
             self._fast_replay.load_snapshot(snapshot)
             self._record_replay_ingestion(
-                tuple(ep for ep in snapshot.episodes if ep.episode_id not in previous_ids)
+                tuple(
+                    ep for ep in snapshot.episodes if ep.episode_id not in previous_ids
+                )
             )
             self._snapshot_loads += 1
             self._full_resyncs += 1

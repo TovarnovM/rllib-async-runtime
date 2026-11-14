@@ -23,12 +23,12 @@ from ray.rllib.core import (
     DEFAULT_MODULE_ID,
 )
 from ray.rllib.core.columns import Columns
+from ray.rllib.core.learner.learner import LR_KEY
 from ray.rllib.core.learner.utils import update_target_network
 from ray.rllib.core.rl_module.apis import TargetNetworkAPI
 from ray.rllib.policy.sample_batch import MultiAgentBatch, SampleBatch
 from ray.rllib.utils.metrics import (
     LAST_TARGET_UPDATE_TS,
-    LR_KEY,
     NUM_AGENT_STEPS_SAMPLED_LIFETIME,
     NUM_ENV_STEPS_SAMPLED_LIFETIME,
     NUM_TARGET_UPDATES,
@@ -139,9 +139,37 @@ class _SelectedModuleUpdates:
     Both SAC and DQN use the same supported target-network and LR APIs here.
     """
 
+    def apply_gradients(self, gradients_dict: dict[Any, Any]) -> None:
+        # TorchLearner steps every registered optimizer, including stale grads
+        # left by an earlier update. Restrict its existing implementation to
+        # optimizers owning gradients from this call; restore the registry even
+        # when the update fails. Local learners serialize all update calls.
+        original = self._module_optimizers
+        if len(original) == 1 or len(gradients_dict) == len(self._params):
+            super().apply_gradients(gradients_dict)
+            return
+        selected = {
+            mid: names
+            for mid, names in original.items()
+            if any(
+                self.filter_param_dict_for_optimizer(
+                    gradients_dict, self._named_optimizers[name]
+                )
+                for name in names
+            )
+        }
+        if len(selected) == len(original):
+            super().apply_gradients(gradients_dict)
+            return
+        self._module_optimizers = selected
+        try:
+            super().apply_gradients(gradients_dict)
+        finally:
+            self._module_optimizers = original
+
     def after_gradient_based_update(self, *, timesteps: dict[str, Any]) -> None:
         selected = timesteps.get("rllib_async_updated_modules")
-        if selected is None:
+        if selected is None or set(selected) == set(self.module.keys()):
             super().after_gradient_based_update(timesteps=timesteps)
             return
         timestep = timesteps.get(NUM_ENV_STEPS_SAMPLED_LIFETIME, 0)
@@ -149,12 +177,17 @@ class _SelectedModuleUpdates:
             for optimizer_name in self._module_optimizers.get(module_id, ()):
                 optimizer = self._named_optimizers[optimizer_name]
                 schedule = self._optimizer_lr_schedules.get(optimizer)
-                if schedule is not None:
+                if self._lr_schedulers:
+                    for scheduler in self._lr_schedulers.get(module_id, {}).get(
+                        optimizer_name, ()
+                    ):
+                        scheduler.step()
+                elif schedule is not None:
                     self._set_optimizer_lr(
                         optimizer, lr=schedule.update(timestep=timestep)
                     )
                 self.metrics.log_value(
-                    key=(module_id, f"{optimizer_name[len(module_id) + 1:]}_{LR_KEY}"),
+                    key=(module_id, f"{optimizer_name[len(module_id) + 1 :]}_{LR_KEY}"),
                     reduce="mean",
                     value=self._get_optimizer_lr(optimizer),
                 )
@@ -328,7 +361,9 @@ def _build_sac_sample_batch(
         current, batch_size = _validate_observation_mapping(observations)
         following, next_size = _validate_observation_mapping(next_observations)
         if batch_size != next_size or set(current) != set(following):
-            raise SACBatchError("'obs' and 'new_obs' mappings must have matching keys/counts")
+            raise SACBatchError(
+                "'obs' and 'new_obs' mappings must have matching keys/counts"
+            )
         columns[Columns.OBS] = current
         columns[Columns.NEXT_OBS] = following
     else:
@@ -398,17 +433,27 @@ def _build_sac_sample_batch(
     columns["weights"] = np.ascontiguousarray(weights, dtype=np.float32)
 
     if "recurrent" in batch:
-        columns["recurrent"] = _validate_recurrent_metadata(batch["recurrent"], batch_size)
+        columns["recurrent"] = _validate_recurrent_metadata(
+            batch["recurrent"], batch_size
+        )
     if "decision_horizons" in batch:
         horizons = np.asarray(batch["decision_horizons"])
-        if horizons.shape != (batch_size,) or horizons.dtype.kind not in "iu" or np.any(horizons < 1):
-            raise SACBatchError("decision_horizons must contain one positive integer per loss row")
+        if (
+            horizons.shape != (batch_size,)
+            or horizons.dtype.kind not in "iu"
+            or np.any(horizons < 1)
+        ):
+            raise SACBatchError(
+                "decision_horizons must contain one positive integer per loss row"
+            )
         columns["decision_horizons"] = np.ascontiguousarray(horizons, dtype=np.int64)
 
     return SampleBatch(columns)
 
 
-def _validate_observation_mapping(observations: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
+def _validate_observation_mapping(
+    observations: Mapping[str, Any],
+) -> tuple[dict[str, Any], int]:
     if not observations:
         raise SACBatchError("observation mappings must not be empty")
     columns = {}
@@ -421,7 +466,9 @@ def _validate_observation_mapping(observations: Mapping[str, Any]) -> tuple[dict
             count = len(columns[name])
         lengths.add(count)
     if len(lengths) != 1:
-        raise SACBatchError("observation mapping fields must have the same batch dimension")
+        raise SACBatchError(
+            "observation mapping fields must have the same batch dimension"
+        )
     return columns, lengths.pop()
 
 
@@ -431,9 +478,19 @@ def _validate_recurrent_metadata(raw: object, batch_size: int) -> Mapping[str, A
         raise SACBatchError("recurrent metadata has invalid columns")
     lengths = np.asarray(raw["seq_lens"])
     prefixes = np.asarray(raw["prefix_lens"])
-    if lengths.ndim != 1 or not len(lengths) or lengths.dtype.kind not in "iu" or np.any(lengths < 1):
+    if (
+        lengths.ndim != 1
+        or not len(lengths)
+        or lengths.dtype.kind not in "iu"
+        or np.any(lengths < 1)
+    ):
         raise SACBatchError("recurrent seq_lens must contain positive integers")
-    if prefixes.shape != lengths.shape or prefixes.dtype.kind not in "iu" or np.any(prefixes < 0) or np.any(prefixes >= lengths):
+    if (
+        prefixes.shape != lengths.shape
+        or prefixes.dtype.kind not in "iu"
+        or np.any(prefixes < 0)
+        or np.any(prefixes >= lengths)
+    ):
         raise SACBatchError("recurrent prefix_lens are outside their histories")
     observations = raw["obs"]
     if isinstance(observations, Mapping) and "graph_ptr" in observations:
@@ -447,15 +504,26 @@ def _validate_recurrent_metadata(raw: object, batch_size: int) -> Mapping[str, A
     indices = []
     for name in ("current_indices", "next_indices"):
         value = np.asarray(raw[name])
-        if value.shape != (batch_size,) or value.dtype.kind not in "iu" or np.any(value < 0) or np.any(value >= history_count):
+        if (
+            value.shape != (batch_size,)
+            or value.dtype.kind not in "iu"
+            or np.any(value < 0)
+            or np.any(value >= history_count)
+        ):
             raise SACBatchError(f"recurrent {name} is outside its history")
         indices.append(value)
     ends = np.cumsum(lengths)
     current_history = np.searchsorted(ends, indices[0], side="right")
     next_history = np.searchsorted(ends, indices[1], side="right")
     starts = np.concatenate(([0], ends[:-1]))
-    if np.any(current_history != next_history) or np.any(indices[1] <= indices[0]) or np.any(indices[0] < starts[current_history] + prefixes[current_history]):
-        raise SACBatchError("recurrent loss/target indices cross prefix or agent boundaries")
+    if (
+        np.any(current_history != next_history)
+        or np.any(indices[1] <= indices[0])
+        or np.any(indices[0] < starts[current_history] + prefixes[current_history])
+    ):
+        raise SACBatchError(
+            "recurrent loss/target indices cross prefix or agent boundaries"
+        )
     return raw
 
 
@@ -776,7 +844,9 @@ class _LocalOffPolicyLearnerAdapter:
             },
         )
         self._learner_updates += 1
-        published_weights = self.maybe_publish_weights() if self._publish_updates else None
+        published_weights = (
+            self.maybe_publish_weights() if self._publish_updates else None
+        )
         return LearnerUpdateResult(
             performed=True,
             learner_updates=self._learner_updates,

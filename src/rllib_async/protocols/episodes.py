@@ -618,9 +618,9 @@ class EncodedRawTransition(EncodedModuleTransition):
 class RawMultiModuleEpisodePayload(MultiModuleEpisodePayload):
     """Versioned physical-time decisions, including heterogeneous observations."""
 
-    _module_histories: tuple[
-        tuple[str, tuple[tuple[int, ...], ...]], ...
-    ] = field(init=False, repr=False, compare=False)
+    _module_histories: tuple[tuple[str, tuple[tuple[int, ...], ...]], ...] = field(
+        init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         MultiModuleEpisodePayload.__post_init__(self)
@@ -677,6 +677,8 @@ class RawMultiModuleEpisodeCodec(MultiModuleEpisodeCodec):
         self, transitions: Iterable[MultiModuleTransition]
     ) -> RawMultiModuleEpisodePayload:
         grouped: dict[str, list[EncodedRawTransition]] = defaultdict(list)
+        previous_observations: dict[str, object] = {}
+        observation_schemas: dict[str, object] = {}
         for transition in transitions:
             if not isinstance(transition, MultiModuleTransition):
                 raise EpisodeValidationError(
@@ -684,8 +686,16 @@ class RawMultiModuleEpisodeCodec(MultiModuleEpisodeCodec):
                 )
             data = dict(transition.data)
             required = {
-                "obs", "new_obs", "actions", "rewards", "terminateds", "truncateds",
-                "world_t", "duration", "raw_rewards", "state_reset",
+                "obs",
+                "new_obs",
+                "actions",
+                "rewards",
+                "terminateds",
+                "truncateds",
+                "world_t",
+                "duration",
+                "raw_rewards",
+                "state_reset",
                 "subtask_terminated",
             }
             missing = required - data.keys()
@@ -697,30 +707,88 @@ class RawMultiModuleEpisodeCodec(MultiModuleEpisodeCodec):
             for name, minimum in (("world_t", 0), ("duration", 1)):
                 value = data[name]
                 if type(value) is not int or value < minimum:
-                    raise EpisodeValidationError(f"{name} must be an integer >= {minimum}")
+                    raise EpisodeValidationError(
+                        f"{name} must be an integer >= {minimum}"
+                    )
             for name in (
-                "state_reset", "subtask_terminated", "terminateds", "truncateds"
+                "state_reset",
+                "subtask_terminated",
+                "terminateds",
+                "truncateds",
             ):
                 if type(data[name]) is not bool:
                     raise EpisodeValidationError(f"{name} must be boolean")
             rewards = data["raw_rewards"]
-            if not isinstance(rewards, (tuple, list)) or len(rewards) != data["duration"]:
-                raise EpisodeValidationError("raw_rewards must contain one reward per tick")
-            if any(
-                not isinstance(value, Real) or isinstance(value, bool)
-                or not math.isfinite(value) for value in rewards
+            if (
+                not isinstance(rewards, tuple | list)
+                or len(rewards) != data["duration"]
             ):
-                raise EpisodeValidationError("raw_rewards must contain finite real values")
+                raise EpisodeValidationError(
+                    "raw_rewards must contain one reward per tick"
+                )
+            if any(
+                not isinstance(value, Real)
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                for value in rewards
+            ):
+                raise EpisodeValidationError(
+                    "raw_rewards must contain finite real values"
+                )
             data["raw_rewards"] = tuple(float(value) for value in rewards)
             if (
                 not isinstance(data["rewards"], Real)
                 or isinstance(data["rewards"], bool)
                 or not math.isclose(
-                    float(data["rewards"]), sum(data["raw_rewards"]),
-                    rel_tol=1e-6, abs_tol=1e-7,
+                    float(data["rewards"]),
+                    sum(data["raw_rewards"]),
+                    rel_tol=1e-6,
+                    abs_tol=1e-7,
                 )
             ):
-                raise EpisodeValidationError("rewards must be the undiscounted raw reward sum")
+                raise EpisodeValidationError(
+                    "rewards must be the undiscounted raw reward sum"
+                )
+            for column in ("obs", "new_obs"):
+                observation = data[column]
+                if isinstance(observation, Mapping) and "node_features" in observation:
+                    from rllib_async.gnn.episodes import (
+                        compact_graph_observation,
+                        normalize_graph_observation,
+                    )
+
+                    data[column] = (
+                        normalize_graph_observation(
+                            observation,
+                            terminated=column == "new_obs"
+                            and (
+                                data["terminateds"] or data["subtask_terminated"]
+                            ),
+                        )
+                        if self._validate_next_episode
+                        else compact_graph_observation(observation)
+                    )
+            if self._validate_next_episode:
+                previous = previous_observations.get(transition.agent_id)
+                if (
+                    previous is not None
+                    and not data["state_reset"]
+                    and not _observations_equal(previous, data["obs"])
+                ):
+                    raise EpisodeValidationError(
+                        "next observation must equal the following decision observation"
+                    )
+                previous_observations[transition.agent_id] = data["new_obs"]
+                for column in ("obs", "new_obs"):
+                    schema = _observation_schema(data[column])
+                    prior_schema = observation_schemas.setdefault(
+                        transition.module_id, schema
+                    )
+                    if schema != prior_schema:
+                        raise EpisodeValidationError(
+                            "one module must keep compatible observation "
+                            "feature schemas"
+                        )
             grouped[transition.module_id].append(
                 EncodedRawTransition(
                     env_t=transition.env_t,
@@ -736,7 +804,9 @@ class RawMultiModuleEpisodeCodec(MultiModuleEpisodeCodec):
                 )
             )
         payload = RawMultiModuleEpisodePayload(
-            tuple((module_id, tuple(grouped[module_id])) for module_id in sorted(grouped))
+            tuple(
+                (module_id, tuple(grouped[module_id])) for module_id in sorted(grouped)
+            )
         )
         self._validate_next_episode = False
         return payload
@@ -745,7 +815,8 @@ class RawMultiModuleEpisodeCodec(MultiModuleEpisodeCodec):
     def _payload(episode: EpisodeEnvelope) -> RawMultiModuleEpisodePayload:
         if not isinstance(episode.payload, RawMultiModuleEpisodePayload):
             raise EpisodeValidationError(
-                "raw sequence replay requires schema 2 physical durations and raw rewards"
+                "raw sequence replay requires schema 2 physical durations "
+                "and raw rewards"
             )
         return episode.payload
 
@@ -756,3 +827,42 @@ class RawMultiModuleEpisodeCodec(MultiModuleEpisodeCodec):
             if candidate == module_id:
                 return histories
         raise KeyError(module_id)
+
+
+def _observations_equal(left: object, right: object) -> bool:
+    if isinstance(left, Mapping):
+        return (
+            isinstance(right, Mapping)
+            and left.keys() == right.keys()
+            and all(
+                _observations_equal(value, right[key]) for key, value in left.items()
+            )
+        )
+    import numpy as np
+
+    return np.array_equal(left, right)
+
+
+def _observation_schema(observation: object) -> object:
+    if isinstance(observation, Mapping):
+        if "node_features" in observation:
+            return (
+                "graph",
+                observation["node_features"].shape[1],
+                observation["edge_features"].shape[1]
+                if "edge_features" in observation
+                else None,
+                observation["action_mask"].shape
+                if "action_mask" in observation
+                else None,
+            )
+        return tuple(
+            (key, _observation_schema(value))
+            for key, value in sorted(observation.items())
+        )
+    import numpy as np
+
+    array = np.asarray(observation)
+    if array.dtype.kind not in "biuf" or not np.isfinite(array).all():
+        raise EpisodeValidationError("observations must contain finite real arrays")
+    return array.shape

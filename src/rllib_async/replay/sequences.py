@@ -83,7 +83,8 @@ def make_sequence_window(
 
     _positive_int("n_step", n_step)
     prefix_start = (
-        0 if sequence_config.burn_in is None
+        0
+        if sequence_config.burn_in is None
         else max(0, start - sequence_config.burn_in)
     )
     learning_end = min(len(history), start + sequence_config.learning_length)
@@ -101,8 +102,8 @@ def make_sequence_window(
         agent_id=first.agent_id,
         learn_start=first.agent_t,
         prefix=rows[:prefix_length],
-        learning=rows[prefix_length:prefix_length + learning_length],
-        continuation=rows[prefix_length + learning_length:],
+        learning=rows[prefix_length : prefix_length + learning_length],
+        continuation=rows[prefix_length + learning_length :],
         approximate=sequence_config.burn_in is not None,
         target_horizon=n_step,
     )
@@ -115,7 +116,9 @@ def prepare_sequence(
 
     _positive_int("n_step", n_step)
     if n_step != window.target_horizon:
-        raise ValueError("target horizon differs from the sampled sequence continuation")
+        raise ValueError(
+            "target horizon differs from the sampled sequence continuation"
+        )
     if isinstance(gamma, bool) or not math.isfinite(gamma) or not 0 <= gamma <= 1:
         raise ValueError("gamma must be finite and between zero and one")
     rows = window.prefix + window.learning + window.continuation
@@ -124,7 +127,12 @@ def prepare_sequence(
     prefix_length = len(window.prefix)
     current_indices = tuple(range(prefix_length, prefix_length + len(window.learning)))
     rewards, exponents, horizons, terminals, truncations, next_indices = (
-        [], [], [], [], [], []
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
     )
     for start in current_indices:
         total_reward = 0.0
@@ -148,7 +156,7 @@ def prepare_sequence(
         next_indices.append(start + horizon)
     last = rows[-1].data
     return PreparedSequence(
-        observations=tuple(row.data["obs"] for row in rows) + (last["new_obs"],),
+        observations=(*(row.data["obs"] for row in rows), last["new_obs"]),
         prefix_length=prefix_length,
         current_indices=current_indices,
         next_indices=tuple(next_indices),
@@ -168,6 +176,7 @@ def collate_sequences(
     gamma: float,
     n_step: int = 1,
     validate: bool = False,
+    include_history: bool = True,
 ) -> dict[str, Any]:
     """Return only valid loss rows plus ragged histories for recurrent encoders.
 
@@ -180,7 +189,9 @@ def collate_sequences(
         raise ValueError("sequence collation requires at least one window")
     if len({window.module_id for window in windows}) != 1:
         raise ValueError("sequence batches cannot mix module semantics")
-    prepared = [prepare_sequence(window, gamma=gamma, n_step=n_step) for window in windows]
+    prepared = [
+        prepare_sequence(window, gamma=gamma, n_step=n_step) for window in windows
+    ]
     observations: list[object] = []
     current, following, lengths, prefixes, history_terminals = [], [], [], [], []
     for sequence in prepared:
@@ -193,7 +204,8 @@ def collate_sequences(
         history_terminals.extend([False] * (len(sequence.observations) - 1))
         history_terminals.append(sequence.final_terminated)
     terminals = np.asarray(
-        [value for sequence in prepared for value in sequence.terminateds], dtype=np.bool_
+        [value for sequence in prepared for value in sequence.terminateds],
+        dtype=np.bool_,
     )
     batch: dict[str, Any] = {
         "obs": _stack_observations(
@@ -201,27 +213,33 @@ def collate_sequences(
         ),
         "new_obs": _stack_observations(
             [observations[index] for index in following],
-            validate=validate, terminated=terminals,
+            validate=validate,
+            terminated=terminals,
         ),
-        "actions": np.ascontiguousarray(np.stack(
-            [action for sequence in prepared for action in sequence.actions]
-        )),
+        "actions": np.ascontiguousarray(
+            np.stack([action for sequence in prepared for action in sequence.actions])
+        ),
         "rewards": np.asarray(
-            [value for sequence in prepared for value in sequence.rewards], dtype=np.float32
+            [value for sequence in prepared for value in sequence.rewards],
+            dtype=np.float32,
         ),
         "terminateds": terminals,
         "truncateds": np.asarray(
-            [value for sequence in prepared for value in sequence.truncateds], dtype=np.bool_
+            [value for sequence in prepared for value in sequence.truncateds],
+            dtype=np.bool_,
         ),
         "n_step": np.asarray(
-            [value for sequence in prepared for value in sequence.n_step], dtype=np.int64
+            [value for sequence in prepared for value in sequence.n_step],
+            dtype=np.int64,
         ),
         "decision_horizons": np.asarray(
             [value for sequence in prepared for value in sequence.decision_horizons],
             dtype=np.int64,
         ),
         "weights": np.ones(len(current), dtype=np.float32),
-        "recurrent": {
+    }
+    if include_history:
+        batch["recurrent"] = {
             "obs": _stack_observations(
                 observations, validate=validate, terminated=history_terminals
             ),
@@ -229,8 +247,7 @@ def collate_sequences(
             "prefix_lens": np.asarray(prefixes, dtype=np.int64),
             "current_indices": np.asarray(current, dtype=np.int64),
             "next_indices": np.asarray(following, dtype=np.int64),
-        },
-    }
+        }
     return batch
 
 
@@ -238,38 +255,53 @@ class SequenceBatchCollator:
     """One consumer's discounting and optional first successful batch check."""
 
     def __init__(
-        self, *, gamma: float, n_step: int = 1, validate_startup: bool = False
+        self,
+        *,
+        gamma: float,
+        n_step: int = 1,
+        validate_startup: bool = False,
+        include_history: bool = True,
     ) -> None:
         self._gamma = gamma
         self._n_step = n_step
         self._validate_next_batch = validate_startup
+        self._include_history = include_history
 
     def collate(self, windows: Sequence[SequenceWindow]) -> dict[str, Any]:
         batch = collate_sequences(
-            windows, gamma=self._gamma, n_step=self._n_step,
+            windows,
+            gamma=self._gamma,
+            n_step=self._n_step,
             validate=self._validate_next_batch,
+            include_history=self._include_history,
         )
         self._validate_next_batch = False
         return batch
 
 
 def _stack_observations(
-    observations: Sequence[object], *, validate: bool,
+    observations: Sequence[object],
+    *,
+    validate: bool,
     terminated: Sequence[bool] | None = None,
 ) -> object:
     first = observations[0]
     if isinstance(first, Mapping):
         if "node_features" in first:
             # Import lazily: graph batching itself uses the ordinary replay collator.
+            from rllib_async.gnn.episodes import compact_graph_observation
             from rllib_async.gnn.graph_batch import pack_graph_observations
 
-            graphs = [_without_graph_padding(item) for item in observations]
-            return pack_graph_observations(graphs, validate=validate, terminated=terminated)
+            graphs = [compact_graph_observation(item) for item in observations]
+            return pack_graph_observations(
+                graphs, validate=validate, terminated=terminated
+            )
         if validate and any(set(item) != set(first) for item in observations):
             raise ValueError("observation mappings must have identical keys")
         return {
             key: _stack_observations(
-                [item[key] for item in observations], validate=validate,
+                [item[key] for item in observations],
+                validate=validate,
                 terminated=terminated,
             )
             for key in first
@@ -278,19 +310,6 @@ def _stack_observations(
     if validate and (result.dtype.kind not in "biuf" or not np.isfinite(result).all()):
         raise ValueError("observations must contain finite real arrays")
     return result
-
-
-def _without_graph_padding(observation: Mapping[str, Any]) -> Mapping[str, Any]:
-    if "node_count" not in observation:
-        return observation
-    graph = dict(observation)
-    node_count = int(graph.pop("node_count"))
-    edge_count = int(graph.pop("edge_count"))
-    graph["node_features"] = graph["node_features"][:node_count]
-    graph["edge_index"] = graph["edge_index"][:, :edge_count]
-    if "edge_features" in graph:
-        graph["edge_features"] = graph["edge_features"][:edge_count]
-    return graph
 
 
 def _positive_int(name: str, value: object) -> None:

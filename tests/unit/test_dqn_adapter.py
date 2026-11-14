@@ -143,7 +143,7 @@ def test_default_module_preparation_does_not_mutate_caller() -> None:
 )
 def test_adapter_matches_stock_dqn_learner(double_q, dueling, num_atoms) -> None:
     config = make_dqn_config().training(
-        double_q=double_q, dueling=dueling, num_atoms=num_atoms
+        double_q=double_q, dueling=dueling, num_atoms=num_atoms, n_step=2
     )
     baseline_config = prepare_dqn_config(config)
     baseline_config.learners(learner_class=DQNTorchLearner)
@@ -155,6 +155,9 @@ def test_adapter_matches_stock_dqn_learner(double_q, dueling, num_atoms) -> None
         )
         baseline.set_state(copy.deepcopy(adapter.get_state()["learner_group"]))
         batch = fixed_batch()
+        # Replay supplies physical tick exponents, which can exceed the number
+        # of decisions in the configured target horizon.
+        batch["n_step"] = np.asarray([1, 2, 4, 3, 1, 2, 3, 4], dtype=np.int64)
         expected = baseline.update(
             batch=build_rllib_dqn_batch(batch),
             timesteps={
@@ -367,7 +370,7 @@ def test_discrete_action_bounds_checked_by_startup_diagnostics() -> None:
 @pytest.mark.parametrize(
     ("override", "message"),
     [
-        ({"n_step": 3}, "n_step=1"),
+        ({"n_step": 0}, "positive integer"),
         ({"noisy": True}, "noisy"),
         ({"model_config": {"use_lstm": True}}, "RLModuleSpec"),
     ],

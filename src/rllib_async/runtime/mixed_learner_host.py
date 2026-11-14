@@ -65,14 +65,22 @@ class MixedLearnerHost(LearnerHost):
     ) -> None:
         if not isinstance(config, Mapping) or not config:
             raise ValueError("mixed module configurations must be a non-empty mapping")
+        if any(not isinstance(mid, str) or not mid for mid in config):
+            raise ValueError("mixed module IDs must be non-empty strings")
         if set(config) - set(spaces):
             raise ValueError("mixed module configurations require matching spaces")
         if not isinstance(codec, SequenceEpisodeCodec):
             raise TypeError("mixed learners require raw decision sequence episodes")
         if batch_queue_capacity != 0:
-            raise ValueError("mixed sequence learners require direct batching (capacity=0)")
+            raise ValueError(
+                "mixed sequence learners require direct batching (capacity=0)"
+            )
         if pbt_state is not None or learning_starts_satisfied:
             raise ValueError("mixed warm start/PBT is not part of the stage 2 contract")
+        if type(batch_seed) is not int:
+            raise ValueError("batch_seed must be an integer")
+        if not isinstance(allow_replay_ahead_on_restore, bool):
+            raise TypeError("allow_replay_ahead_on_restore must be a bool")
         for name, value in (
             ("publication_interval_updates", publication_interval_updates),
             ("batch_size", batch_size),
@@ -88,10 +96,18 @@ class MixedLearnerHost(LearnerHost):
         ):
             raise ValueError("replay_sync_interval_s must be finite and non-negative")
         self._module_ids = tuple(sorted(config))
-        selected = self._module_ids if trainable_modules is None else tuple(trainable_modules)
-        if not selected or len(set(selected)) != len(selected) or not set(selected).issubset(config):
+        selected = (
+            self._module_ids if trainable_modules is None else tuple(trainable_modules)
+        )
+        if (
+            not selected
+            or len(set(selected)) != len(selected)
+            or not set(selected).issubset(config)
+        ):
             raise ValueError("trainable_modules must be a non-empty unique team subset")
-        self._trainable_modules = tuple(mid for mid in self._module_ids if mid in selected)
+        self._trainable_modules = tuple(
+            mid for mid in self._module_ids if mid in selected
+        )
         sequence_configs = dict(sequence_configs or {})
         if set(sequence_configs) - set(config) or any(
             not isinstance(value, SequenceConfig) for value in sequence_configs.values()
@@ -154,20 +170,32 @@ class MixedLearnerHost(LearnerHost):
             self._fast_replay.load_snapshot(snapshot)
             for mid, module_config in self._configs.items():
                 if not isinstance(module_config, SACConfig | DQNConfig):
-                    raise TypeError("every mixed module requires SACConfig or DQNConfig")
+                    raise TypeError(
+                        "every mixed module requires SACConfig or DQNConfig"
+                    )
                 if type(module_config.n_step) is not int or module_config.n_step < 1:
                     raise ValueError("mixed module n_step must be a positive integer")
                 size = module_config.train_batch_size_per_learner
                 if type(size) is not int or size < 1:
-                    raise ValueError("module train_batch_size_per_learner must be positive")
+                    raise ValueError(
+                        "module train_batch_size_per_learner must be positive"
+                    )
                 intensity = module_config.training_intensity
                 # Here intensity is explicitly valid learned positions/new decision.
+                if isinstance(intensity, bool):
+                    raise ValueError("module training_intensity must be numeric")
                 intensity = 1.0 if intensity is None else float(intensity)
                 if not math.isfinite(intensity) or intensity <= 0:
-                    raise ValueError("module training_intensity must be finite and positive")
+                    raise ValueError(
+                        "module training_intensity must be finite and positive"
+                    )
                 self._batch_sizes[mid] = size
                 self._intensities[mid] = intensity
-                adapter_type = SACLearnerAdapter if isinstance(module_config, SACConfig) else DQNLearnerAdapter
+                adapter_type = (
+                    SACLearnerAdapter
+                    if isinstance(module_config, SACConfig)
+                    else DQNLearnerAdapter
+                )
                 adapter = adapter_type(
                     module_config,
                     spaces={mid: spaces[mid]},
@@ -178,17 +206,24 @@ class MixedLearnerHost(LearnerHost):
                 )
                 self._adapters[mid] = adapter
                 if set(adapter.get_published_weights().module_versions) != {mid}:
-                    raise ValueError("each mixed module config must resolve to its own module ID")
+                    raise ValueError(
+                        "each mixed module config must resolve to its own module ID"
+                    )
                 learner_module = adapter._learner_group._learner.module[mid]
                 recurrent = learner_module.is_stateful()
                 self._recurrent[mid] = recurrent
                 self._sequence_configs[mid] = sequence_configs.get(
                     mid, SequenceConfig(burn_in=None if recurrent else 0)
                 )
+                if not recurrent:
+                    self._sequence_configs[mid] = replace(
+                        self._sequence_configs[mid], burn_in=0
+                    )
                 self._collators[mid] = SequenceBatchCollator(
                     gamma=module_config.gamma,
                     n_step=module_config.n_step,
                     validate_startup=validate_startup,
+                    include_history=recurrent,
                 )
             self._record_replay_ingestion(snapshot.episodes, initial=True)
             self._latest_weights = self._build_publication()
@@ -206,9 +241,13 @@ class MixedLearnerHost(LearnerHost):
 
     @property
     def _learned_positions(self) -> int:
-        return sum(int(value["learned_positions"]) for value in self._module_counters.values())
+        return sum(
+            int(value["learned_positions"]) for value in self._module_counters.values()
+        )
 
-    def _record_replay_ingestion(self, episodes: tuple[Any, ...], *, initial: bool = False) -> None:
+    def _record_replay_ingestion(
+        self, episodes: tuple[Any, ...], *, initial: bool = False
+    ) -> None:
         for episode in episodes:
             # Immutable, validated payload metadata; no decode or size traversal.
             for mid, transitions in episode.payload.encoded_module_transitions:
@@ -221,8 +260,12 @@ class MixedLearnerHost(LearnerHost):
                 clock["ingested_decisions"] = current
                 clock["ready"] = current >= threshold
                 if not initial and mid in self._trainable_modules:
-                    eligible = max(0, current - threshold) - max(0, previous - threshold)
-                    clock["budget"] = float(clock["budget"]) + eligible * self._intensities[mid]
+                    eligible = max(0, current - threshold) - max(
+                        0, previous - threshold
+                    )
+                    clock["budget"] = (
+                        float(clock["budget"]) + eligible * self._intensities[mid]
+                    )
 
     def start(self) -> None:
         if self._state is LearnerHostState.RUNNING:
@@ -268,7 +311,9 @@ class MixedLearnerHost(LearnerHost):
                 updates_skipped_learning_start=0,
                 published_weights=publication,
                 learner_metrics=(),
-                retry_after_s=max(self._next_sync_at - time.monotonic(), 0.0) if not updates and not has_more else 0.0,
+                retry_after_s=max(self._next_sync_at - time.monotonic(), 0.0)
+                if not updates and not has_more
+                else 0.0,
             )
         except Exception:
             self._state = LearnerHostState.FAILED
@@ -314,7 +359,9 @@ class MixedLearnerHost(LearnerHost):
                 sampled_agent_steps=int(clock["ingested_decisions"]),
             )
             if not update.performed:
-                raise LearnerHostError("ready mixed learner unexpectedly skipped its update")
+                raise LearnerHostError(
+                    "ready mixed learner unexpectedly skipped its update"
+                )
             clock["learned_positions"] = int(clock["learned_positions"]) + positions
             clock["optimizer_updates"] = update.learner_updates
             clock["budget"] = max(0.0, float(clock["budget"]) - positions)
@@ -364,7 +411,9 @@ class MixedLearnerHost(LearnerHost):
     ) -> LearnerHostTick:
         if self._state not in {LearnerHostState.RUNNING, LearnerHostState.PAUSED}:
             raise LearnerHostError("cannot drain a mixed learner that is not running")
-        if max_updates is not None and (type(max_updates) is not int or max_updates < 0):
+        if max_updates is not None and (
+            type(max_updates) is not int or max_updates < 0
+        ):
             raise ValueError("max_updates must be non-negative or None")
         deadline = self._deadline(timeout_s)
         transactions = 0
@@ -374,7 +423,9 @@ class MixedLearnerHost(LearnerHost):
                 count, has_more = self._sync_once()
                 transactions += count
                 if has_more and self._remaining(deadline) == 0:
-                    raise TimeoutError("timed out draining mixed replay synchronization")
+                    raise TimeoutError(
+                        "timed out draining mixed replay synchronization"
+                    )
             self._fast_replay.wait_for_idle(timeout=self._remaining(deadline))
             self._state = LearnerHostState.PAUSED
             # Direct mode has no queued selections to consume during checkpoint.
@@ -387,7 +438,11 @@ class MixedLearnerHost(LearnerHost):
     def get_stats(self) -> LearnerHostStats:
         self._require_not_stopped()
         self._refresh_learner_metrics()
-        elapsed = max(time.monotonic() - self._started_at, 0.0) if self._started_at is not None else 0.0
+        elapsed = (
+            max(time.monotonic() - self._started_at, 0.0)
+            if self._started_at is not None
+            else 0.0
+        )
         updates = self._learner_updates
         producer_state = {
             LearnerHostState.CREATED: BatchProducerState.CREATED,
@@ -425,8 +480,13 @@ class MixedLearnerHost(LearnerHost):
             learner_updates=updates,
             updates_skipped_learning_start=0,
             weight_publications=self._weight_publications,
-            updates_per_s=(updates - self._rate_base_learner_updates) / elapsed if elapsed else 0.0,
-            samples_per_s=(self._learned_positions - self._rate_base_learned_positions) / elapsed if elapsed else 0.0,
+            updates_per_s=(updates - self._rate_base_learner_updates) / elapsed
+            if elapsed
+            else 0.0,
+            samples_per_s=(self._learned_positions - self._rate_base_learned_positions)
+            / elapsed
+            if elapsed
+            else 0.0,
             data_wait_fraction=0.0,
             batch_queue_empty_fraction=0.0,
             update_time_ms_p50=self._percentile(self._update_times_ms, 50),
@@ -444,8 +504,14 @@ class MixedLearnerHost(LearnerHost):
     def get_checkpoint_state(self) -> dict[str, Any]:
         self._require_state(LearnerHostState.PAUSED)
         replay = self._fast_replay.get_stats()
-        if replay.cursor is None or replay.active_cursor != replay.cursor or replay.rebuild_in_progress:
-            raise LearnerHostError("mixed replay must be fully materialized before checkpoint")
+        if (
+            replay.cursor is None
+            or replay.active_cursor != replay.cursor
+            or replay.rebuild_in_progress
+        ):
+            raise LearnerHostError(
+                "mixed replay must be fully materialized before checkpoint"
+            )
         self._refresh_learner_metrics()
         return {
             "state_version": 1,
@@ -455,8 +521,12 @@ class MixedLearnerHost(LearnerHost):
             "trainable_modules": self._trainable_modules,
             "sequence_configs": dict(self._sequence_configs),
             "training_intensities": dict(self._intensities),
-            "adapters": {mid: adapter.get_state() for mid, adapter in self._adapters.items()},
-            "sampler_rng_states": {mid: rng.getstate() for mid, rng in self._samplers.items()},
+            "adapters": {
+                mid: adapter.get_state() for mid, adapter in self._adapters.items()
+            },
+            "sampler_rng_states": {
+                mid: rng.getstate() for mid, rng in self._samplers.items()
+            },
             "module_counters": copy.deepcopy(self._module_counters),
             "next_module": self._next_module,
             "publication_epoch": self._publication_epoch,
@@ -471,38 +541,89 @@ class MixedLearnerHost(LearnerHost):
             "python_rng_state": random.getstate(),
             "numpy_rng_state": np.random.get_state(),
             "torch_rng_state": torch.get_rng_state().clone(),
-            "torch_cuda_rng_states": tuple(value.clone() for value in torch.cuda.get_rng_state_all()) if torch.cuda.is_available() else (),
+            "torch_cuda_rng_states": tuple(
+                value.clone() for value in torch.cuda.get_rng_state_all()
+            )
+            if torch.cuda.is_available()
+            else (),
         }
 
     def _restore_checkpoint_state(self, state: Mapping[str, Any]) -> None:
-        if not isinstance(state, Mapping) or state.get("state_version") != 1 or state.get("kind") != "mixed_team":
+        if (
+            not isinstance(state, Mapping)
+            or state.get("state_version") != 1
+            or state.get("kind") != "mixed_team"
+        ):
             raise ValueError("unsupported mixed learner checkpoint")
         if state.get("member_id") != self._member_id:
             raise ValueError("mixed checkpoint member_id does not match")
-        if state.get("trainable_modules") != self._trainable_modules or state.get("sequence_configs") != self._sequence_configs or state.get("training_intensities") != self._intensities:
+        if (
+            state.get("trainable_modules") != self._trainable_modules
+            or state.get("sequence_configs") != self._sequence_configs
+            or state.get("training_intensities") != self._intensities
+        ):
             raise ValueError("mixed checkpoint sampling/training contract differs")
         cursor = state.get("replay_cursor")
         replay = self._fast_replay.get_stats()
         if not isinstance(cursor, ReplayCursor) or replay.cursor is None:
             raise ValueError("mixed checkpoint replay cursor is invalid")
         same = cursor == replay.cursor
-        ahead = self._allow_replay_ahead_on_restore and cursor.store_generation == replay.cursor.store_generation and cursor.mutation_seq <= replay.cursor.mutation_seq
+        ahead = (
+            self._allow_replay_ahead_on_restore
+            and cursor.store_generation == replay.cursor.store_generation
+            and cursor.mutation_seq <= replay.cursor.mutation_seq
+        )
         if not (same or ahead) or replay.active_cursor != replay.cursor:
             raise ValueError("mixed checkpoint does not match authoritative replay")
         adapters = state.get("adapters")
         samplers = state.get("sampler_rng_states")
         counters = state.get("module_counters")
-        if any(not isinstance(value, Mapping) or set(value) != set(self._module_ids) for value in (adapters, samplers, counters)):
+        if any(
+            not isinstance(value, Mapping) or set(value) != set(self._module_ids)
+            for value in (adapters, samplers, counters)
+        ):
             raise ValueError("mixed checkpoint module IDs differ")
         for mid, clock in counters.items():
-            if not isinstance(clock, Mapping) or set(clock) != set(self._module_counters[mid]):
+            if not isinstance(clock, Mapping) or set(clock) != set(
+                self._module_counters[mid]
+            ):
                 raise ValueError("mixed checkpoint module counters are invalid")
-            for name in ("ingested_decisions", "learned_positions", "optimizer_updates"):
+            for name in (
+                "ingested_decisions",
+                "learned_positions",
+                "optimizer_updates",
+            ):
                 self._checkpoint_counter(clock, name)
-            if type(clock["ready"]) is not bool or isinstance(clock["budget"], bool) or not isinstance(clock["budget"], int | float) or not math.isfinite(clock["budget"]) or clock["budget"] < 0:
+            if (
+                type(clock["ready"]) is not bool
+                or isinstance(clock["budget"], bool)
+                or not isinstance(clock["budget"], int | float)
+                or not math.isfinite(clock["budget"])
+                or clock["budget"] < 0
+            ):
                 raise ValueError("mixed checkpoint budget/readiness is invalid")
-            if not isinstance(adapters[mid], Mapping) or clock["optimizer_updates"] != adapters[mid].get("learner_updates"):
+            if not isinstance(adapters[mid], Mapping) or clock[
+                "optimizer_updates"
+            ] != adapters[mid].get("learner_updates"):
                 raise ValueError("mixed checkpoint optimizer clocks disagree")
+            threshold = self._configs[mid].num_steps_sampled_before_learning_starts
+            if clock["ready"] != (clock["ingested_decisions"] >= threshold):
+                raise ValueError(
+                    "mixed checkpoint readiness contradicts ingested decisions"
+                )
+            maximum = (
+                max(0, clock["ingested_decisions"] - threshold)
+                * self._intensities[mid]
+            )
+            if clock["budget"] + clock["learned_positions"] > maximum + 1e-7:
+                raise ValueError(
+                    "mixed checkpoint budget exceeds its unique-data allowance"
+                )
+            if mid not in self._trainable_modules and any(
+                clock[name]
+                for name in ("budget", "learned_positions", "optimizer_updates")
+            ):
+                raise ValueError("a frozen module cannot have learner progress")
             random.Random().setstate(samplers[mid])
         next_module = self._checkpoint_counter(state, "next_module")
         if next_module >= len(self._trainable_modules):
@@ -510,14 +631,48 @@ class MixedLearnerHost(LearnerHost):
         epoch = self._checkpoint_counter(state, "publication_epoch")
         published_update = self._checkpoint_counter(state, "last_published_update")
         weights = state.get("latest_weights")
-        if not isinstance(weights, WeightsDescriptor) or weights.member_id != self._member_id or dict(weights.module_versions) != {mid: epoch for mid in self._module_ids} or weights.learner_updates != published_update or not isinstance(weights.state, Mapping) or set(weights.state) != set(self._module_ids):
+        if (
+            not isinstance(weights, WeightsDescriptor)
+            or weights.member_id != self._member_id
+            or dict(weights.module_versions) != {mid: epoch for mid in self._module_ids}
+            or weights.learner_updates != published_update
+            or not isinstance(weights.state, Mapping)
+            or set(weights.state) != set(self._module_ids)
+        ):
             raise ValueError("mixed checkpoint publication is invalid")
         updates = sum(clock["optimizer_updates"] for clock in counters.values())
         if published_update > updates:
             raise ValueError("mixed checkpoint publication exceeds learner progress")
-        restored_counters = {name: self._checkpoint_counter(state, name) for name in ("sync_requests", "snapshot_loads", "delta_transactions", "full_resyncs", "weight_publications")}
+        restored_counters = {
+            name: self._checkpoint_counter(state, name)
+            for name in (
+                "sync_requests",
+                "snapshot_loads",
+                "delta_transactions",
+                "full_resyncs",
+                "weight_publications",
+            )
+        }
         random.Random().setstate(state.get("python_rng_state"))
         np.random.RandomState().set_state(state.get("numpy_rng_state"))
+        validator = next(iter(self._adapters.values()))._validated_rng_state
+        torch_rng = validator(
+            state.get("torch_rng_state"),
+            name="torch_rng_state",
+            expected_numel=torch.get_rng_state().numel(),
+        )
+        current_cuda = (
+            tuple(torch.cuda.get_rng_state_all()) if torch.cuda.is_available() else ()
+        )
+        cuda_rng = state.get("torch_cuda_rng_states")
+        if not isinstance(cuda_rng, tuple) or len(cuda_rng) != len(current_cuda):
+            raise ValueError("mixed checkpoint CUDA RNG device count differs")
+        cuda_rng = tuple(
+            validator(
+                value, name="torch_cuda_rng_states", expected_numel=current.numel()
+            )
+            for value, current in zip(cuda_rng, current_cuda)
+        )
         # These adapters are still constructor-owned and cannot be observed live.
         for mid, adapter in self._adapters.items():
             adapter.set_state(adapters[mid])
@@ -536,9 +691,9 @@ class MixedLearnerHost(LearnerHost):
         # Restore process RNG once, after every local learner and optimizer.
         random.setstate(state["python_rng_state"])
         np.random.set_state(state["numpy_rng_state"])
-        torch.set_rng_state(state["torch_rng_state"])
+        torch.set_rng_state(torch_rng)
         if torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(list(state["torch_cuda_rng_states"]))
+            torch.cuda.set_rng_state_all(list(cuda_rng))
 
     def stop(self, *, timeout_s: float | None = None) -> None:
         if self._state is LearnerHostState.STOPPED:

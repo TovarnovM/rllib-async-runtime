@@ -9,7 +9,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import gymnasium as gym
 import numpy as np
+import torch
 from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
 from ray.rllib.core import COMPONENT_RL_MODULE
 from ray.rllib.core.columns import Columns
@@ -17,6 +19,7 @@ from ray.rllib.core.rl_module.multi_rl_module import MultiRLModule, MultiRLModul
 from ray.rllib.env.env_runner import ENV_STEP_FAILURE
 from ray.rllib.env.multi_agent_env_runner import MultiAgentEnvRunner
 from ray.rllib.utils.metrics import WEIGHTS_SEQ_NO
+from ray.rllib.utils.spaces.space_utils import normalize_action
 
 from rllib_async.protocols.episodes import (
     EpisodeEnvelope,
@@ -42,16 +45,48 @@ class _DecisionClockMultiRLModule(MultiRLModule):
     def setup(self) -> None:
         super().setup()
         self.decision_steps: dict[str, int] = {}
+        self.publication_seq = 0
+
+    def _with_publication(
+        self, module_id: str, output: dict[str, Any]
+    ) -> dict[str, Any]:
+        # Ray 2.56.1 adds agent provenance only when at least one model-output
+        # column remains after ACTIONS is consumed. Stateless DQN otherwise
+        # emits actions alone. Carry the actual installed publication explicitly.
+        anchor = output.get(Columns.ACTIONS, output.get(Columns.ACTION_DIST_INPUTS))
+        if anchor is None:
+            raise EpisodeRunnerError(
+                "inference must produce actions or distribution inputs"
+            )
+        shape = anchor.shape[:2] if self[module_id].is_stateful() else anchor.shape[:1]
+        output[WEIGHTS_SEQ_NO] = torch.full(
+            shape, self.publication_seq, dtype=torch.int64, device=anchor.device
+        )
+        return output
+
+    def _forward_inference(
+        self, batch: dict[str, Any], **kwargs: Any
+    ) -> dict[str, Any]:
+        return {
+            module_id: self._with_publication(
+                module_id, self[module_id].forward_inference(module_batch, **kwargs)
+            )
+            for module_id, module_batch in batch.items()
+            if module_id in self
+        }
 
     def _forward_exploration(
         self, batch: dict[str, Any], **kwargs: Any
     ) -> dict[str, Any]:
         kwargs.pop("t", None)
         return {
-            module_id: self[module_id].forward_exploration(
-                module_batch,
-                t=self.decision_steps.get(module_id, 0),
-                **kwargs,
+            module_id: self._with_publication(
+                module_id,
+                self[module_id].forward_exploration(
+                    module_batch,
+                    t=self.decision_steps.get(module_id, 0),
+                    **kwargs,
+                ),
             )
             for module_id, module_batch in batch.items()
             if module_id in self
@@ -141,7 +176,9 @@ def _raw_decisions(steps: Sequence[_RawStep]) -> dict[tuple[str, int], dict[str,
     for env_t, step in enumerate(steps):
         for agent, action in step.actions.items():
             if agent in pending:
-                raise EpisodeRunnerError("agent acted before its previous decision closed")
+                raise EpisodeRunnerError(
+                    "agent acted before its previous decision closed"
+                )
             pending[agent] = {
                 "env_t": env_t,
                 "world_t": step.world_t,
@@ -167,7 +204,9 @@ def _raw_decisions(steps: Sequence[_RawStep]) -> dict[tuple[str, int], dict[str,
             decision = pending.pop(agent)
             duration = step.next_world_t - decision["world_t"]
             if duration < 1 or duration != len(decision["raw_rewards"]):
-                raise EpisodeRunnerError("every training decision needs positive duration")
+                raise EpisodeRunnerError(
+                    "every training decision needs positive duration"
+                )
             agent_t = next_agent_t[agent]
             local_terminal = agent in step.subtask_terminated
             decision.update(
@@ -264,7 +303,9 @@ class MultiModuleEpisodeRunner:
         self._temporal = isinstance(codec, RawMultiModuleEpisodeCodec)
         if self._temporal:
             spec = runner_config.rl_module_spec
-            if not isinstance(spec, MultiRLModuleSpec) or spec.multi_rl_module_class not in (
+            if not isinstance(
+                spec, MultiRLModuleSpec
+            ) or spec.multi_rl_module_class not in (
                 MultiRLModule,
                 _DecisionClockMultiRLModule,
             ):
@@ -272,11 +313,27 @@ class MultiModuleEpisodeRunner:
                     "temporal collection requires a standard explicit MultiRLModuleSpec"
                 )
             spec.multi_rl_module_class = _DecisionClockMultiRLModule
+            # Ray 2.56.1 preserves flags on explicit per-module specs even when
+            # the EnvRunner requests an inference-only MultiRLModule.
+            spec.inference_only = True
+            for module_spec in spec.rl_module_specs.values():
+                module_spec.inference_only = True
         runner_class = _RawRewardEnvRunner if self._temporal else MultiAgentEnvRunner
         self._env_runner = runner_class(
             config=runner_config,
             worker_index=worker_index,
         )
+        self._action_normalization_spaces = {}
+        if self._temporal and runner_config.normalize_actions:
+            for module_id in self._module_ids:
+                action_space = self._env_runner.module[module_id].action_space
+                if (
+                    isinstance(action_space, gym.spaces.Box)
+                    and action_space.dtype in (np.float32, np.float64)
+                    and np.all(action_space.bounded_below)
+                    and np.all(action_space.bounded_above)
+                ):
+                    self._action_normalization_spaces[module_id] = action_space
         try:
             self.install_weights(initial_weights)
         except Exception:
@@ -318,6 +375,8 @@ class MultiModuleEpisodeRunner:
                 WEIGHTS_SEQ_NO: next(iter(versions)),
             }
         )
+        if self._temporal:
+            self._env_runner.module.publication_seq = next(iter(versions))
         self._weights = weights
         return True
 
@@ -338,14 +397,17 @@ class MultiModuleEpisodeRunner:
         if self._temporal and sampled_module_steps is not None:
             module = self._env_runner.module
             assert isinstance(module, _DecisionClockMultiRLModule)
+            if any(
+                module_id not in self._module_id_set
+                or not isinstance(count, int)
+                or isinstance(count, bool)
+                or count < 0
+                for module_id, count in sampled_module_steps.items()
+            ):
+                raise ValueError(
+                    "sampled_module_steps must contain known module counters"
+                )
             for module_id, count in sampled_module_steps.items():
-                if (
-                    module_id not in self._module_id_set
-                    or not isinstance(count, int)
-                    or isinstance(count, bool)
-                    or count < 0
-                ):
-                    raise ValueError("sampled_module_steps must contain known module counters")
                 module.decision_steps[module_id] = max(
                     module.decision_steps.get(module_id, 0), count
                 )
@@ -492,9 +554,22 @@ class MultiModuleEpisodeRunner:
                 if raw_decisions is not None:
                     raw = dict(raw_decisions[(agent_id, agent_t)])
                     if raw.pop("env_t") != env_t:
-                        raise EpisodeRunnerError("raw decisions disagree with RLlib action turns")
+                        raise EpisodeRunnerError(
+                            "raw decisions disagree with RLlib action turns"
+                        )
                     if not np.isclose(sum(raw["raw_rewards"]), rewards[agent_t]):
-                        raise EpisodeRunnerError("raw reward history disagrees with RLlib aggregation")
+                        raise EpisodeRunnerError(
+                            "raw reward history disagrees with RLlib aggregation"
+                        )
+                    executed = raw[Columns.ACTIONS]
+                    raw["executed_actions"] = copy.deepcopy(executed)
+                    if module_id in self._action_normalization_spaces:
+                        # Stock SAC evaluates candidate actions in the policy's
+                        # normalized domain. Invert RLlib's official transport
+                        # mapping after clipping, retaining the physical facts.
+                        raw[Columns.ACTIONS] = normalize_action(
+                            executed, self._action_normalization_spaces[module_id]
+                        )
                     transitions[-1].data.update(raw)
                 next_agent_t[agent_id] += 1
         if any(

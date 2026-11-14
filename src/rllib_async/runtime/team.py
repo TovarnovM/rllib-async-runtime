@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 import gymnasium as gym
+from ray import cloudpickle
 from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
 from ray.rllib.algorithms.dqn import DQNConfig
 from ray.rllib.algorithms.sac import SACConfig
@@ -18,9 +20,27 @@ from ray.rllib.policy.policy import PolicySpec
 from rllib_async.learner.dqn_adapter import prepare_dqn_config, validate_dqn_config
 from rllib_async.protocols.episodes import RawMultiModuleEpisodeCodec
 from rllib_async.replay.sequences import SequenceConfig
+from rllib_async.runtime.checkpoint import RuntimeCheckpointState
 from rllib_async.runtime.config import AsyncRuntimeConfig
 from rllib_async.runtime.controller import SingleMemberAsyncSAC
 from rllib_async.runtime.learner_host import LearnerHostActor
+
+
+def _rollout_contract(config: AlgorithmConfig) -> str:
+    """Fingerprint data semantics once, including closures in policy routing."""
+
+    return hashlib.sha256(
+        cloudpickle.dumps(
+            (
+                RawMultiModuleEpisodeCodec.schema_version,
+                config.env,
+                config.env_config,
+                config.policy_mapping_fn,
+                config.normalize_actions,
+                config.clip_actions,
+            )
+        )
+    ).hexdigest()
 
 
 def prepare_team_config(
@@ -96,11 +116,21 @@ def prepare_team_config(
         source = module_configs[mid]
         if not isinstance(source, SACConfig | DQNConfig):
             raise TypeError(f"module {mid!r} must use SACConfig or DQNConfig")
-        if source.num_learners != 0:
-            raise ValueError("mixed teams require local learners (num_learners=0)")
-        if source.num_gpus_per_learner != runtime_config.num_gpus_per_learner:
-            raise ValueError("module and host num_gpus_per_learner must match")
         config = source.copy(copy_frozen=False)
+        if set(config.algorithm_config_overrides_per_module) - {mid}:
+            raise ValueError(f"module {mid!r} has overrides for other module IDs")
+        if any(
+            "model_config" in overrides
+            for overrides in config.algorithm_config_overrides_per_module.values()
+        ):
+            raise ValueError("use RLModuleSpec.model_config for module model settings")
+        if config.algorithm_config_overrides_per_module:
+            config = config.get_config_for_module(mid).copy(copy_frozen=False)
+            config.rl_module(algorithm_config_overrides_per_module={})
+        if config.num_learners != 0:
+            raise ValueError("mixed teams require local learners (num_learners=0)")
+        if config.num_gpus_per_learner != runtime_config.num_gpus_per_learner:
+            raise ValueError("module and host num_gpus_per_learner must match")
         spec = copy.deepcopy(config.rl_module_spec)
         if isinstance(spec, MultiRLModuleSpec):
             keys = set(spec.rl_module_specs)
@@ -113,12 +143,13 @@ def prepare_team_config(
         config.rl_module(rl_module_spec=spec)
         config.multi_agent(
             policies={mid: copy.deepcopy(policy)},
-            policy_mapping_fn=lambda agent_id, *args, module_id=mid, **kwargs: module_id,
+            policy_mapping_fn=lambda agent_id,
+            *args,
+            module_id=mid,
+            **kwargs: module_id,
             count_steps_by="agent_steps",
             policies_to_train=[mid],
         )
-        if set(config.algorithm_config_overrides_per_module) - {mid}:
-            raise ValueError(f"module {mid!r} has overrides for other module IDs")
         if isinstance(config, DQNConfig):
             validate_dqn_config(config, spaces={mid: spaces[mid]})
             config = prepare_dqn_config(config)
@@ -172,6 +203,7 @@ class SingleMemberAsyncTeam(SingleMemberAsyncSAC):
             trainable_modules=trainable_modules,
             sequence_configs=sequence_configs,
         )
+        self._team_rollout_contract = _rollout_contract(rollout)
         super().__init__(
             rollout,
             runtime_config,
@@ -181,7 +213,9 @@ class SingleMemberAsyncTeam(SingleMemberAsyncSAC):
         )
 
     def _make_codec(self) -> RawMultiModuleEpisodeCodec:
-        return RawMultiModuleEpisodeCodec(validate_startup=self._config.validate_startup)
+        return RawMultiModuleEpisodeCodec(
+            validate_startup=self._config.validate_startup
+        )
 
     def _resolve_spaces(self, config: AlgorithmConfig) -> Mapping[str, tuple[Any, Any]]:
         return self._team_spaces
@@ -261,6 +295,25 @@ class SingleMemberAsyncTeam(SingleMemberAsyncSAC):
 
     def export_pbt_state(self) -> Any:
         raise ValueError("mixed-team PBT transfer is reserved for stage 3")
+
+    def _controller_checkpoint_state(
+        self, *, checkpoint_sequence: int
+    ) -> dict[str, Any]:
+        state = super()._controller_checkpoint_state(
+            checkpoint_sequence=checkpoint_sequence
+        )
+        state["rollout_contract"] = self._team_rollout_contract
+        return state
+
+    def _restore_controller_checkpoint_state(
+        self, checkpoint: RuntimeCheckpointState
+    ) -> None:
+        if checkpoint.controller.get("rollout_contract") != self._team_rollout_contract:
+            raise ValueError(
+                "mixed checkpoint environment, policy routing "
+                "or action transforms differ"
+            )
+        super()._restore_controller_checkpoint_state(checkpoint)
 
     @classmethod
     def from_checkpoint(
