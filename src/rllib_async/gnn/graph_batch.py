@@ -34,9 +34,7 @@ def pack_graph_observations(
 
     if not observations:
         raise BatchCollationError("graph collation requires at least one observation")
-    terminal_rows = (
-        _terminal_rows(terminated, len(observations)) if validate else None
-    )
+    terminal_rows = _terminal_rows(terminated, len(observations)) if validate else None
     try:
         graphs = (
             [

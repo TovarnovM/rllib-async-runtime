@@ -209,8 +209,7 @@ class TorchGraphEncoder(TorchModel, Encoder):
                 or graph_ptr.ndim != 1
                 or len(graph_ptr) < 2
                 or (
-                    controlled is not None
-                    and controlled.shape != (len(graph_ptr) - 1,)
+                    controlled is not None and controlled.shape != (len(graph_ptr) - 1,)
                 )
             ):
                 raise ValueError("invalid packed graph tensor shapes")

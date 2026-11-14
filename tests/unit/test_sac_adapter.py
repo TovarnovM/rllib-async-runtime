@@ -5,6 +5,7 @@ import pickle
 from collections.abc import Mapping
 from dataclasses import fields
 
+import gymnasium as gym
 import numpy as np
 import pytest
 import torch
@@ -659,4 +660,63 @@ def test_adapter_runs_content_diagnostics_only_on_first_batch(
         assert_tree_close(publication.state, frozen_state)
     finally:
         adapter.close()
+        runner.stop()
+
+
+@pytest.mark.parametrize(
+    ("target_entropy", "twin_q", "message"),
+    [
+        ("auto", True, "target_entropy"),
+        (None, True, "target_entropy"),
+        (float("nan"), True, "target_entropy"),
+        (-1.0, False, "twin_q"),
+    ],
+)
+def test_masked_discrete_sac_requires_explicit_entropy_and_twin_q(
+    target_entropy, twin_q, message
+) -> None:
+    config = make_sac_config().training(target_entropy=target_entropy, twin_q=twin_q)
+    observation_space = gym.spaces.Dict(
+        {
+            "observations": gym.spaces.Box(-1.0, 1.0, (3,)),
+            "action_mask": gym.spaces.MultiBinary(2),
+        }
+    )
+    with pytest.raises(ValueError, match=message):
+        SACLearnerAdapter(
+            config,
+            spaces={DEFAULT_MODULE_ID: (observation_space, gym.spaces.Discrete(2))},
+            member_id="sac",
+            publication_interval_updates=1,
+        )
+
+
+def test_sac_checkpoint_guards_module_semantics_and_accepts_legacy_state() -> None:
+    config = make_sac_config()
+    runner = SingleAgentEnvRunner(config=config, worker_index=0)
+    adapter = None
+    try:
+        adapter = SACLearnerAdapter(
+            config,
+            spaces=runner.get_spaces(),
+            member_id="sac",
+            publication_interval_updates=1,
+        )
+        checkpoint = adapter.get_state()
+        incompatible = copy.deepcopy(checkpoint)
+        incompatible["module_config_contract"]["rl_module_spec"].model_config = {
+            "fcnet_activation": "tanh"
+        }
+        with pytest.raises(ValueError, match="module configuration"):
+            adapter.set_state(incompatible)
+        legacy = copy.deepcopy(checkpoint)
+        del legacy["module_config_contract"]
+        adapter.set_state(legacy)
+        assert_tree_close(
+            learner_payload(adapter.get_state()["learner_group"]),
+            learner_payload(checkpoint["learner_group"]),
+        )
+    finally:
+        if adapter is not None:
+            adapter.close()
         runner.stop()

@@ -97,6 +97,7 @@ def make_dqn_config() -> DQNConfig:
         )
     )
 
+
 def update_learner(learner_group: Any, episodes: Sequence[Any]) -> list[dict[str, Any]]:
     steps = sum(len(episode) for episode in episodes)
     return learner_group.update(

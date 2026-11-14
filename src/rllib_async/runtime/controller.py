@@ -16,6 +16,7 @@ import gymnasium as gym
 import ray
 from ray.rllib.algorithms.dqn import DQNConfig
 from ray.rllib.algorithms.sac import SACConfig
+from ray.rllib.env import INPUT_ENV_SPACES
 from ray.rllib.env.single_agent_env_runner import SingleAgentEnvRunner
 from ray.tune import Trainable
 from ray.tune.execution.placement_groups import PlacementGroupFactory
@@ -1377,7 +1378,10 @@ class SingleMemberAsyncDQN(SingleMemberAsyncSAC):
     @staticmethod
     def _resolve_spaces(config: DQNConfig) -> Mapping[str, tuple[Any, Any]]:
         spaces = SingleMemberAsyncSAC._resolve_spaces(config)
-        for observation_space, action_space in spaces.values():
+        for module_id, (observation_space, action_space) in spaces.items():
+            # This entry describes the vector environment, not module actions.
+            if module_id == INPUT_ENV_SPACES:
+                continue
             if not isinstance(observation_space, gym.spaces.Box):
                 raise ValueError("DQN runtime currently requires flat Box observations")
             if not isinstance(action_space, gym.spaces.Discrete):

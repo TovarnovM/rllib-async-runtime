@@ -328,17 +328,17 @@ def test_graph_learner_update_has_finite_loss_and_updates_encoders(
         validate_startup=True,
     )
     try:
-        before = adapter.get_state()["learner_group"]["learner"][
-            COMPONENT_RL_MODULE
-        ][DEFAULT_MODULE_ID]
+        before = adapter.get_state()["learner_group"]["learner"][COMPONENT_RL_MODULE][
+            DEFAULT_MODULE_ID
+        ]
         before = {key: np.array(value, copy=True) for key, value in before.items()}
         result = adapter.update(batch, sampled_env_steps=2)
         assert result.performed
         assert result.published_weights is not None
         assert_finite_losses(result.learner_results)
-        after = adapter.get_state()["learner_group"]["learner"][
-            COMPONENT_RL_MODULE
-        ][DEFAULT_MODULE_ID]
+        after = adapter.get_state()["learner_group"]["learner"][COMPONENT_RL_MODULE][
+            DEFAULT_MODULE_ID
+        ]
         for prefix in encoder_prefixes:
             assert any(
                 not np.array_equal(value, after[key])

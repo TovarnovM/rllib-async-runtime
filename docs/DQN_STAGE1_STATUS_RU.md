@@ -150,6 +150,17 @@ GPU-приёмка требует отдельного запуска в про�
 машине. Старые CUDA-проверки graph SAC не доказывают CUDA-корректность
 нового graph DQN, нового continuous graph SAC или их конфигураций.
 
+| Проверка | Файл |
+| --- | --- |
+| Паритет со штатным DQN learner, target clock, optimizer/RNG resume | `tests/unit/test_dqn_adapter.py` |
+| EnvRunner → replay → DQN learner → новые weights | `tests/compatibility/test_dqn_components.py` |
+| Runtime, publication, evaluation, checkpoint/resume | `tests/integration/test_single_member_async_dqn.py` |
+| Packed graph indices, actor/critic gradients, четыре learner updates | `tests/unit/test_graph_algorithms.py` |
+| Greedy/epsilon, Q=0, Bellman mask, конечность SAC entropy | `tests/unit/test_action_masks.py` |
+| Terminal / truncated mask на границе codec и batch | `tests/unit/test_shared_gnn.py` |
+| Сохранение clocks при задержанном счётчике и пересоздании runner | `tests/unit/test_episode_runner.py`, `tests/unit/test_rollout_scheduler.py` |
+| Старые SAC checkpoints и семантика module specs | `tests/unit/test_sac_adapter.py` |
+
 Команды локальной проверки выполняются внутри devcontainer:
 
 ```bash
@@ -159,6 +170,29 @@ uv run --locked --extra cu118 --group dev ruff format --check .
 uv run --locked --extra cu118 --group dev \
   pytest --durations=20 -m "not gpu and not cluster and not stress"
 ```
+
+Новый полный runtime пример со стандартным CartPole:
+
+```bash
+uv run --locked --extra cu118 --group dev \
+  python examples/dqn_single_member.py \
+  --checkpoint-dir /tmp/dqn-stage1-checkpoint --stop-env-steps 512
+```
+
+Каталог checkpoint должен быть новым или пустым. Пример обучается,
+сохраняет checkpoint, останавливает runtime, восстанавливается и продолжает
+обучение с evaluation. Это проверка связности runtime, не бенчмарк качества.
+
+Отдельно запустить четыре новые проверки на CUDA:
+
+```bash
+uv run --locked --extra cu118 --group dev \
+  pytest -q -m gpu \
+  tests/unit/test_graph_algorithms.py::test_graph_learner_update_has_finite_loss_and_updates_encoders
+```
+
+Ожидается **4 passed**. `skipped` означает отсутствие доступной CUDA,
+а не успешную GPU-приёмку.
 
 Для оценки ускорения нужны парные прогоны на одном оборудовании.
 Эта работа не заявляет прироста throughput, сокращения реальных сетевых

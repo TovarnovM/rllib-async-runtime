@@ -780,9 +780,7 @@ class _LocalOffPolicyLearnerAdapter:
             raise ValueError(
                 f"checkpoint {self._algorithm} configuration does not match"
             )
-        if (
-            self._algorithm != "SAC" and "module_config_contract" not in state
-        ) or (
+        if (self._algorithm != "SAC" and "module_config_contract" not in state) or (
             "module_config_contract" in state
             and state["module_config_contract"] != self._module_config_contract
         ):

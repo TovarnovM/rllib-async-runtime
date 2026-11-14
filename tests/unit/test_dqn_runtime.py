@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import gymnasium as gym
 import pytest
+from ray.rllib.core import DEFAULT_MODULE_ID
+from ray.rllib.env import INPUT_ENV_SPACES
 
 from rllib_async.runtime import (
     AsyncDQNTrainable,
@@ -12,6 +15,30 @@ from rllib_async.runtime import (
     SingleMemberAsyncSAC,
 )
 from tests.helpers import make_dqn_config
+
+
+def test_dqn_runtime_preserves_vector_environment_space_descriptor(monkeypatch):
+    spaces = {
+        INPUT_ENV_SPACES: (
+            gym.spaces.Box(-1.0, 1.0, shape=(1, 4)),
+            gym.spaces.MultiDiscrete([2]),
+        ),
+        DEFAULT_MODULE_ID: (
+            gym.spaces.Box(-1.0, 1.0, shape=(4,)),
+            gym.spaces.Discrete(2),
+        ),
+    }
+    monkeypatch.setattr(
+        SingleMemberAsyncSAC, "_resolve_spaces", staticmethod(lambda config: spaces)
+    )
+    assert SingleMemberAsyncDQN._resolve_spaces(make_dqn_config()) is spaces
+
+    spaces[DEFAULT_MODULE_ID] = (
+        spaces[DEFAULT_MODULE_ID][0],
+        gym.spaces.MultiDiscrete([2]),
+    )
+    with pytest.raises(ValueError, match="Discrete action space"):
+        SingleMemberAsyncDQN._resolve_spaces(make_dqn_config())
 
 
 def test_dqn_reuses_runtime_settings_and_tune_resources() -> None:
@@ -31,17 +58,13 @@ def test_dqn_reuses_runtime_settings_and_tune_resources() -> None:
 
 def test_dqn_rejects_population_and_unsupported_modes_before_actor_creation() -> None:
     with pytest.raises(ValueError, match="population"):
-        AsyncDQNTrainable._parse_config(
-            {"dqn_config": make_dqn_config(), "member": {}}
-        )
+        AsyncDQNTrainable._parse_config({"dqn_config": make_dqn_config(), "member": {}})
     with pytest.raises(ValueError, match="noisy"):
         SingleMemberAsyncDQN(
             make_dqn_config().training(noisy=True), AsyncRuntimeConfig()
         )
     with pytest.raises(ValueError, match="n_step=1"):
-        SingleMemberAsyncDQN(
-            make_dqn_config().training(n_step=3), AsyncRuntimeConfig()
-        )
+        SingleMemberAsyncDQN(make_dqn_config().training(n_step=3), AsyncRuntimeConfig())
 
 
 @pytest.mark.parametrize(

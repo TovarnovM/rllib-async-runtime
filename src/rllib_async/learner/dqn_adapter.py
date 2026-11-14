@@ -15,6 +15,7 @@ from ray.rllib.algorithms.dqn.torch.default_dqn_torch_rl_module import (
 from ray.rllib.algorithms.dqn.torch.dqn_torch_learner import DQNTorchLearner
 from ray.rllib.core.columns import Columns
 from ray.rllib.core.rl_module.multi_rl_module import MultiRLModuleSpec
+from ray.rllib.env import INPUT_ENV_SINGLE_SPACES, INPUT_ENV_SPACES
 from ray.rllib.policy.sample_batch import MultiAgentBatch
 
 from rllib_async.learner.action_masks import ActionMaskedDQNTorchRLModule
@@ -49,6 +50,14 @@ def validate_dqn_config(
 
     if not isinstance(config, DQNConfig):
         raise TypeError("config must be a DQNConfig")
+    if any(
+        "model_config" in overrides
+        for overrides in config.algorithm_config_overrides_per_module.values()
+    ):
+        raise ValueError(
+            "RLlib 2.56.1 cannot apply model_config through algorithm overrides; "
+            "use RLModuleSpec.model_config for each module"
+        )
     configs = [
         config,
         *(
@@ -62,7 +71,9 @@ def validate_dqn_config(
             or isinstance(module_config.n_step, bool)
             or module_config.n_step != 1
         ):
-            raise ValueError("DQN supports n_step=1 until replay constructs n-step targets")
+            raise ValueError(
+                "DQN supports n_step=1 until replay constructs n-step targets"
+            )
         if module_config.noisy:
             raise ValueError("noisy DQN is not supported by the pinned RLlib module")
         if module_config.burn_in_len:
@@ -106,6 +117,8 @@ def validate_dqn_config(
                 )
     if spaces is not None:
         for module_id, (_, action_space) in spaces.items():
+            if module_id in (INPUT_ENV_SPACES, INPUT_ENV_SINGLE_SPACES):
+                continue
             if (
                 not isinstance(action_space, gym.spaces.Discrete)
                 or action_space.start != 0
@@ -157,10 +170,9 @@ class CheckpointableDQNTorchLearner(DQNTorchLearner):
     def set_state(self, state: dict[str, Any]) -> None:
         target_update_ts = state.get(DQN_TARGET_UPDATE_STATE)
         if target_update_ts is not None:
-            if (
-                not isinstance(target_update_ts, Mapping)
-                or set(target_update_ts) != set(self.module.keys())
-            ):
+            if not isinstance(target_update_ts, Mapping) or set(
+                target_update_ts
+            ) != set(self.module.keys()):
                 raise ValueError(
                     "DQN target update state must match the learner module IDs"
                 )
@@ -266,7 +278,11 @@ class DQNLearnerAdapter(_LocalOffPolicyLearnerAdapter):
         validate_startup: bool = False,
     ) -> None:
         validate_dqn_config(config, spaces=spaces)
-        self._action_spaces = {module_id: pair[1] for module_id, pair in spaces.items()}
+        self._action_spaces = {
+            module_id: pair[1]
+            for module_id, pair in spaces.items()
+            if module_id not in (INPUT_ENV_SPACES, INPUT_ENV_SINGLE_SPACES)
+        }
         super().__init__(
             prepare_dqn_config(config),
             spaces=spaces,

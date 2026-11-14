@@ -72,9 +72,7 @@ def test_double_dqn_masks_selection_and_evaluation_and_keeps_regression_raw() ->
         QF_PREDS: current_q,
         QF_PROBS: current_probs,
         QF_NEXT_PREDS: torch.tensor([[3.0, 1_000.0, 1.0], [5.0, 6.0, 7.0]]),
-        QF_TARGET_NEXT_PREDS: torch.tensor(
-            [[4.0, 2_000.0, 9.0], [8.0, 9.0, 10.0]]
-        ),
+        QF_TARGET_NEXT_PREDS: torch.tensor([[4.0, 2_000.0, 9.0], [8.0, 9.0, 10.0]]),
     }
     batch = {
         Columns.OBS: {"action_mask": torch.ones(2, 3)},
@@ -92,9 +90,10 @@ def test_double_dqn_masks_selection_and_evaluation_and_keeps_regression_raw() ->
     torch.testing.assert_close(
         masked[QF_TARGET_NEXT_PREDS].max(-1).values, torch.tensor([9.0, 0.0])
     )
-    bellman_targets = torch.tensor([1.0, 2.0]) + 0.9 * (
-        1.0 - batch[Columns.TERMINATEDS].float()
-    ) * double_targets
+    bellman_targets = (
+        torch.tensor([1.0, 2.0])
+        + 0.9 * (1.0 - batch[Columns.TERMINATEDS].float()) * double_targets
+    )
     torch.testing.assert_close(bellman_targets, torch.tensor([4.6, 2.0]))
 
 

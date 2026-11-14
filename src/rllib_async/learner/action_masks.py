@@ -155,9 +155,7 @@ class ActionMaskedDQNTorchRLModule(DefaultDQNTorchRLModule):
             output[Columns.STATE_OUT] = qf_outs[Columns.STATE_OUT]
         return output
 
-    def _forward_exploration(
-        self, batch: dict[str, Any], t: int
-    ) -> dict[str, Any]:
+    def _forward_exploration(self, batch: dict[str, Any], t: int) -> dict[str, Any]:
         qf_outs = self.compute_q_values(batch)
         self.epsilon_schedule.update(t)
         output = {

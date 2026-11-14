@@ -398,9 +398,7 @@ def test_empty_graph_action_mask_is_allowed_only_for_terminal_next_observation(
         },
     )
     codec = GraphEpisodeCodec(node_feature_dim=1, action_mask_dim=3)
-    collator = GraphBatchCollator(
-        module_id=SHARED_GNN_MODULE_ID, validate_startup=True
-    )
+    collator = GraphBatchCollator(module_id=SHARED_GNN_MODULE_ID, validate_startup=True)
     if not terminated:
         with pytest.raises(EpisodeValidationError, match="action_mask"):
             codec.encode([transition])

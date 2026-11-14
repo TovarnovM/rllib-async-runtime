@@ -13,6 +13,10 @@ from ray.rllib.algorithms.dqn.torch.default_dqn_torch_rl_module import (
 from ray.rllib.algorithms.dqn.torch.dqn_torch_learner import DQNTorchLearner
 from ray.rllib.core import COMPONENT_OPTIMIZER, COMPONENT_RL_MODULE, DEFAULT_MODULE_ID
 from ray.rllib.core.columns import Columns
+from ray.rllib.core.rl_module.multi_rl_module import MultiRLModuleSpec
+from ray.rllib.core.rl_module.rl_module import RLModuleSpec
+from ray.rllib.env import INPUT_ENV_SPACES
+from ray.rllib.env.single_agent_env_runner import SingleAgentEnvRunner
 from ray.rllib.utils.metrics import (
     NUM_AGENT_STEPS_SAMPLED_LIFETIME,
     NUM_ENV_STEPS_SAMPLED_LIFETIME,
@@ -269,7 +273,7 @@ def test_discrete_action_bounds_checked_by_startup_diagnostics() -> None:
     [
         ({"n_step": 3}, "n_step=1"),
         ({"noisy": True}, "noisy"),
-        ({"model_config": {"use_lstm": True}}, "recurrent"),
+        ({"model_config": {"use_lstm": True}}, "RLModuleSpec"),
     ],
 )
 def test_module_overrides_cannot_bypass_capability_gates(override, message) -> None:
@@ -278,3 +282,36 @@ def test_module_overrides_cannot_bypass_capability_gates(override, message) -> N
     )
     with pytest.raises(ValueError, match=message):
         validate_dqn_config(config)
+
+
+@pytest.mark.parametrize("option", ["use_lstm", "use_attention"])
+def test_module_specs_cannot_bypass_recurrent_capability_gate(option) -> None:
+    config = make_dqn_config().rl_module(
+        rl_module_spec=MultiRLModuleSpec(
+            rl_module_specs={
+                DEFAULT_MODULE_ID: RLModuleSpec(model_config={option: True}),
+            },
+        )
+    )
+    with pytest.raises(ValueError, match="recurrent"):
+        validate_dqn_config(config)
+
+
+def test_adapter_accepts_env_runner_spaces_with_vector_environment_metadata() -> None:
+    config = prepare_dqn_config(make_dqn_config())
+    runner = SingleAgentEnvRunner(config=config, worker_index=0)
+    try:
+        runner_spaces = runner.get_spaces()
+        assert isinstance(runner_spaces[INPUT_ENV_SPACES][1], gym.spaces.MultiDiscrete)
+        with DQNLearnerAdapter(
+            config,
+            spaces=runner_spaces,
+            member_id="dqn",
+            publication_interval_updates=1,
+            validate_startup=True,
+        ) as adapter:
+            result = adapter.update(fixed_batch(), sampled_env_steps=8)
+            assert result.performed
+            assert_finite_losses(result.learner_results)
+    finally:
+        runner.stop()
