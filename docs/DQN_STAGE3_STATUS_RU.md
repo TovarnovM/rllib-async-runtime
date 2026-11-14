@@ -123,7 +123,15 @@ Ray 2.56.1, Torch 2.7.0+cu118. В JUnit найдены все 479 собранн
 создания акторов. Регрессия runner проверяет настоящий Unix socket bind,
 сохранение журналов, очистку только собственных каталогов, ошибки collection,
 pytest/timeout и сохранение первичной ошибки при сбое копирования журналов.
-CI также запускает DQN unit-тесты отдельным процессом перед полным набором.
+CI также запускает DQN unit-тесты и проверки runner отдельным процессом
+перед полным набором.
+
+Исправления проверены на commit `25b13fbbd74a789dd7ce648663ccf1d2d374f7a7`,
+[CI run 43631394369](https://github.com/TovarnovM/rllib-async-runtime/actions/runs/43631394369):
+**Ruff check PASS; Ruff format PASS; изолированная группа — 19 passed за
+4.49 s; полный CPU набор — 484 passed, 18 deselected, 0 skipped,
+24 warnings за 351.86 s.** Все пять новых сценариев runner прошли как отдельно,
+так и в полном наборе. GPU evidence этот CPU CI не создаёт.
 
 GPU-блоки 11/2/1, component benchmarks и GPU quality **не запускались**:
 агент остановился после CPU prerequisite. Это не доказательство ошибки
