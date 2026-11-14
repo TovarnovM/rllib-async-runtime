@@ -199,8 +199,11 @@ Training seeds: `20261114, 20261115, 20261116, 20261117, 20261118`.
 Evaluation seed streams: `910001, 910002, 910003, 910004, 910005`; каждый даёт
 20 отдельных evaluation episodes. Они одинаковы для методов и отделены от
 training. Длина эпизода — 5, сбор — 320 world ticks на training seed,
-обучение — 8192 valid positions на вариант. Stateful и memoryless actor
+исходное обучение — 8192 valid positions на вариант; подтверждённый ниже
+расширенный бюджет — 32768. Stateful и memoryless actor
 получают одинаковые наблюдения без скрытой подсказки в поздних observations.
+
+Воспроизведение исходного бюджета (его CPU quality gate не пройден):
 
 ```bash
 timeout --signal=TERM --kill-after=30s 1800s \
@@ -215,7 +218,7 @@ timeout --signal=TERM --kill-after=30s 1800s \
 разность не ниже `0.4`, положительная разность минимум в четырёх seeds.
 В этой задаче return равен `+1/-1`, поэтому `0.6` соответствует 80% успеха;
 идеальная memoryless policy без информации о cue имеет ожидаемый return 0.
-Это экспериментальный acceptance criterion, не уже измеренный результат.
+Это исходный acceptance criterion; результаты обоих CPU-бюджетов приведены ниже.
 
 `--require-quality` завершает команду ошибкой при незакрытом критерии,
 сохраняя все raw returns. Не менять seeds/порог после неудачи ради PASS:
@@ -225,8 +228,9 @@ timeout --signal=TERM --kill-after=30s 1800s \
 Исходный CPU run с бюджетом 8192 не прошёл quality gate (full-prefix mean
 0.20, stateless -0.024; задачу решил один seed). Его данные сохранены в
 [отчёте этапа 3](DQN_STAGE3_STATUS_RU.md). Следующий отдельно зафиксированный
-эксперимент меняет только learning budget на 32768, сохраняя те же seeds,
-dataset budget и пороги:
+эксперимент изменил только learning budget на 32768, сохранив те же seeds,
+dataset budget и пороги. Он прошёл: full-prefix return 1.00 у всех пяти seeds,
+stateless mean -0.024. Приёмочный повтор с расширенным бюджетом:
 
 ```bash
 uv run --locked --extra cu118 --group dev \
@@ -234,6 +238,10 @@ uv run --locked --extra cu118 --group dev \
   --learned-positions 32768 \
   --output "$artifact_dir/memory-vector-dqn-quality-32768.json"
 ```
+
+Это команда повторения CPU quality evidence. Для отдельного обучения на GPU
+добавить `--num-gpus 1` и использовать новое имя output. Успех CPU-эксперимента
+не закрывает такую GPU-проверку автоматически.
 
 Дополнительные точки выполняются тем же entry point:
 

@@ -151,6 +151,30 @@ learning budget в четыре раза, не переоценка исходн
 Поэтому проверяется достаточность исходного бюджета, без изменения sampler
 или recurrence semantics ради прохождения порога.
 
+## Результат второго quality-эксперимента
+
+Commit с предварительно зафиксированным новым бюджетом:
+`b0599ee9231b92ef10f9b7aa5477a9458e2d1a26`.
+[Успешный workflow](https://github.com/TovarnovM/rllib-async-runtime/actions/runs/43626039733),
+[исходный JSON в архиве](https://github.com/TovarnovM/rllib-async-runtime/actions/runs/43626039733/artifacts/14126361092).
+SHA-256 архива:
+`99093a2c4db7279c3777998a8b0e69f83a1bf92bac2a5a66e6d82a2d091ad37d`.
+
+При **32768 valid positions** все пять full-prefix моделей получили return
+**1.00**, среднее и стандартное отклонение между training seeds — **1.00 / 0.00**.
+Stateless результаты остались `[-0.04, -0.04, 0.04, -0.04, -0.04]`, среднее
+**-0.024**. Средняя парная разность **1.024**, положительна во всех пяти парах.
+Все заранее сохранённые пороги пройдены. На одну модель приходится 100
+evaluation episodes из пяти отдельных streams; одинаковые streams используются
+обоими методами, они не являются новыми training interactions.
+
+CPU training wall times: stateless **4.01–4.24 s**, full-prefix **10.64–12.22 s**
+на seed; это время learner budget, отдельно от создания акторов и evaluation.
+Стоимость recurrence явно выше. Результат подтверждает обучение памяти
+в этой небольшой vector-DQN задаче на фиксированном raw dataset. Он не
+доказывает превосходства Rainbow, GNN или иерархии на прикладных задачах,
+качество на GPU либо достаточность первоначального бюджета 8192.
+
 ## Измерительные инструменты
 
 [`benchmarks/team_acceptance.py`](../benchmarks/team_acceptance.py) собирает
@@ -190,8 +214,10 @@ Workflow `Stage 3 CPU experiments` запускается вручную или 
 - GPU этапов 2 и 3: **не запускалась в этой среде**. Единый runner требует
   сначала CPU prerequisite, затем 11 GPU cases этапа 2, 2 алгоритмических
   cases этапа 3 и 1 двух-GPU lifecycle case. Skips не принимаются за PASS.
-- Полный closure требует результатов quality и performance экспериментов,
-  а не только численных unit/integration tests.
+- CPU memory quality на пяти seeds и парный flat-SAC time regression gate
+  закрыты приведёнными экспериментами. Дополнительные graph/SAC/burn-in и
+  Rainbow ablations остаются отдельными исследовательскими точками плана;
+  результаты vector-DQN не переносятся на них автоматически.
 - Aggregate peak memory всей системы и межузловой traffic требуют измерений
   на целевой машине/topology. Локальные process/NIC counters не закрывают
   эти пункты автоматически.
