@@ -88,14 +88,68 @@ DEMO-04: [`examples/mixed_population.py`](../examples/mixed_population.py).
 ## Проверки и доказательства
 
 Базовый CPU gate этапа 2: commit `6d22868bc1a9d04754409aabc4b0c9192648ca58`,
-427 passed, 15 deselected, 0 skipped. Результаты этапа 3 будут зафиксированы
-здесь после завершения CI и отдельных экспериментов.
+427 passed, 15 deselected, 0 skipped. Полный зелёный CPU CI этапа 3:
+commit `ef3a51f06e7670a130b32cd059180bb612ebd32b`,
+[run 43625394145](https://github.com/TovarnovM/rllib-async-runtime/actions/runs/43625394145).
+**Ruff check PASS; Ruff format PASS; 479 passed, 18 deselected, 0 skipped,
+24 warnings, 294.31 s.** Три новых GPU cases входят в deselected; это не GPU PASS.
+Самый дорогой новый integration case — mixed population, 48.02 s с PBT,
+exact resume и warm start. Результаты разных hosted runner запусков не
+используются как доказательство ускорения тестового набора.
 
 Новые проверки покрывают PER probabilities/IS weights, tail aggregation,
 eviction и reader leases, точный следующий sample/update после restore,
 численную C51/dueling семантику, Noisy RNG, штатные weighted losses,
 whole-team preflight и lifecycle популяции. Обычный CI сохраняет весь прежний
 CPU набор; GPU/cluster/stress не входят в ежедневный запуск.
+
+## Результаты первого CPU-эксперимента
+
+Исходный код: `5ae907e8d7728008b9b4a174cbedfaf023fe7c52`.
+[Workflow и журналы](https://github.com/TovarnovM/rllib-async-runtime/actions/runs/43624747327),
+[архив 34 исходных файлов](https://github.com/TovarnovM/rllib-async-runtime/actions/runs/43624747327/artifacts/14125034496).
+SHA-256 архива:
+`05c6d910e98483644ff3b050ae7847bbe1891dbbdc30f79fa3e21b4de13abbac`.
+Артефакт Actions хранится 14 дней; для долговременной приёмки его нужно архивировать.
+
+Компонентный recurrent Rainbow/PER case прошёл все gates: 384 valid positions
+по трём модулям, 48 optimizer updates, 1.322 s обучения; sample/decode/collate
+заняли 0.0391 s. Это одна короткая CPU-точка, не steady-state GPU throughput.
+Подтверждены общий payload, его неизменность, ноль replay RPC при обучении,
+отсутствие rebuild на пустых delta и реальные CPU parameter devices.
+
+Flat SAC сравнивался с baseline `6d22868bc1a9d04754409aabc4b0c9192648ca58`
+в пяти чередующихся парах на одном runner и одном lock. Медиана отношения
+candidate/baseline: **0.98477 по времени на world step**, **0.98479 по времени
+на learner update**. Размах парных отношений относительно медианы — 6.36%
+и 6.02%; объём обучения сопоставим. Порог регрессии 10% пройден. Это не
+доказательство переносимого ускорения; aggregate peak memory не измерена.
+
+Первый memory quality experiment: 320 world ticks на seed, 8192 valid positions
+на вариант, прежние пять training seeds и отдельные evaluation streams.
+
+| Training seed | Stateless return | Full-prefix return |
+| --- | ---: | ---: |
+| 20261114 | -0.04 | -0.04 |
+| 20261115 | -0.04 | 1.00 |
+| 20261116 | 0.04 | 0.04 |
+| 20261117 | -0.04 | 0.04 |
+| 20261118 | -0.04 | -0.04 |
+| Среднее | **-0.024** | **0.200** |
+
+**Заранее заданный критерий не выполнен.** Задачу решил один из пяти seeds;
+небольшая разница двух постоянных действий не считается освоением памяти.
+Исходный отрицательный результат сохраняется. Workflow завершился failure
+из-за quality gate, несмотря на успешные component и flat regression gates.
+
+До следующего запуска фиксируется отдельный эксперимент: те же данные,
+пять seeds, evaluation, архитектуры, target schedule и пороги; единственное
+изменение — **32768 valid positions** на вариант вместо 8192. Это увеличение
+learning budget в четыре раза, не переоценка исходного результата. В окнах,
+начинающихся после cue, prefix восстанавливает состояние без градиента;
+только часть выбранных окон обучает перенос cue от начала до terminal loss.
+Поэтому проверяется достаточность исходного бюджета, без изменения sampler
+или recurrence semantics ради прохождения порога.
 
 ## Измерительные инструменты
 
@@ -121,7 +175,9 @@ worktrees на одной машине и одном lock. Пять пар че�
 RSS и largest-child RSS не являются aggregate peak memory всей системы.
 
 Workflow `Stage 3 CPU experiments` запускается вручную или commit marker
-`[stage3-validation]`, отдельно от обычного CI. Он сохраняет исходные JSON/logs
+`[stage3-validation]`; `[stage3-quality]` выполняет только продолжение quality
+с бюджетом 32768, без повторения неизменённых component/flat измерений.
+Он работает отдельно от обычного CI и сохраняет исходные JSON/logs
 и результаты критериев; диагностическое профилирование отделено от timing runs.
 
 Для PER-варианта benchmark с точным valid-position budget используется

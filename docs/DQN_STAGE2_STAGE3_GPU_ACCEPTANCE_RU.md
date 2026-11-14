@@ -222,6 +222,19 @@ timeout --signal=TERM --kill-after=30s 1800s \
 дальнейший бюджет или гиперпараметры оформить новым экспериментом и сохранить
 первый результат. Одиночный smoke seed не является quality evidence.
 
+Исходный CPU run с бюджетом 8192 не прошёл quality gate (full-prefix mean
+0.20, stateless -0.024; задачу решил один seed). Его данные сохранены в
+[отчёте этапа 3](DQN_STAGE3_STATUS_RU.md). Следующий отдельно зафиксированный
+эксперимент меняет только learning budget на 32768, сохраняя те же seeds,
+dataset budget и пороги:
+
+```bash
+uv run --locked --extra cu118 --group dev \
+  python -m benchmarks.team_acceptance quality --require-quality \
+  --learned-positions 32768 \
+  --output "$artifact_dir/memory-vector-dqn-quality-32768.json"
+```
+
 Дополнительные точки выполняются тем же entry point:
 
 | Сравнение/точка | Аргументы сверх предыдущей команды |
