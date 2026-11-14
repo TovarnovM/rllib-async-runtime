@@ -64,25 +64,31 @@ def parse_args() -> argparse.Namespace:
             default="stateless" if command is hierarchy else "full-prefix",
         )
         command.add_argument(
-            "--burn-in", type=int, default=2,
+            "--burn-in",
+            type=int,
+            default=2,
             help="prefix length for the explicitly approximate burn-in mode",
         )
         command.add_argument("--learning-length", type=_positive_int, default=4)
         command.add_argument("--n-step", type=_positive_int, default=1)
         command.add_argument("--batch-size", type=_positive_int, default=8)
         command.add_argument(
-            "--steps", type=_positive_int, default=128,
+            "--steps",
+            type=_positive_int,
+            default=128,
             help="additional completed physical world ticks, including after restore",
         )
         command.add_argument(
-            "--updates", type=_positive_int,
+            "--updates",
+            type=_positive_int,
             help="alternative update threshold; functional checks still apply",
         )
         command.add_argument("--timeout-s", type=_positive_float, default=120.0)
         command.add_argument("--seed", type=int, default=20261114)
         command.add_argument("--num-gpus", type=int, choices=(0, 1), default=0)
         command.add_argument(
-            "--episode-length", type=_positive_int,
+            "--episode-length",
+            type=_positive_int,
             default=8 if command is hierarchy else 5,
         )
         command.add_argument("--validate-startup", action="store_true")
@@ -152,8 +158,11 @@ def main() -> None:
             training_intensity=1.0,
         )
     burn_in = (
-        None if args.memory == "full-prefix"
-        else args.burn_in if args.memory == "burn-in" else 0
+        None
+        if args.memory == "full-prefix"
+        else args.burn_in
+        if args.memory == "burn-in"
+        else 0
     )
     sequences = {
         module_id: SequenceConfig(learning_length=args.learning_length, burn_in=burn_in)

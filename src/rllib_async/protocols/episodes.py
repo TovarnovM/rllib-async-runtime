@@ -761,9 +761,7 @@ class RawMultiModuleEpisodeCodec(MultiModuleEpisodeCodec):
                         normalize_graph_observation(
                             observation,
                             terminated=column == "new_obs"
-                            and (
-                                data["terminateds"] or data["subtask_terminated"]
-                            ),
+                            and (data["terminateds"] or data["subtask_terminated"]),
                         )
                         if self._validate_next_episode
                         else compact_graph_observation(observation)

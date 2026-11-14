@@ -142,9 +142,7 @@ def test_team_preparation_resolves_overrides_before_sampling_and_budgeting() -> 
             }
         }
     )
-    _, learners, _, _, _ = prepare_team_config(
-        rollout, modules, AsyncRuntimeConfig()
-    )
+    _, learners, _, _, _ = prepare_team_config(rollout, modules, AsyncRuntimeConfig())
     manager = learners["manager"]
     assert manager.gamma == 0.5
     assert manager.n_step == 2

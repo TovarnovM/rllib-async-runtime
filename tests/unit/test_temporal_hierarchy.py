@@ -137,6 +137,34 @@ def test_time_limit_keeps_real_final_state_and_manager_bootstrap():
     assert final["world_t"] + final["duration"] == 4
 
 
+@pytest.mark.parametrize(("episode_length", "goal_finished"), [(5, False), (6, True)])
+def test_time_limit_distinguishes_interrupted_and_completed_local_goals(
+    episode_length, goal_finished
+):
+    env = CausalHierarchyEnv(
+        {
+            "episode_length": episode_length,
+            "manager_period": 3,
+            "variable_duration": False,
+            "time_limit": True,
+        }
+    )
+    _, decisions = _run_scripted_environment(env)
+    manager = decisions[("manager", 1)]
+    worker = next(
+        value
+        for (agent, _), value in decisions.items()
+        if agent != "manager"
+        and value["world_t"] + value["duration"] == episode_length
+    )
+    assert manager[Columns.TRUNCATEDS]
+    assert not manager[Columns.TERMINATEDS]
+    assert not manager["subtask_terminated"]
+    assert worker[Columns.TRUNCATEDS]
+    assert not worker[Columns.TERMINATEDS]
+    assert worker["subtask_terminated"] is goal_finished
+
+
 @pytest.mark.parametrize("graph", [False, True])
 def test_delayed_cue_does_not_leak_into_query_observation(graph):
     env = CueMemoryEnv({"graph": graph, "episode_length": 4})

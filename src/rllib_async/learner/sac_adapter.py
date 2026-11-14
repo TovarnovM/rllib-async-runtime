@@ -212,10 +212,11 @@ class _SelectedModuleUpdates:
 
 
 class CheckpointableSACTorchLearner(_SelectedModuleUpdates, SACTorchLearner):
-    """Add the SAC state omitted by RLlib 2.56.1 checkpoints.
+    """Persist SAC state and restrict partial updates to participating modules.
 
-    SAC loss, gradients, optimizers, and target updates remain implemented by
-    ``SACTorchLearner``. This subclass changes state serialization only.
+    RLlib supplies the losses, gradient computation, optimizers and target
+    operations. The shared mixin limits their application for partial batches;
+    this subclass adds temperature and target-clock checkpoint state.
     """
 
     def get_state(

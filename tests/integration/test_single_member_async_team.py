@@ -9,7 +9,10 @@ import ray
 import torch
 from ray.exceptions import GetTimeoutError, RayActorError
 
-from rllib_async.examples.temporal_hierarchy import build_temporal_hierarchy_configs
+from rllib_async.examples.temporal_hierarchy import (
+    build_memory_configs,
+    build_temporal_hierarchy_configs,
+)
 from rllib_async.replay.sequences import SequenceConfig
 from rllib_async.runtime import (
     AsyncRuntimeConfig,
@@ -124,9 +127,7 @@ def _frozen_learner_states(runtime):
     return ray.get(
         runtime._learner_actor.__ray_call__.remote(
             lambda actor: {
-                module_id: actor._host._adapters[module_id].get_state()[
-                    "learner_group"
-                ]
+                module_id: actor._host._adapters[module_id].get_state()["learner_group"]
                 for module_id in ("worker_0", "worker_1")
             }
         ),
@@ -305,6 +306,67 @@ def test_frozen_workers_keep_weights_while_manager_learns(ray_runtime) -> None:
             assert counters[module_id]["learned_positions"] == 0
             assert_tree_close(initial[module_id], final.state[module_id])
         assert_tree_close(frozen_states, _frozen_learner_states(runtime))
+    finally:
+        runtime.stop(graceful=False)
+        _assert_stopped(actors)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(("algorithm", "graph"), [("dqn", True), ("sac", False)])
+def test_hidden_cue_memory_runtime_learns_and_evaluates(
+    ray_runtime, algorithm, graph
+) -> None:
+    rollout, modules, _ = build_memory_configs(
+        algorithm=algorithm, graph=graph, episode_length=5
+    )
+    modules["memory"].training(
+        n_step=2,
+        train_batch_size_per_learner=2,
+        num_steps_sampled_before_learning_starts=0,
+        training_intensity=1.0,
+        target_network_update_freq=1,
+    )
+    runtime = SingleMemberAsyncTeam(
+        rollout,
+        modules,
+        _settings(),
+        sequence_configs={"memory": SequenceConfig(learning_length=2)},
+    )
+    actors = _owned_actors(runtime)
+    try:
+        initial = ray.get(
+            runtime._learner_actor.get_published_weights.remote(), timeout=10
+        )
+        initial_version = initial.module_versions["memory"]
+        runtime.start()
+        report = _train_until(runtime, {"memory": 2})
+        deadline = time.monotonic() + 30
+        while report["evaluation"]["latest_module_version"] <= initial_version:
+            if time.monotonic() >= deadline:
+                pytest.fail(
+                    f"Memory evaluation did not use trained weights: {report!r}"
+                )
+            report = runtime.run_for(0.1)
+        runtime.drain(timeout_s=10)
+
+        counters = _counters(runtime)
+        assert set(counters) == {"memory"}
+        assert counters["memory"]["optimizer_updates"] >= 2
+        assert counters["memory"]["learned_positions"] > 0
+        assert counters["memory"]["ingested_decisions"] > 0
+        weights = ray.get(
+            runtime._learner_actor.get_published_weights.remote(), timeout=10
+        )
+        assert set(weights.state) == set(weights.module_versions) == {"memory"}
+        assert weights.module_versions["memory"] > initial_version
+        assert weights.learner_updates >= 2
+        assert report["evaluation"]["latest_learner_updates"] > 0
+        assert report["evaluation"]["latest_env_steps"] == 5
+
+        rollout_stats = runtime._rollout_group.get_stats()
+        assert rollout_stats.world_steps == rollout_stats.env_steps > 0
+        assert rollout_stats.agent_steps == rollout_stats.world_steps
+        assert dict(rollout_stats.module_steps) == {"memory": rollout_stats.agent_steps}
     finally:
         runtime.stop(graceful=False)
         _assert_stopped(actors)

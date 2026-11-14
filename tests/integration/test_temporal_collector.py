@@ -228,3 +228,57 @@ def test_raw_collector_maps_executed_actions_back_to_the_learner_domain(
             np.testing.assert_array_equal(data[Columns.ACTIONS], [training])
     finally:
         runner.close()
+
+
+@pytest.mark.integration
+def test_complete_episode_collection_advances_the_seeded_cue_sequence():
+    seed = 20261114
+    config, _, spaces = build_memory_configs(
+        recurrent=False, episode_length=3, seed=seed
+    )
+    observation_space, action_space = spaces["memory"]
+    config.rl_module(
+        rl_module_spec=MultiRLModuleSpec(
+            rl_module_specs={
+                "memory": RLModuleSpec(
+                    module_class=_ScriptedModule,
+                    observation_space=observation_space,
+                    action_space=action_space,
+                    model_config={"role": "memory"},
+                )
+            }
+        )
+    )
+    codec = RawMultiModuleEpisodeCodec()
+    observed = []
+    for _ in range(2):
+        runner = MultiModuleEpisodeRunner(
+            config,
+            codec,
+            member_id="cue-sequence",
+            runner_id="runner",
+            runner_generation=0,
+            max_episode_steps=3,
+            module_ids=("memory",),
+            initial_weights=WeightsDescriptor(
+                member_id="cue-sequence",
+                module_versions={"memory": 0},
+                learner_updates=0,
+                published_at_monotonic=0,
+                state={"memory": {}},
+            ),
+            worker_index=0,
+        )
+        try:
+            cues = []
+            for _ in range(12):
+                result = runner.collect_episode(explore=False)
+                first = codec.get_transition(result.episode, 0)
+                cues.append(float(first.data[Columns.OBS][0]))
+            observed.append(cues)
+        finally:
+            runner.close()
+    expected_rng = np.random.default_rng(seed)
+    expected = [float(expected_rng.choice((-1, 1))) for _ in range(12)]
+    assert observed[0] == observed[1] == expected
+    assert set(observed[0]) == {-1.0, 1.0}

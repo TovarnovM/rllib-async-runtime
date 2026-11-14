@@ -49,6 +49,7 @@ from rllib_async.runtime.learner_host import (
     LearnerHostCheckpoint,
     LearnerHostStats,
     LearnerHostTick,
+    validate_flat_replay_n_step,
 )
 
 
@@ -1382,7 +1383,9 @@ class SingleMemberAsyncDQN(SingleMemberAsyncSAC):
     ) -> None:
         from rllib_async.learner.dqn_adapter import prepare_dqn_config
 
-        super().__init__(prepare_dqn_config(dqn_config), runtime_config, **kwargs)
+        prepared = prepare_dqn_config(dqn_config)
+        validate_flat_replay_n_step(prepared)
+        super().__init__(prepared, runtime_config, **kwargs)
 
     @staticmethod
     def _resolve_spaces(config: DQNConfig) -> Mapping[str, tuple[Any, Any]]:

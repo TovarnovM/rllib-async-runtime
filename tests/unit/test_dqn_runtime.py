@@ -65,6 +65,13 @@ def test_dqn_rejects_population_and_unsupported_modes_before_actor_creation() ->
         )
     with pytest.raises(ValueError, match="n_step=1"):
         SingleMemberAsyncDQN(make_dqn_config().training(n_step=3), AsyncRuntimeConfig())
+    with pytest.raises(ValueError, match="n_step=1"):
+        SingleMemberAsyncDQN(
+            make_dqn_config().rl_module(
+                algorithm_config_overrides_per_module={DEFAULT_MODULE_ID: {"n_step": 2}}
+            ),
+            AsyncRuntimeConfig(),
+        )
 
 
 @pytest.mark.parametrize(

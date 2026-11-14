@@ -39,6 +39,23 @@ from rllib_async.replay import (
 LEARNER_HOST_CHECKPOINT_VERSION = 1
 
 
+def validate_flat_replay_n_step(config: SACConfig | DQNConfig) -> None:
+    """Reject horizons that the legacy flat replay never prepares."""
+
+    configurations = (
+        config,
+        *(
+            config.get_config_for_module(module_id)
+            for module_id in config.algorithm_config_overrides_per_module
+        ),
+    )
+    if any(type(item.n_step) is not int or item.n_step != 1 for item in configurations):
+        raise ValueError(
+            "LearnerHost requires n_step=1 for every flat replay module; "
+            "use the mixed sequence runtime for prepared n-step targets"
+        )
+
+
 def encode_learner_host_checkpoint(state: Mapping[str, Any]) -> bytes:
     """Serialize learner-owned tensors inside the learner process."""
 
@@ -171,10 +188,7 @@ class LearnerHost:
             or replay_sync_max_bytes < 1
         ):
             raise ValueError("replay_sync_max_bytes must be positive")
-        if config.n_step != 1:
-            raise ValueError(
-                "LearnerHost requires n_step=1 until n-step targets are constructed"
-            )
+        validate_flat_replay_n_step(config)
         if not isinstance(allow_replay_ahead_on_restore, bool):
             raise TypeError("allow_replay_ahead_on_restore must be a bool")
         if checkpoint_state is not None and pbt_state is not None:

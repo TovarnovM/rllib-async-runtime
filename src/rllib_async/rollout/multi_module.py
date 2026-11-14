@@ -117,6 +117,20 @@ class _RawRewardEnvRunner(MultiAgentEnvRunner):
         self.raw_steps: list[_RawStep] = []
         return super()._reset_envs(*args, **kwargs)
 
+    def _try_env_reset(
+        self, *, seed: int | None = None, options: dict | None = None
+    ) -> Any:
+        # Complete-episode sampling in Ray 2.56.1 repeatedly marks the next
+        # reset as initial. Seed each actual environment once, then let its
+        # RNG advance. A recreated environment receives the configured seed.
+        if self.env is getattr(self, "_seeded_env", None):
+            seed = None
+        elif seed is None:
+            seed = self._seed
+        result = super()._try_env_reset(seed=seed, options=options)
+        self._seeded_env = self.env
+        return result
+
     def _world_t(self) -> int:
         value = getattr(self.env.envs[0].unwrapped, "world_t", None)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -318,6 +332,9 @@ class MultiModuleEpisodeRunner:
             spec.inference_only = True
             for module_spec in spec.rl_module_specs.values():
                 module_spec.inference_only = True
+            # AlgorithmConfig.rl_module_spec returns a merged copy, so changes
+            # must be persisted through its supported setter before construction.
+            runner_config.rl_module(rl_module_spec=spec)
         runner_class = _RawRewardEnvRunner if self._temporal else MultiAgentEnvRunner
         self._env_runner = runner_class(
             config=runner_config,

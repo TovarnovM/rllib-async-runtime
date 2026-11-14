@@ -406,9 +406,7 @@ def test_sac_module_roundtrip_preserves_independent_encoder_specs(
     )
     assert {
         name: tuple(value.shape) for name, value in restored.named_parameters()
-    } == {
-        name: tuple(value.shape) for name, value in module.named_parameters()
-    }
+    } == {name: tuple(value.shape) for name, value in module.named_parameters()}
     restored.set_state(module.get_state())
     history = _batch(graph=True)[RECURRENT]
     for name in (
@@ -563,6 +561,12 @@ def test_recurrent_learner_update_and_next_update_after_restore(
             validate_startup=True,
         )
         restored.set_state(copy.deepcopy(checkpoint))
+        restored_devices = assert_learner_parameter_devices(
+            restored._learner_group, "cuda" if gpus else "cpu"
+        )
+        request.node.user_properties.append(
+            ("restored_parameter_devices", json.dumps(restored_devices))
+        )
         resumed = restored.update(batch, sampled_env_steps=16)
         assert_finite_losses(expected.learner_results)
         assert_finite_losses(resumed.learner_results)

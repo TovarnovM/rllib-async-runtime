@@ -223,9 +223,7 @@ def test_sequences_never_cross_agents_episode_or_reset_boundaries() -> None:
         }
 
 
-def test_window_boundary_does_not_create_terminal_and_reset_final_obs_is_preserved() -> (
-    None
-):
+def test_window_boundary_keeps_bootstrap_and_old_final_observation() -> None:
     episode = raw_episode(
         [
             raw_transition(0, next_obs=np.asarray([10.0])),
@@ -419,9 +417,8 @@ def test_startup_validation_retries_failure_then_stops(monkeypatch) -> None:
         collator.collate([window])
     collator.collate([window])
     assert validations == [True, True, True, True]
-    validations.clear()
     collator.collate([window])
-    assert validations == [False, False, False]
+    assert validations == [True, True, True, True, False, False, False]
 
 
 @pytest.mark.parametrize(

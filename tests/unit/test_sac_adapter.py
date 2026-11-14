@@ -208,9 +208,16 @@ def test_multi_module_adapter_updates_discrete_manager_and_continuous_workers() 
         assert result.performed
         after = adapter.get_state()["learner_group"]["learner"]
         for mid in (MANAGER_MODULE_ID, WORKER_1_MODULE_ID):
-            assert_tree_close(after[COMPONENT_RL_MODULE][mid], before[COMPONENT_RL_MODULE][mid])
-            assert_tree_close(after[SAC_TEMPERATURE_STATE][mid], before[SAC_TEMPERATURE_STATE][mid])
-            assert after[SAC_TARGET_UPDATE_STATE][mid] == before[SAC_TARGET_UPDATE_STATE][mid]
+            assert_tree_close(
+                after[COMPONENT_RL_MODULE][mid], before[COMPONENT_RL_MODULE][mid]
+            )
+            assert_tree_close(
+                after[SAC_TEMPERATURE_STATE][mid], before[SAC_TEMPERATURE_STATE][mid]
+            )
+            assert (
+                after[SAC_TARGET_UPDATE_STATE][mid]
+                == before[SAC_TARGET_UPDATE_STATE][mid]
+            )
         for key, value in before[COMPONENT_OPTIMIZER].items():
             if not key.startswith(WORKER_0_MODULE_ID):
                 assert_tree_close(after[COMPONENT_OPTIMIZER][key], value)

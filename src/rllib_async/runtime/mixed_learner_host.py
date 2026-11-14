@@ -173,8 +173,17 @@ class MixedLearnerHost(LearnerHost):
                     raise TypeError(
                         "every mixed module requires SACConfig or DQNConfig"
                     )
+                if module_config.algorithm_config_overrides_per_module:
+                    raise ValueError(
+                        "resolve per-module overrides with prepare_team_config"
+                    )
                 if type(module_config.n_step) is not int or module_config.n_step < 1:
                     raise ValueError("mixed module n_step must be a positive integer")
+                threshold = module_config.num_steps_sampled_before_learning_starts
+                if type(threshold) is not int or threshold < 0:
+                    raise ValueError(
+                        "module learning-start threshold must be non-negative"
+                    )
                 size = module_config.train_batch_size_per_learner
                 if type(size) is not int or size < 1:
                     raise ValueError(
@@ -612,8 +621,7 @@ class MixedLearnerHost(LearnerHost):
                     "mixed checkpoint readiness contradicts ingested decisions"
                 )
             maximum = (
-                max(0, clock["ingested_decisions"] - threshold)
-                * self._intensities[mid]
+                max(0, clock["ingested_decisions"] - threshold) * self._intensities[mid]
             )
             if clock["budget"] + clock["learned_positions"] > maximum + 1e-7:
                 raise ValueError(
@@ -671,7 +679,7 @@ class MixedLearnerHost(LearnerHost):
             validator(
                 value, name="torch_cuda_rng_states", expected_numel=current.numel()
             )
-            for value, current in zip(cuda_rng, current_cuda)
+            for value, current in zip(cuda_rng, current_cuda, strict=True)
         )
         # These adapters are still constructor-owned and cannot be observed live.
         for mid, adapter in self._adapters.items():

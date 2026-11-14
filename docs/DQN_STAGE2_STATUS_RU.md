@@ -158,8 +158,9 @@ CLI поддерживает `--seed`, `--steps`, `--updates`, `--timeout-s`, `-
 
 Новые focused tests расположены в `test_replay_sequences.py`,
 `test_recurrent_algorithms.py`, `test_temporal_hierarchy.py`,
-`test_temporal_collector.py`, `test_team_config.py`, `test_team_transport.py`
-и `test_single_member_async_team.py`. Проверки охватывают reference parity,
+`test_temporal_collector.py`, `test_team_config.py`, `test_team_transport.py`,
+`test_mixed_learner.py` и `test_single_member_async_team.py`.
+Проверки охватывают reference parity,
 raw reward provenance от настоящего collector, causal order, физические
 n-step targets, independent state/gradients, partial updates, publication,
 checkpoint/resume и фактическое размещение learner parameters.
@@ -172,13 +173,26 @@ uv run --locked --extra cpu --group dev ruff format --check .
 uv run --locked --extra cpu --group dev pytest --durations=20 -m "not gpu and not cluster and not stress"
 ```
 
-Реальный GPU gate для локального агента:
+Реальный GPU gate для локального агента: одна видимая GPU, пять новых cases
+и шесть регрессионных cases этапа 1. Выполнять в проектном devcontainer.
 
 ```bash
-uv run --locked --extra cu118 --group dev pytest --durations=20 -m gpu
+export CUDA_VISIBLE_DEVICES=0
+uv sync --locked --extra cu118 --group dev
+uv run --locked --extra cu118 --group dev \
+  pytest --durations=20 -m "gpu and not cluster and not stress" \
+  tests/unit/test_recurrent_algorithms.py \
+  tests/integration/test_single_member_async_team.py \
+  tests/unit/test_graph_algorithms.py \
+  tests/unit/test_dqn_adapter.py \
+  tests/integration/test_single_member_async_dqn.py \
+  --junitxml=stage2-gpu-junit.xml
 ```
 
-GPU skip не считается подтверждением поддержки. Сохранить проверенный SHA,
+Ожидается **11 passed, 69 deselected, 0 skipped**. GPU skip не считается
+подтверждением поддержки. Проверки устройств выполняются до и после restore;
+mixed runtime дополнительно проверяет все три learners внутри Ray actor и
+единственное назначение GPU. Сохранить проверенный SHA,
 команды, exit codes, counts, duration и parameter devices внутри Ray actor.
 Численные тесты и короткий smoke не подменяют learning-quality кампанию.
 

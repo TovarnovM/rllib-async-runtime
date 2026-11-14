@@ -13,7 +13,7 @@ import rllib_async.runtime.learner_host as learner_host_module
 from rllib_async.protocols import EpisodeEnvelope, FlatEpisodeCodec, FrozenVersions
 from rllib_async.replay.reference import EpisodeStore
 from rllib_async.runtime import LearnerHost, LearnerHostState
-from tests.helpers import make_sac_config
+from tests.helpers import make_dqn_config, make_sac_config
 
 
 class ImmediateRemoteMethod:
@@ -44,6 +44,29 @@ def test_learner_host_rejects_unconstructed_n_step_targets() -> None:
             publication_interval_updates=1,
             batch_size=8,
             batch_queue_capacity=1,
+            batch_seed=7,
+            replay_sync_max_bytes=1_000_000,
+        )
+
+
+@pytest.mark.parametrize("make_config", [make_dqn_config, make_sac_config])
+def test_flat_replay_module_override_cannot_bypass_target_preparation_gate(
+    make_config,
+) -> None:
+    config = make_config().rl_module(
+        algorithm_config_overrides_per_module={DEFAULT_MODULE_ID: {"n_step": 2}}
+    )
+    assert config.n_step == 1
+    with pytest.raises(ValueError, match="n_step=1 for every flat replay module"):
+        LearnerHost(
+            config,
+            {},
+            object(),
+            FlatEpisodeCodec(),
+            member_id="member-0",
+            publication_interval_updates=1,
+            batch_size=8,
+            batch_queue_capacity=0,
             batch_seed=7,
             replay_sync_max_bytes=1_000_000,
         )

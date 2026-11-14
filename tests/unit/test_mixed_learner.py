@@ -172,8 +172,7 @@ def test_partial_readiness_fair_budget_duplicates_eviction_and_frozen_worker(
         assert host._module_counters["manager"]["budget"] == 1
         tick(host, max_updates=2)
         assert all(
-            clock["optimizer_updates"] > 0
-            for clock in host._module_counters.values()
+            clock["optimizer_updates"] > 0 for clock in host._module_counters.values()
         )
         while tick(host, max_updates=10).updates_performed:
             pass
@@ -249,9 +248,7 @@ def test_mixed_checkpoint_replays_next_selection_and_optimizer_step(monkeypatch)
 def test_ingestion_budget_uses_valid_positions_and_does_not_reset_on_eviction():
     host = object.__new__(MixedLearnerHost)
     host._configs = {
-        "worker": type(
-            "Config", (), {"num_steps_sampled_before_learning_starts": 3}
-        )()
+        "worker": type("Config", (), {"num_steps_sampled_before_learning_starts": 3})()
     }
     host._intensities = {"worker": 2.5}
     host._trainable_modules = ("worker",)
