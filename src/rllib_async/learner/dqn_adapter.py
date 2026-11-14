@@ -49,35 +49,48 @@ def validate_dqn_config(
 
     if not isinstance(config, DQNConfig):
         raise TypeError("config must be a DQNConfig")
-    if (
-        not isinstance(config.n_step, int)
-        or isinstance(config.n_step, bool)
-        or config.n_step != 1
-    ):
-        raise ValueError("DQN supports n_step=1 until replay constructs n-step targets")
-    if config.noisy:
-        raise ValueError("noisy DQN is not supported by the pinned RLlib module")
-    if config.burn_in_len:
-        raise ValueError(
-            "recurrent DQN requires sequence replay and burn-in support"
-        )
-    if (
-        not isinstance(config.num_atoms, int)
-        or isinstance(config.num_atoms, bool)
-        or config.num_atoms < 1
-    ):
-        raise ValueError("DQN num_atoms must be a positive integer")
-    if config.num_atoms > 1 and not (
-        np.isfinite(config.v_min)
-        and np.isfinite(config.v_max)
-        and config.v_min < config.v_max
-    ):
-        raise ValueError("C51 requires finite v_min < v_max")
+    configs = [
+        config,
+        *(
+            config.get_config_for_module(module_id)
+            for module_id in config.algorithm_config_overrides_per_module
+        ),
+    ]
+    for module_config in configs:
+        if (
+            not isinstance(module_config.n_step, int)
+            or isinstance(module_config.n_step, bool)
+            or module_config.n_step != 1
+        ):
+            raise ValueError("DQN supports n_step=1 until replay constructs n-step targets")
+        if module_config.noisy:
+            raise ValueError("noisy DQN is not supported by the pinned RLlib module")
+        if module_config.burn_in_len:
+            raise ValueError(
+                "recurrent DQN requires sequence replay and burn-in support"
+            )
+        if (
+            not isinstance(module_config.num_atoms, int)
+            or isinstance(module_config.num_atoms, bool)
+            or module_config.num_atoms < 1
+        ):
+            raise ValueError("DQN num_atoms must be a positive integer")
+        if module_config.num_atoms > 1 and not (
+            np.isfinite(module_config.v_min)
+            and np.isfinite(module_config.v_max)
+            and module_config.v_min < module_config.v_max
+        ):
+            raise ValueError("C51 requires finite v_min < v_max")
     spec = config.rl_module_spec
     specs = (
-        spec.rl_module_specs.values() if isinstance(spec, MultiRLModuleSpec) else (spec,)
+        spec.rl_module_specs.values()
+        if isinstance(spec, MultiRLModuleSpec)
+        else (spec,)
     )
-    models = [config.model_config, *(item.model_config for item in specs)]
+    models = [
+        *(item.model_config for item in configs),
+        *(item.model_config for item in specs),
+    ]
     for model in models:
         if model is None:
             continue
@@ -110,7 +123,9 @@ def prepare_dqn_config(config: DQNConfig) -> DQNConfig:
     prepared = config.copy(copy_frozen=False)
     spec = prepared.rl_module_spec
     specs = (
-        spec.rl_module_specs.values() if isinstance(spec, MultiRLModuleSpec) else (spec,)
+        spec.rl_module_specs.values()
+        if isinstance(spec, MultiRLModuleSpec)
+        else (spec,)
     )
     for item in specs:
         if item.module_class is DefaultDQNTorchRLModule:
@@ -135,15 +150,16 @@ class CheckpointableDQNTorchLearner(DQNTorchLearner):
         if components is None:
             state[DQN_TARGET_UPDATE_STATE] = {
                 module_id: self.last_update_ts_by_mid[module_id]
-                for module_id in self.module.keys()
+                for module_id in tuple(self.module.keys())
             }
         return state
 
     def set_state(self, state: dict[str, Any]) -> None:
         target_update_ts = state.get(DQN_TARGET_UPDATE_STATE)
         if target_update_ts is not None:
-            if not isinstance(target_update_ts, Mapping) or set(target_update_ts) != set(
-                self.module.keys()
+            if (
+                not isinstance(target_update_ts, Mapping)
+                or set(target_update_ts) != set(self.module.keys())
             ):
                 raise ValueError(
                     "DQN target update state must match the learner module IDs"

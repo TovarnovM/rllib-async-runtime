@@ -365,7 +365,9 @@ def test_graph_startup_checks_scalars_and_retries_until_batch_succeeds(
         np.testing.assert_array_equal(batch[Columns.REWARDS], [0.0])
 
 
-@pytest.mark.parametrize("terminated,truncated", [(True, False), (False, False), (False, True)])
+@pytest.mark.parametrize(
+    "terminated,truncated", [(True, False), (False, False), (False, True)]
+)
 def test_empty_graph_action_mask_is_allowed_only_for_terminal_next_observation(
     terminated: bool, truncated: bool
 ) -> None:

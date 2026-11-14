@@ -262,3 +262,19 @@ def test_discrete_action_bounds_checked_by_startup_diagnostics() -> None:
         batch[Columns.ACTIONS][:] = 2
         with pytest.raises(DQNBatchError, match="Discrete action"):
             adapter.update(batch, sampled_env_steps=8)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"n_step": 3}, "n_step=1"),
+        ({"noisy": True}, "noisy"),
+        ({"model_config": {"use_lstm": True}}, "recurrent"),
+    ],
+)
+def test_module_overrides_cannot_bypass_capability_gates(override, message) -> None:
+    config = make_dqn_config().rl_module(
+        algorithm_config_overrides_per_module={DEFAULT_MODULE_ID: override}
+    )
+    with pytest.raises(ValueError, match=message):
+        validate_dqn_config(config)

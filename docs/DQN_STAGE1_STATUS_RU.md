@@ -25,7 +25,7 @@ n-step, PER и DQN-PBT требуют следующих этапов.
 | Continuous graph SAC | Штатный action-conditioned critic через multi-stream encoder |
 | Actor / Q1 / Q2 | Независимые экземпляры энкодеров и отдельные конфигурации |
 | Replay | Прежний authoritative store и learner-local view; uniform one-step sampling |
-| Checkpoint / resume DQN | Веса, targets, optimizer, RNG, счётчики и курсор target update |
+| Checkpoint / resume DQN | Веса, targets, optimizer, RNG learner, счётчики и курсор target update |
 | Recurrent / Noisy DQN | Явный отказ для неподдерживаемых режимов |
 | Mixed hierarchy / sequence replay / PER / DQN-PBT | Следующие этапы; не объявляются работающими |
 
@@ -52,6 +52,11 @@ learner host, rollout group и evaluation. `AsyncDQNTrainable` использу�
 target недостаточно для корректного продолжения расписания.
 Checkpoint различает DQN и SAC. Старые runtime checkpoints без метки
 алгоритма трактуются как SAC; загрузка их в DQN запрещена.
+
+Точное продолжение проверяется для learner на фиксированном batch, включая
+Torch CPU/CUDA RNG. Rollout actors при восстановлении получают следующую
+generation и соответствующий seed; состояние среды посреди эпизода не
+сохраняется. Побитовое повторение будущих траекторий не обещается.
 
 ### Счётчик epsilon
 

@@ -39,7 +39,9 @@ def test_dqn_env_runner_replay_learner_and_weight_publication() -> None:
         weights = learner.get_state(
             components="learner/rl_module", inference_only=True
         )["learner"][COMPONENT_RL_MODULE]
-        runner.set_state({COMPONENT_RL_MODULE: copy.deepcopy(weights), WEIGHTS_SEQ_NO: 1})
+        runner.set_state(
+            {COMPONENT_RL_MODULE: copy.deepcopy(weights), WEIGHTS_SEQ_NO: 1}
+        )
         next_episode = runner.sample(num_episodes=1)[0]
         versions = np.asarray(next_episode.get_extra_model_outputs(WEIGHTS_SEQ_NO))
         assert versions.size == len(next_episode)

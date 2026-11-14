@@ -297,7 +297,7 @@ class GraphEpisodeCodec(MultiModuleEpisodeCodec):
             )
         data = dict(transition.data)
         terminated = data[Columns.TERMINATEDS]
-        if not isinstance(terminated, (bool, np.bool_)):
+        if not isinstance(terminated, bool | np.bool_):
             raise EpisodeValidationError("terminateds must be boolean")
         data[Columns.OBS] = normalize_graph_observation(data[Columns.OBS])
         data[Columns.NEXT_OBS] = normalize_graph_observation(

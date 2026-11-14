@@ -1196,4 +1196,3 @@ class SACLearnerAdapter(_LocalOffPolicyLearnerAdapter):
         self._module_versions = module_versions
         self._latest_weights = descriptor
         return copy.deepcopy(descriptor)
-

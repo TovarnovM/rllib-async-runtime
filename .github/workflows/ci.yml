@@ -31,15 +31,18 @@ jobs:
           enable-cache: true
 
       - name: Install locked CPU environment
+        id: dependencies
         run: uv sync --locked --extra cpu --group dev
 
       - name: Lint
         run: uv run ruff check .
 
       - name: Check formatting
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         run: uv run ruff format --check --diff .
 
       - name: Run CPU tests
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         run: >-
           uv run --locked --extra cpu --group dev
           pytest --durations=20 -m "not gpu and not cluster and not stress"

@@ -22,9 +22,11 @@ from ray.rllib.algorithms.sac.sac_learner import (
     ACTION_LOG_PROBS_NEXT,
     ACTION_PROBS,
     ACTION_PROBS_NEXT,
-    QF_PREDS as SAC_QF_PREDS,
     QF_TARGET_NEXT,
     QF_TWIN_PREDS,
+)
+from ray.rllib.algorithms.sac.sac_learner import (
+    QF_PREDS as SAC_QF_PREDS,
 )
 from ray.rllib.algorithms.sac.torch.default_sac_torch_rl_module import (
     DefaultSACTorchRLModule,

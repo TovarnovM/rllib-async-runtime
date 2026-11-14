@@ -20,9 +20,9 @@ from rllib_async.gnn.graph_batch import (
 )
 
 __all__ = [
-    "GraphDQNCatalog",
     "GraphBatch",
     "GraphBatchCollator",
+    "GraphDQNCatalog",
     "GraphEncoderConfig",
     "GraphEpisodeCodec",
     "GraphEpisodePayload",
