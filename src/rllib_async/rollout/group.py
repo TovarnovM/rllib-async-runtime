@@ -1004,9 +1004,7 @@ class AsyncRolloutGroup:
         behavior = episode.behavior_versions
         if not behavior or not set(behavior) <= set(latest):
             raise RolloutGroupError("episode behavior module IDs do not match weights")
-        lags = [
-            latest[module_id] - version for module_id, version in behavior.items()
-        ]
+        lags = [latest[module_id] - version for module_id, version in behavior.items()]
         if any(lag < 0 for lag in lags):
             raise RolloutGroupError(
                 "episode behavior version is newer than publication"
