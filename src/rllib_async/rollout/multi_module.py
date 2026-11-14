@@ -13,6 +13,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
+from ray.rllib.connectors.common.agent_to_module_mapping import AgentToModuleMapping
+from ray.rllib.connectors.connector_v2 import ConnectorV2
 from ray.rllib.core import COMPONENT_RL_MODULE
 from ray.rllib.core.columns import Columns
 from ray.rllib.core.rl_module.multi_rl_module import MultiRLModule, MultiRLModuleSpec
@@ -103,6 +105,29 @@ class _RawStep:
     terminateds: Mapping[str, bool]
     truncateds: Mapping[str, bool]
     subtask_terminated: frozenset[str]
+
+
+class _OnlyActingAgents(ConnectorV2):
+    """Keep final observations in episodes without forwarding terminal agents."""
+
+    def __call__(
+        self, *, batch: dict[str, Any], episodes: Sequence[Any], **kwargs: Any
+    ) -> dict[str, Any]:
+        del kwargs
+        active = {
+            (episode.id_, agent_id)
+            for episode in episodes
+            for agent_id in episode.get_agents_to_act()
+        }
+        for column, items in tuple(batch.items()):
+            filtered = {
+                key: values for key, values in items.items() if key[:2] in active
+            }
+            if filtered:
+                batch[column] = filtered
+            else:
+                del batch[column]
+        return batch
 
 
 class _RawRewardEnvRunner(MultiAgentEnvRunner):
@@ -352,6 +377,16 @@ class MultiModuleEpisodeRunner:
                 ):
                     self._action_normalization_spaces[module_id] = action_space
         try:
+            if self._temporal:
+                pipeline = self._env_runner._env_to_module
+                if not any(
+                    isinstance(connector, AgentToModuleMapping)
+                    for connector in pipeline.connectors
+                ):
+                    raise ValueError(
+                        "temporal collection requires AgentToModuleMapping"
+                    )
+                pipeline.insert_before(AgentToModuleMapping, _OnlyActingAgents())
             self.install_weights(initial_weights)
         except Exception:
             self._env_runner.stop()

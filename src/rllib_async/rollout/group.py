@@ -1001,11 +1001,11 @@ class AsyncRolloutGroup:
 
     def _policy_lag(self, episode: EpisodeMetadata) -> int:
         latest = self._latest_weights.module_versions
-        if set(episode.behavior_versions) != set(latest):
+        behavior = episode.behavior_versions
+        if not behavior or not set(behavior) <= set(latest):
             raise RolloutGroupError("episode behavior module IDs do not match weights")
         lags = [
-            latest[module_id] - episode.behavior_versions[module_id]
-            for module_id in latest
+            latest[module_id] - version for module_id, version in behavior.items()
         ]
         if any(lag < 0 for lag in lags):
             raise RolloutGroupError(

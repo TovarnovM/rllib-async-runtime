@@ -13,11 +13,12 @@ from ray.rllib.core.rl_module.torch.torch_rl_module import TorchRLModule
 from ray.rllib.policy.policy import PolicySpec
 
 from rllib_async.examples.temporal_hierarchy import (
+    CausalHierarchyEnv,
     CueMemoryEnv,
     build_memory_configs,
     build_temporal_hierarchy_configs,
 )
-from rllib_async.gnn.episodes import NODE_FEATURES
+from rllib_async.gnn.episodes import ACTION_MASK, NODE_FEATURES
 from rllib_async.protocols.episodes import RawMultiModuleEpisodeCodec
 from rllib_async.protocols.weights import WeightsDescriptor
 from rllib_async.rollout.multi_module import MultiModuleEpisodeRunner
@@ -32,6 +33,10 @@ class _ScriptedModule(TorchRLModule):
     def _forward_inference(self, batch, **kwargs):
         del kwargs
         observations = batch[Columns.OBS]
+        if isinstance(observations, dict) and ACTION_MASK in observations:
+            assert observations[ACTION_MASK].any(dim=-1).all(), (
+                "terminal observations must not request another action"
+            )
         features = (
             observations[NODE_FEATURES][:, 0]
             if isinstance(observations, dict)
@@ -54,14 +59,56 @@ class _ScriptedModule(TorchRLModule):
         return self._forward_inference(batch, **kwargs)
 
 
+class _TerminalMaskHierarchyEnv(CausalHierarchyEnv):
+    def __init__(self, config=None):
+        super().__init__(config)
+        observation_space, action_space = self._spaces["worker_0"]
+        self._spaces["worker_0"] = (
+            gym.spaces.Dict(
+                {
+                    **observation_space.spaces,
+                    ACTION_MASK: gym.spaces.Box(0, 1, (2,), np.float32),
+                }
+            ),
+            action_space,
+        )
+        self.observation_spaces = {
+            agent: self.get_observation_space(agent) for agent in self.possible_agents
+        }
+
+    def _observation(self, agent_id):
+        observation = super()._observation(agent_id)
+        if agent_id.startswith("worker_0:"):
+            observation[ACTION_MASK] = np.ones(2, np.float32)
+        return observation
+
+    def step(self, actions):
+        observations, rewards, terminateds, truncateds, infos = super().step(actions)
+        for agent, terminal in terminateds.items():
+            if terminal and agent.startswith("worker_0:"):
+                observations[agent][ACTION_MASK] = np.zeros(2, np.float32)
+        return observations, rewards, terminateds, truncateds, infos
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("time_limit", [False, True])
 def test_raw_collector_preserves_actual_step_rewards_and_decision_clocks(time_limit):
     config, _, spaces = build_temporal_hierarchy_configs(
         episode_length=8,
         manager_period=3,
-        vector_worker=True,
         time_limit=time_limit,
+    )
+    config.environment(_TerminalMaskHierarchyEnv)
+    env = _TerminalMaskHierarchyEnv(config.env_config)
+    spaces["worker_0"] = (
+        env.get_observation_space("worker_0:0"),
+        env.get_action_space("worker_0:0"),
+    )
+    config.multi_agent(
+        policies={
+            module_id: PolicySpec(observation_space=obs, action_space=act)
+            for module_id, (obs, act) in spaces.items()
+        }
     )
     config.rl_module(
         rl_module_spec=MultiRLModuleSpec(
@@ -139,6 +186,13 @@ def test_raw_collector_preserves_actual_step_rewards_and_decision_clocks(time_li
             "worker_0:1": 3,
             "worker_1:2": 3,
         }
+        local_finals = [
+            item.data[Columns.NEXT_OBS][ACTION_MASK]
+            for item in all_transitions
+            if item.module_id == "worker_0" and item.data["subtask_terminated"]
+        ]
+        assert len(local_finals) == 2
+        assert all(not mask.any() for mask in local_finals)
         modules = runner._env_runner.module
         assert all(modules[module_id].inference_only for module_id in spaces)
         assert modules["manager"].observed_clocks == [10, 11, 12]

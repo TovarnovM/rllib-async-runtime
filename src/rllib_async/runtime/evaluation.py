@@ -393,7 +393,12 @@ class AsyncEvaluationGroup:
         if self._active_weights is None:
             self._failures += 1
             raise EvaluationGroupError("evaluation returned outside an active round")
-        if result.episode.behavior_versions != self._active_weights.module_versions:
+        behavior = result.episode.behavior_versions
+        active = self._active_weights.module_versions
+        if not behavior or any(
+            module_id not in active or version != active[module_id]
+            for module_id, version in behavior.items()
+        ):
             self._failures += 1
             raise EvaluationGroupError("evaluation mixed weight publications")
         self._active_returns.append(result.metrics.episode_return)

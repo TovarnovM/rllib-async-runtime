@@ -154,8 +154,7 @@ def test_time_limit_distinguishes_interrupted_and_completed_local_goals(
     worker = next(
         value
         for (agent, _), value in decisions.items()
-        if agent != "manager"
-        and value["world_t"] + value["duration"] == episode_length
+        if agent != "manager" and value["world_t"] + value["duration"] == episode_length
     )
     assert manager[Columns.TRUNCATEDS]
     assert not manager[Columns.TERMINATEDS]
