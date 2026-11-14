@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import pickle
 
 import gymnasium as gym
@@ -31,7 +32,12 @@ from rllib_async.learner.dqn_adapter import (
     prepare_dqn_config,
     validate_dqn_config,
 )
-from tests.helpers import assert_finite_losses, assert_tree_close, make_dqn_config
+from tests.helpers import (
+    assert_finite_losses,
+    assert_learner_parameter_devices,
+    assert_tree_close,
+    make_dqn_config,
+)
 
 
 def fixed_batch(size: int = 8) -> dict[str, np.ndarray]:
@@ -171,37 +177,127 @@ def test_adapter_matches_stock_dqn_learner(double_q, dueling, num_atoms) -> None
             adapter.close()
 
 
-def test_full_restore_preserves_optimizer_rng_and_target_update_schedule() -> None:
+@pytest.mark.parametrize(
+    "num_gpus_per_learner",
+    [pytest.param(0, id="cpu"), pytest.param(1, marks=pytest.mark.gpu, id="gpu")],
+)
+def test_full_restore_preserves_optimizer_rng_and_target_update_schedule(
+    num_gpus_per_learner: int, request: pytest.FixtureRequest
+) -> None:
+    if num_gpus_per_learner and not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable in this container")
     config = make_dqn_config().training(num_steps_sampled_before_learning_starts=8)
+    config.learners(num_gpus_per_learner=num_gpus_per_learner)
+    device_type = "cuda" if num_gpus_per_learner else "cpu"
     source = DQNLearnerAdapter(
         config, spaces=spaces(), member_id="dqn", publication_interval_updates=2
     )
     restored = None
     try:
+        devices = assert_learner_parameter_devices(source._learner_group, device_type)
+        request.node.user_properties.append(
+            ("source_parameter_devices", json.dumps(devices))
+        )
         batch = fixed_batch()
+        initial_online = copy.deepcopy(
+            source.get_published_weights().state[DEFAULT_MODULE_ID]
+        )
         assert not source.update(batch, sampled_env_steps=4).performed
-        assert source.update(batch, sampled_env_steps=8).published_weights is None
+        initial_update = source.update(batch, sampled_env_steps=8)
+        assert initial_update.performed
+        assert initial_update.published_weights is None
+        assert_finite_losses(initial_update.learner_results)
         checkpoint = pickle.loads(pickle.dumps(source.get_state()))
+        updated_module = payload(source)[COMPONENT_RL_MODULE][DEFAULT_MODULE_ID]
+        assert any(
+            not np.array_equal(value, updated_module[key])
+            for key, value in initial_online.items()
+        )
         assert payload(source)[DQN_TARGET_UPDATE_STATE] == {DEFAULT_MODULE_ID: 0}
         assert payload(source)[COMPONENT_OPTIMIZER]
         expected_rng = torch.rand(4)
+        expected_cuda_rng = None
+        if num_gpus_per_learner:
+            assert checkpoint["torch_cuda_rng_states"]
+            assert all(state.numel() for state in checkpoint["torch_cuda_rng_states"])
+            expected_cuda_rng = torch.rand(4, device="cuda")
         restored = DQNLearnerAdapter(
             config, spaces=spaces(), member_id="dqn", publication_interval_updates=2
         )
         restored.set_state(copy.deepcopy(checkpoint))
+        torch.testing.assert_close(torch.get_rng_state(), checkpoint["torch_rng_state"])
+        assert_tree_close(
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else (),
+            checkpoint["torch_cuda_rng_states"],
+        )
         torch.testing.assert_close(torch.rand(4), expected_rng)
+        if expected_cuda_rng is not None:
+            torch.testing.assert_close(torch.rand(4, device="cuda"), expected_cuda_rng)
+        devices = assert_learner_parameter_devices(restored._learner_group, device_type)
+        request.node.user_properties.append(
+            ("restored_parameter_devices", json.dumps(devices))
+        )
         assert_tree_close(payload(source), payload(restored))
-        for steps, target_steps in ((15, 0), (16, 16)):
-            step_checkpoint = source.get_state()
+        counter_keys = (
+            "learner_updates",
+            "sampled_env_steps",
+            "sampled_agent_steps",
+            "last_published_update",
+            "module_versions",
+            "learning_starts_satisfied",
+        )
+        restored_state = restored.get_state()
+        for key in counter_keys:
+            assert restored_state[key] == checkpoint[key], key
+        assert_tree_close(
+            restored.get_published_weights().state, checkpoint["latest_weights"].state
+        )
+        for steps, target_steps in ((15, 0), (16, 16), (31, 16), (32, 32)):
+            step_checkpoint = copy.deepcopy(source.get_state())
+            previous_module = step_checkpoint["learner_group"]["learner"][
+                COMPONENT_RL_MODULE
+            ][DEFAULT_MODULE_ID]
+            targets = {
+                key: value for key, value in previous_module.items() if "target" in key
+            }
+            assert targets
             actual = source.update(batch, sampled_env_steps=steps)
             restored.set_state(copy.deepcopy(step_checkpoint))
+            assert_tree_close(
+                payload(restored),
+                {
+                    key: step_checkpoint["learner_group"]["learner"][key]
+                    for key in payload(restored)
+                },
+            )
             resumed = restored.update(batch, sampled_env_steps=steps)
+            assert_finite_losses(actual.learner_results)
+            assert_finite_losses(resumed.learner_results)
             assert actual.learner_updates == resumed.learner_updates
             assert bool(actual.published_weights) == bool(resumed.published_weights)
             assert_tree_close(payload(source), payload(restored))
             assert payload(source)[DQN_TARGET_UPDATE_STATE] == {
                 DEFAULT_MODULE_ID: target_steps
             }
+            source_state = source.get_state()
+            restored_state = restored.get_state()
+            for key in counter_keys:
+                assert source_state[key] == restored_state[key], key
+            assert source_state["sampled_env_steps"] == steps
+            assert source_state["sampled_agent_steps"] == steps
+            assert_tree_close(
+                source.get_published_weights().state,
+                restored.get_published_weights().state,
+            )
+            updated_module = payload(source)[COMPONENT_RL_MODULE][DEFAULT_MODULE_ID]
+            if steps in (15, 31):
+                for key, value in targets.items():
+                    assert_tree_close(value, updated_module[key])
+            else:
+                assert any(
+                    not np.array_equal(value, updated_module[key])
+                    for key, value in targets.items()
+                )
         incompatible = copy.deepcopy(checkpoint)
         incompatible["config_contract"]["double_q"] = not config.double_q
         with pytest.raises(ValueError, match="configuration"):

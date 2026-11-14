@@ -200,3 +200,31 @@ def flattened_key_paths(value: Any, prefix: str = "") -> list[str]:
         child = f"{prefix}.{key}" if prefix else str(key)
         paths.extend(flattened_key_paths(nested, child))
     return paths
+
+
+def assert_learner_parameter_devices(
+    learner_group: Any, device_type: str
+) -> dict[str, dict[str, str]]:
+    """Inspect live parameters, including targets, in the owning learner."""
+    results = list(
+        learner_group.foreach_learner(
+            lambda learner: {
+                module_id: {
+                    name: str(parameter.device)
+                    for name, parameter in module.named_parameters()
+                }
+                for module_id, module in learner.module.items()
+            },
+            timeout_seconds=10,
+        )
+    )
+    assert len(results) == 1
+    assert results[0].ok, results[0].get()
+    devices = results[0].get()
+    assert devices
+    for module_id, parameters in devices.items():
+        assert parameters, module_id
+        assert all(
+            torch.device(device).type == device_type for device in parameters.values()
+        ), (module_id, parameters)
+    return devices

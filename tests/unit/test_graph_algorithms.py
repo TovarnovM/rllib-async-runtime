@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import gymnasium as gym
 import numpy as np
 import pytest
@@ -24,7 +26,12 @@ from rllib_async.gnn.graph_batch import pack_graph_observations
 from rllib_async.gnn.rl_modules import GraphDQNTorchRLModule, GraphSACTorchRLModule
 from rllib_async.learner.dqn_adapter import DQNLearnerAdapter
 from rllib_async.learner.sac_adapter import SACLearnerAdapter
-from tests.helpers import assert_finite_losses, make_dqn_config, make_sac_config
+from tests.helpers import (
+    assert_finite_losses,
+    assert_learner_parameter_devices,
+    make_dqn_config,
+    make_sac_config,
+)
 
 
 def _space(*, controlled: bool = True, masked: bool = False) -> gym.spaces.Dict:
@@ -266,6 +273,7 @@ def test_graph_sac_rejects_unsupported_specs(config: dict, message: str) -> None
 def test_graph_learner_update_has_finite_loss_and_updates_encoders(
     algorithm: str,
     num_gpus_per_learner: int,
+    request: pytest.FixtureRequest,
 ) -> None:
     if num_gpus_per_learner and not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable in this container")
@@ -328,6 +336,10 @@ def test_graph_learner_update_has_finite_loss_and_updates_encoders(
         validate_startup=True,
     )
     try:
+        devices = assert_learner_parameter_devices(
+            adapter._learner_group, "cuda" if num_gpus_per_learner else "cpu"
+        )
+        request.node.user_properties.append(("parameter_devices", json.dumps(devices)))
         before = adapter.get_state()["learner_group"]["learner"][COMPONENT_RL_MODULE][
             DEFAULT_MODULE_ID
         ]
