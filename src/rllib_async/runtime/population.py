@@ -1793,8 +1793,7 @@ class PopulationAsyncSAC:
                 replay_state.store_generation, replay_state.mutation_seq
             )
             if any(
-                state.replay_cursor != replay_cursor
-                for state in member_states.values()
+                state.replay_cursor != replay_cursor for state in member_states.values()
             ):
                 raise PopulationError(
                     "coordinated population checkpoint replay cursors differ"

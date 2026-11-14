@@ -1323,7 +1323,6 @@ def test_population_checkpoint_aligns_late_foreign_commit(
         ("sync", "member-01"),
     ]
     assert all(
-        member.state is RuntimeState.RUNNING
-        and member._learner_updates_completed == 7
+        member.state is RuntimeState.RUNNING and member._learner_updates_completed == 7
         for member in population.members.values()
     )
