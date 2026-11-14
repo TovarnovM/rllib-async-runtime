@@ -5,6 +5,7 @@ import os
 import socket
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -115,9 +116,11 @@ def test_acceptance_keeps_ray_sockets_short_and_retains_failure_evidence(
         ("uv", "--version"): "uv test",
     }
     monkeypatch.setattr(
-        gpu_acceptance.subprocess,
-        "check_output",
-        lambda command, **kwargs: metadata[tuple(command)],
+        gpu_acceptance,
+        "subprocess",
+        SimpleNamespace(
+            check_output=lambda command, **kwargs: metadata[tuple(command)]
+        ),
     )
     monkeypatch.setattr(
         gpu_acceptance, "allocated_devices", lambda *args: ["GPU-first", "GPU-second"]
@@ -202,7 +205,9 @@ def test_acceptance_keeps_ray_sockets_short_and_retains_failure_evidence(
         def cannot_copy(*args, **kwargs):
             raise OSError("diagnostic copy failed")
 
-        monkeypatch.setattr(gpu_acceptance.shutil, "copytree", cannot_copy)
+        monkeypatch.setattr(
+            gpu_acceptance, "shutil", SimpleNamespace(copytree=cannot_copy)
+        )
     if outcome == "passed":
         gpu_acceptance.main()
     else:
