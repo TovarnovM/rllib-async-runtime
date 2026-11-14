@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, replace
+from types import SimpleNamespace
 
 import gymnasium as gym
 import pytest
@@ -9,6 +10,7 @@ import ray
 
 import rllib_async.runtime.population as population_module
 from rllib_async.protocols import ReplayCursor, ReplayStats
+from rllib_async.protocols.episodes import EpisodeEnvelope, FrozenVersions
 from rllib_async.replay.reference import EpisodeStore
 from rllib_async.runtime import (
     AsyncSACRuntimeConfig,
@@ -26,6 +28,7 @@ from rllib_async.runtime import (
     make_runtime_member_id,
 )
 from rllib_async.runtime.checkpoint import write_population_checkpoint
+from rllib_async.runtime.learner_host import LearnerHostCheckpoint, LearnerHostTick
 from tests.helpers import make_sac_config
 
 
@@ -1194,3 +1197,133 @@ def test_population_colocation_uses_one_core_bundle_and_disjoint_worker_bundles(
     population._member_specs = dict(zip(population._slot_ids, members, strict=True))
     assert population._worker_bundle_start("member-00") == 2
     assert population._worker_bundle_start("member-01") == 4
+
+
+@pytest.mark.parametrize("sync_foreign_commit", (True, False))
+def test_population_checkpoint_aligns_late_foreign_commit(
+    tmp_path,
+    monkeypatch,
+    sync_foreign_commit,
+) -> None:
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    spaces = {
+        "default_policy": (
+            gym.spaces.Box(-1.0, 1.0, shape=(3,)),
+            gym.spaces.Box(-1.0, 1.0, shape=(1,)),
+        )
+    }
+    monkeypatch.setattr(
+        SingleMemberAsyncSAC, "_resolve_spaces", staticmethod(lambda _: spaces)
+    )
+    population = PopulationAsyncSAC(make_single_trial_specs())
+    population._state = RuntimeState.RUNNING
+    runtime = population._member_specs["member-00"].runtime_config
+    codec = population_module.FlatEpisodeCodec()
+    store = EpisodeStore(
+        codec,
+        capacity_transitions=runtime.replay_capacity_transitions,
+        capacity_bytes=runtime.replay_capacity_bytes,
+        journal_capacity=runtime.replay_journal_capacity,
+    )
+    payload = codec.encode([{"obs": 0}])
+    final_episode = EpisodeEnvelope(
+        episode_id="member-01/runner/0/0",
+        schema_version=codec.schema_version,
+        producer_member_id="member-01",
+        runner_id="runner",
+        runner_generation=0,
+        local_episode_seq=0,
+        behavior_versions=FrozenVersions({"default_policy": 1}),
+        env_steps=1,
+        agent_steps=1,
+        terminated=True,
+        truncated=False,
+        estimated_bytes=payload.estimated_bytes,
+        payload=payload,
+    )
+    events = []
+
+    class Member(SingleMemberAsyncSAC):
+        def __init__(self, slot):
+            self.slot = slot
+            self._config = population._member_specs[slot].runtime_config
+            self._state = RuntimeState.RUNNING
+            self._owns_replay_actor = False
+            self._checkpoint_sequence = 0
+            self._learner_updates_completed = 7
+            self._rollout_group = SimpleNamespace(env_steps=0, agent_steps=0)
+            self.cursor = store.cursor
+            self._learner_actor = SimpleNamespace(
+                drain=SimpleNamespace(remote=self.sync),
+                get_checkpoint=SimpleNamespace(
+                    remote=lambda: LearnerHostCheckpoint(self.cursor, b"learner")
+                ),
+            )
+
+        def pause(self, **kwargs):
+            self._state = RuntimeState.PAUSED
+
+        def drain(self, **kwargs):
+            # The second producer's outstanding episode lands after the first
+            # member has already drained its own producer and local learner.
+            if self.slot == "member-01":
+                store.commit_episode(final_episode)
+            self.cursor = store.cursor
+            events.append(("drain", self.slot, self.cursor.mutation_seq))
+
+        def sync(self, *, max_updates, timeout_s, **kwargs):
+            assert self.state is RuntimeState.PAUSED
+            assert max_updates == 0
+            assert timeout_s > 0
+            if sync_foreign_commit:
+                self.cursor = store.cursor
+            events.append(("sync", self.slot, self.cursor.mutation_seq))
+            return LearnerHostTick(0, False, 0, 0, None, ())
+
+        def _build_checkpoint_state(self, checkpoint, **kwargs):
+            return RuntimeCheckpointState(
+                state_version=1,
+                member_id=self._config.member_id,
+                runtime_config=asdict(self._config),
+                replay_file="replay.snapshot",
+                replay_cursor=checkpoint.replay_cursor,
+                learner=checkpoint.payload,
+                rollout={},
+                evaluation=None,
+                controller={},
+            )
+
+        def resume(self):
+            self._state = RuntimeState.RUNNING
+
+    population._members = {slot: Member(slot) for slot in population.slot_ids}
+    population._replay_actor = SimpleNamespace(
+        get_checkpoint_state=SimpleNamespace(remote=store.export_state)
+    )
+    monkeypatch.setattr(ray, "get", lambda value, **kwargs: value)
+    written = []
+
+    def capture(directory, *, replay_state, members, pbt_metadata):
+        written.append(members)
+        assert replay_state.mutation_seq == 1
+        assert all(state.replay_cursor == store.cursor for state in members.values())
+        return "checkpoint"
+
+    monkeypatch.setattr(population_module, "write_population_checkpoint", capture)
+    if sync_foreign_commit:
+        assert population.save_checkpoint(tmp_path) == "checkpoint"
+        assert len(written) == 1
+    else:
+        with pytest.raises(PopulationError, match="replay cursors differ"):
+            population.save_checkpoint(tmp_path)
+        assert not written
+    assert events[:2] == [("drain", "member-00", 0), ("drain", "member-01", 1)]
+    assert [event[:2] for event in events[2:]] == [
+        ("sync", "member-00"),
+        ("sync", "member-01"),
+    ]
+    assert all(
+        member.state is RuntimeState.RUNNING
+        and member._learner_updates_completed == 7
+        for member in population.members.values()
+    )

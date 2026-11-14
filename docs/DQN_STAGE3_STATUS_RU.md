@@ -74,6 +74,12 @@ state. Shared replay записывается один раз. Metadata смеш
 schema 3; существующая SAC schema 2 сохраняется. Warm start использует прежнюю
 семантику нового run с перенесёнными моделями и опытом.
 
+Согласованный checkpoint сначала завершает pending rollout commits всех
+команд, затем повторно синхронизирует learners без обучения. Все member cursors
+должны совпасть с общим replay snapshot. Это устраняет найденную гонку, когда
+последний commit второй команды ещё не входил в сохранённые priorities первой.
+Дополнительная синхронизация выполняется только при checkpoint.
+
 DEMO-04: [`examples/mixed_population.py`](../examples/mixed_population.py).
 Интеграционная проверка проводит обучение двух команд с Rainbow-менеджером,
 публикацию новых весов, evaluation, replacement, checkpoint, exact resume

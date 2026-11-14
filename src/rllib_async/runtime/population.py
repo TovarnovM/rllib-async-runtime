@@ -1789,6 +1789,16 @@ class PopulationAsyncSAC:
             )
             if not isinstance(replay_state, EpisodeStoreState):
                 raise PopulationError("shared replay returned invalid checkpoint state")
+            replay_cursor = ReplayCursor(
+                replay_state.store_generation, replay_state.mutation_seq
+            )
+            if any(
+                state.replay_cursor != replay_cursor
+                for state in member_states.values()
+            ):
+                raise PopulationError(
+                    "coordinated population checkpoint replay cursors differ"
+                )
             return write_population_checkpoint(
                 destination,
                 replay_state=replay_state,

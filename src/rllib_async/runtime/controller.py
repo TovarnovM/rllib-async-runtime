@@ -768,10 +768,24 @@ class SingleMemberAsyncSAC:
             raise ValueError("timeout_s must be finite and positive")
 
         started = time.monotonic()
+        deadline = started + timeout_s
         assert self._learner_actor is not None
+        assert self._rollout_group is not None
+        # Other population members can commit their final episodes after this
+        # member's earlier drain. Once all producers are quiescent, reach the
+        # shared replay frontier without sampling or consuming learner budget.
+        tick = ray.get(
+            self._learner_actor.drain.remote(
+                **self._sampled_step_kwargs(self._rollout_group),
+                max_updates=0,
+                timeout_s=self._remaining(deadline),
+            ),
+            timeout=self._remaining(deadline),
+        )
+        self._accept_learner_tick(tick)
         learner_checkpoint = ray.get(
             self._learner_actor.get_checkpoint.remote(),
-            timeout=timeout_s,
+            timeout=self._remaining(deadline),
         )
         if not isinstance(learner_checkpoint, LearnerHostCheckpoint):
             raise RuntimeError("learner actor returned invalid checkpoint")

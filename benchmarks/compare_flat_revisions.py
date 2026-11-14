@@ -64,7 +64,8 @@ def summarize(pairs: list[dict[str, Any]]) -> dict[str, Any]:
         before, after = measurements["baseline"], measurements["candidate"]
         ratios.append(after[0] / before[0])
         update_ratios.append((after[0] / after[1]) / (before[0] / before[1]))
-        comparable &= 0.9 <= after[1] / before[1] <= 1.1
+        # Preserve the inclusive 10% boundary despite float division roundoff.
+        comparable &= 0.9 - 1e-12 <= after[1] / before[1] <= 1.1 + 1e-12
     median = statistics.median(ratios)
     relative_span = (max(ratios) - min(ratios)) / median
     update_median = statistics.median(update_ratios)

@@ -71,7 +71,13 @@ jobs:
               print(json.dumps({
                   "report": str(path),
                   "quality": data.get("quality"),
-                  "gates": [item.get("gates") for item in data.get("results", [])],
+                  "measurements": [{key: item.get(key) for key in (
+                      "seed", "memory", "elapsed_s", "optimizer_updates",
+                      "valid_learned_positions", "valid_learned_positions_per_s",
+                      "sample_decode_collate_s", "final_publication_s",
+                      "retained_payload_estimate_bytes", "before_training",
+                      "after_training", "evaluation", "gates",
+                  )} for item in data.get("results", [])],
               }, sort_keys=True))
           path = Path("artifacts/stage3/flat-comparison/summary.json")
           if path.exists():
