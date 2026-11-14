@@ -186,7 +186,7 @@ class PrioritizedSequenceSampler:
                 self._set_priority(slot, priority)
 
     def _set_priority(self, slot: int, priority: float) -> None:
-        mass = priority ** self._config.alpha
+        mass = priority**self._config.alpha
         self._priorities[slot] = priority
         self._sum[slot] = mass
         self._min[slot] = mass

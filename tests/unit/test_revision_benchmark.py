@@ -25,6 +25,8 @@ def test_time_gate_does_not_reward_less_learning_or_cherry_pick_noisy_repeats():
     assert summarize([_pair(0.9)] * 5)["time_regression_gate"] == "pass"
     assert summarize([_pair(1.2)] * 5)["time_regression_gate"] == "regression"
     assert summarize([_pair(0.5, 40)] * 5)["time_regression_gate"] == "inconclusive"
+    # World-step time alone hides a >10% cost increase per learner update.
+    assert summarize([_pair(1.05, 90)] * 5)["time_regression_gate"] == "regression"
     noisy = [_pair(value) for value in (0.8, 0.9, 1.0, 1.1, 1.2)]
     assert summarize(noisy)["time_regression_gate"] == "inconclusive"
     assert summarize([_pair()] * 4)["time_regression_gate"] == "inconclusive"

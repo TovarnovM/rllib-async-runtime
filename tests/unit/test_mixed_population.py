@@ -27,14 +27,18 @@ def test_team_contract_allows_only_rates_and_seeds() -> None:
     altered = dict(first.module_configs)
     altered["manager"] = altered["manager"].copy(copy_frozen=False).training(v_max=99)
     other = PopulationMemberSpec.for_team(
-        first.sac_config, altered, first.runtime_config,
+        first.sac_config,
+        altered,
+        first.runtime_config,
         per_configs=first.per_configs,
     )
     assert _team_contract(other) != _team_contract(first)
     changed_rollout = first.sac_config.copy(copy_frozen=False)
     changed_rollout.normalize_actions = not first.sac_config.normalize_actions
     other = PopulationMemberSpec.for_team(
-        changed_rollout, first.module_configs, first.runtime_config,
+        changed_rollout,
+        first.module_configs,
+        first.runtime_config,
         per_configs=first.per_configs,
     )
     assert _team_contract(other) != _team_contract(first)
@@ -48,7 +52,9 @@ def test_mixed_population_rejects_semantics_and_loss_fitness_before_actors(
     changed_rollout = specs[1].sac_config.copy(copy_frozen=False)
     changed_rollout.environment(env_config={"episode_length": 11})
     incompatible = PopulationMemberSpec.for_team(
-        changed_rollout, specs[1].module_configs, specs[1].runtime_config,
+        changed_rollout,
+        specs[1].module_configs,
+        specs[1].runtime_config,
         per_configs=specs[1].per_configs,
     )
     with pytest.raises(ValueError, match="complete team contract"):
@@ -59,8 +65,11 @@ def test_mixed_population_rejects_semantics_and_loss_fitness_before_actors(
         )
     with pytest.raises(ValueError, match="trainable team modules"):
         PopulationMemberSpec.for_team(
-            specs[0].sac_config, specs[0].module_configs, specs[0].runtime_config,
-            trainable_modules=("manager",), per_configs=specs[0].per_configs,
+            specs[0].sac_config,
+            specs[0].module_configs,
+            specs[0].runtime_config,
+            trainable_modules=("manager",),
+            per_configs=specs[0].per_configs,
         )
 
 
@@ -108,7 +117,8 @@ def test_invalid_donor_does_not_stop_or_mutate_recipient(monkeypatch) -> None:
 
 
 def test_mixed_metadata_resume_and_warm_start_keep_different_contracts(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ) -> None:
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
     specs = mixed_specs()
@@ -129,7 +139,9 @@ def test_mixed_metadata_resume_and_warm_start_keep_different_contracts(
             replay_file="replay.snapshot",
             replay_cursor=store.cursor,
             learner=b"only metadata is read in this test",
-            rollout={}, evaluation=None, controller={},
+            rollout={},
+            evaluation=None,
+            controller={},
         )
         for member in source._member_specs.values()
     }
@@ -138,7 +150,9 @@ def test_mixed_metadata_resume_and_warm_start_keep_different_contracts(
     metadata = source._checkpoint_metadata().to_mapping()
     assert metadata["schema_version"] == 3
     write_population_checkpoint(
-        directory, replay_state=store.export_state(), members=states,
+        directory,
+        replay_state=store.export_state(),
+        members=states,
         pbt_metadata=metadata,
     )
     resumed = PopulationAsyncSAC.from_checkpoint(
@@ -148,8 +162,10 @@ def test_mixed_metadata_resume_and_warm_start_keep_different_contracts(
     assert resumed._report_index == 7
     assert resumed._current_hparams == source._current_hparams
     warm = PopulationAsyncSAC.from_warm_start_checkpoint(
-        mixed_specs(seed=900, manager_lr=5e-4), directory,
-        run_id="warm", pbt_config=mixed_pbt(),
+        mixed_specs(seed=900, manager_lr=5e-4),
+        directory,
+        run_id="warm",
+        pbt_config=mixed_pbt(),
     )
     assert warm.runtime_member_ids != source.runtime_member_ids
     assert warm._report_index == 0

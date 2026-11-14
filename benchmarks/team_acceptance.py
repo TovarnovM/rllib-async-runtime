@@ -4,6 +4,8 @@ This deliberately uses the existing learner host behind one Ray actor. Dataset
 collection and evaluation are synchronous, so world-step budgets are exact.
 Offline training gives each module an explicit valid-position budget; replaying
 that dataset does not count as new environment interactions.
+PER requires --learning-length 1 to drain that budget exactly; full-prefix
+recurrence and n-step targets remain enabled for each selected position.
 """
 
 from __future__ import annotations
@@ -65,7 +67,8 @@ def process_measurements() -> dict[str, Any]:
             name, values = line.split(":", 1)
             columns = values.split()
             interfaces[name.strip()] = {
-                "rx_bytes": int(columns[0]), "tx_bytes": int(columns[8])
+                "rx_bytes": int(columns[0]),
+                "tx_bytes": int(columns[8]),
             }
     return {
         "pid": os.getpid(),
@@ -288,9 +291,7 @@ def build_case(args, seed: int, memory: str, *, behavior: bool = False):
             elif args.dqn_profile == "rainbow":
                 config.training(epsilon=0.0)
     burn_in = (
-        None
-        if memory == "full-prefix"
-        else args.burn_in if memory == "burn-in" else 0
+        None if memory == "full-prefix" else args.burn_in if memory == "burn-in" else 0
     )
     sequences = {
         module_id: SequenceConfig(
@@ -461,17 +462,24 @@ def parse_args():
     for name in ("components", "quality"):
         command = subparsers.add_parser(name)
         command.add_argument(
-            "--task", choices=("memory", "hierarchy"),
+            "--task",
+            choices=("memory", "hierarchy"),
             default="memory" if name == "quality" else "hierarchy",
         )
         command.add_argument("--algorithm", choices=("dqn", "sac"), default="dqn")
         command.add_argument("--graph", action="store_true")
         command.add_argument(
-            "--memories", nargs="+", choices=("stateless", "full-prefix", "burn-in"),
-            default=["stateless", "full-prefix"] if name == "quality" else ["full-prefix"],
+            "--memories",
+            nargs="+",
+            choices=("stateless", "full-prefix", "burn-in"),
+            default=["stateless", "full-prefix"]
+            if name == "quality"
+            else ["full-prefix"],
         )
         command.add_argument(
-            "--seeds", nargs="+", type=int,
+            "--seeds",
+            nargs="+",
+            type=int,
             default=list(TRAINING_SEEDS) if name == "quality" else [TRAINING_SEEDS[0]],
         )
         command.add_argument(
@@ -504,8 +512,13 @@ def parse_args():
             command.add_argument("--require-quality", action="store_true")
     args = parser.parse_args()
     for name in (
-        "episode_length", "world_steps", "learned_positions", "batch_size",
-        "learning_length", "n_step", "evaluation_episodes",
+        "episode_length",
+        "world_steps",
+        "learned_positions",
+        "batch_size",
+        "learning_length",
+        "n_step",
+        "evaluation_episodes",
     ):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -513,17 +526,28 @@ def parse_args():
         parser.error("--world-steps must be divisible by --episode-length")
     if args.burn_in < 0 or not np.isfinite(args.timeout_s) or args.timeout_s <= 0:
         parser.error("burn-in must be non-negative and timeout finite and positive")
-    if len(set(args.seeds)) != len(args.seeds) or set(args.seeds) & set(EVALUATION_SEEDS):
+    if len(set(args.seeds)) != len(args.seeds) or set(args.seeds) & set(
+        EVALUATION_SEEDS
+    ):
         parser.error("training seeds must be unique and disjoint from evaluation")
     if len(set(args.memories)) != len(args.memories):
         parser.error("memory modes must be unique")
     if args.command == "quality" and args.task != "memory":
         parser.error("offline quality comparison is defined only for the memory task")
+    if args.sampling == "per" and args.learning_length != 1:
+        parser.error(
+            "exact-position PER benchmarks require --learning-length 1: "
+            "fixed multirow windows retain residual credit smaller than a window"
+        )
     if args.dqn_profile == "rainbow" and (args.sampling != "per" or args.n_step < 2):
         parser.error("Rainbow requires --sampling per and --n-step at least 2")
     if args.task == "hierarchy" and (args.graph or args.algorithm != "dqn"):
         parser.error("hierarchy already has fixed mixed graph/vector DQN/SAC roles")
-    if args.task == "memory" and args.algorithm == "sac" and args.dqn_profile != "baseline":
+    if (
+        args.task == "memory"
+        and args.algorithm == "sac"
+        and args.dqn_profile != "baseline"
+    ):
         parser.error("DQN profiles do not apply to the SAC memory task")
     return args
 
@@ -533,13 +557,15 @@ def quality_summary(results):
     for memory in sorted({result["memory"] for result in results}):
         returns = {
             result["seed"]: result["evaluation"]["mean_return"]
-            for result in results if result["memory"] == memory
+            for result in results
+            if result["memory"] == memory
         }
         by_memory[memory] = {
             "seed_returns": returns,
             "mean_return": float(np.mean(list(returns.values()))),
             "std_across_training_seeds": float(np.std(list(returns.values()), ddof=1))
-            if len(returns) > 1 else None,
+            if len(returns) > 1
+            else None,
         }
     comparison = None
     if "stateless" in by_memory and "full-prefix" in by_memory:
@@ -551,16 +577,23 @@ def quality_summary(results):
         }
         gates = {
             "five_preregistered_seeds": set(paired) == set(TRAINING_SEEDS),
-            "recurrent_return_at_least_0_6": by_memory["full-prefix"]["mean_return"] >= 0.6,
-            "memoryless_return_within_0_3_of_zero": abs(by_memory["stateless"]["mean_return"]) <= 0.3,
-            "paired_mean_gain_at_least_0_4": bool(paired) and float(np.mean(list(paired.values()))) >= 0.4,
-            "at_least_four_positive_pairs": sum(value > 0 for value in paired.values()) >= 4,
+            "recurrent_return_at_least_0_6": by_memory["full-prefix"]["mean_return"]
+            >= 0.6,
+            "memoryless_return_within_0_3_of_zero": abs(
+                by_memory["stateless"]["mean_return"]
+            )
+            <= 0.3,
+            "paired_mean_gain_at_least_0_4": bool(paired)
+            and float(np.mean(list(paired.values()))) >= 0.4,
+            "at_least_four_positive_pairs": sum(value > 0 for value in paired.values())
+            >= 4,
         }
         gates["all_passed"] = all(gates.values())
         comparison = {
             "paired_return_gains": paired,
             "gates": gates,
-            "interpretation": "registered criterion met" if gates["all_passed"]
+            "interpretation": "registered criterion met"
+            if gates["all_passed"]
             else "registered criterion not met; quality evidence is inconclusive",
         }
     return {"by_memory": by_memory, "memory_comparison": comparison}
@@ -596,10 +629,16 @@ def main():
         for seed in args.seeds:
             results.extend(run_seed(args, seed))
             document = benchmark_document("team_acceptance", vars(args), results)
-            document["scope"] = "offline fixed-data learning; not online runtime throughput"
+            document["scope"] = (
+                "offline fixed-data learning; not online runtime throughput"
+            )
             document["evaluation_seeds"] = EVALUATION_SEEDS
-            document["lock_sha256"] = hashlib.sha256(Path("uv.lock").read_bytes()).hexdigest()
-            document["quality_plan"] = quality_plan if args.command == "quality" else None
+            document["lock_sha256"] = hashlib.sha256(
+                Path("uv.lock").read_bytes()
+            ).hexdigest()
+            document["quality_plan"] = (
+                quality_plan if args.command == "quality" else None
+            )
             document["status"] = "running"
             if args.command == "quality":
                 document["quality"] = quality_summary(results)
@@ -609,7 +648,9 @@ def main():
         if args.command == "quality" and args.require_quality:
             comparison = document["quality"]["memory_comparison"]
             if comparison is None:
-                raise ValueError("quality acceptance requires stateless and full-prefix runs")
+                raise ValueError(
+                    "quality acceptance requires stateless and full-prefix runs"
+                )
             require_gates(comparison["gates"])
     except Exception as error:
         if document is not None:

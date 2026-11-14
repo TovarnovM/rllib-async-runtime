@@ -29,8 +29,14 @@ def mixed_specs(*, num_gpus=0, seed=300, manager_lr=3e-4):
                 target_network_update_freq=1,
             )
         modules["manager"].training(
-            lr=manager_lr, noisy=True, num_atoms=5, v_min=-10, v_max=10,
-            dueling=True, double_q=True, epsilon=0.0,
+            lr=manager_lr,
+            noisy=True,
+            num_atoms=5,
+            v_min=-10,
+            v_max=10,
+            dueling=True,
+            double_q=True,
+            epsilon=0.0,
         )
         settings = AsyncRuntimeConfig(
             member_id=f"team-{index}",

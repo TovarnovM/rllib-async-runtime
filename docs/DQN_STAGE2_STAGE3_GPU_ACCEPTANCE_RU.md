@@ -122,12 +122,19 @@ sample с handles/probabilities/IS weights, RNG Noisy и следующий upda
 каждом optimizer update. Production sampling clock не подделывается новыми
 world steps; при фиксированном dataset он естественно перестаёт расти.
 
+PER измеряется с `--learning-length 1`: production sampler сохраняет размер
+окна, поэтому при multirow windows остаток бюджета меньше окна ожидает
+новых данных. Однопозиционное окно позволяет этому offline harness потратить
+ровно заданный бюджет. Full-prefix/burn-in и n-step targets сохраняются;
+multirow PER проверяется функциональными тестами. Для сравнения uniform/PER
+использовать `--learning-length 1` в обоих запусках.
+
 Короткая проверка измерительного пути на CPU:
 
 ```bash
 uv run --locked --extra cu118 --group dev \
   python -m benchmarks.team_acceptance components \
-  --sampling per --dqn-profile rainbow \
+  --sampling per --dqn-profile rainbow --learning-length 1 \
   --world-steps 32 --learned-positions 128 \
   --output "$artifact_dir/components-cpu.json"
 ```
@@ -137,7 +144,7 @@ uv run --locked --extra cu118 --group dev \
 ```bash
 uv run --locked --extra cu118 --group dev \
   python -m benchmarks.team_acceptance components \
-  --num-gpus 1 --sampling per --dqn-profile rainbow \
+  --num-gpus 1 --sampling per --dqn-profile rainbow --learning-length 1 \
   --memories stateless full-prefix burn-in \
   --seeds 20261114 20261115 20261116 20261117 20261118 \
   --world-steps 256 --learned-positions 4096 \
@@ -175,7 +182,7 @@ Actor/Q1/Q2 получают один выбранный batch. Это свой�
 ```bash
 uv run --locked --extra cu118 --group dev \
   python -m benchmarks.team_acceptance components \
-  --sampling per --learned-positions 128 \
+  --sampling per --learning-length 1 --learned-positions 128 \
   --profile-dir "$artifact_dir/profiles" \
   --output "$artifact_dir/components-profiled.json"
 ```
@@ -223,7 +230,7 @@ timeout --signal=TERM --kill-after=30s 1800s \
 | Continuous recurrent SAC | `--algorithm sac` |
 | Приближённый burn-in | `--memories stateless full-prefix burn-in --burn-in 2` |
 | C51 относительно expectation-Q | `--dqn-profile c51` |
-| Rainbow + локальный PER | `--dqn-profile rainbow --sampling per` |
+| Rainbow + локальный PER | `--dqn-profile rainbow --sampling per --learning-length 1` |
 
 Каждая точка получает отдельный output filename. DQN и continuous SAC имеют
 разные action semantics и сравниваются как разные задачи; это не discrete

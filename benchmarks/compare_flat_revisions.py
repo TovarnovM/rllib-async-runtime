@@ -42,6 +42,7 @@ def summarize(pairs: list[dict[str, Any]]) -> dict[str, Any]:
     if not pairs:
         raise ValueError("at least one paired measurement is required")
     ratios = []
+    update_ratios = []
     comparable = True
     for pair in pairs:
         measurements = {}
@@ -62,18 +63,26 @@ def summarize(pairs: list[dict[str, Any]]) -> dict[str, Any]:
             measurements[label] = (duration / steps, updates / steps)
         before, after = measurements["baseline"], measurements["candidate"]
         ratios.append(after[0] / before[0])
+        update_ratios.append((after[0] / after[1]) / (before[0] / before[1]))
         comparable &= 0.9 <= after[1] / before[1] <= 1.1
     median = statistics.median(ratios)
     relative_span = (max(ratios) - min(ratios)) / median
+    update_median = statistics.median(update_ratios)
+    update_span = (max(update_ratios) - min(update_ratios)) / update_median
     verdict = (
         "inconclusive"
-        if len(pairs) < 5 or relative_span >= 0.1 or not comparable
-        else "pass" if median <= 1.1 else "regression"
+        if len(pairs) < 5 or max(relative_span, update_span) >= 0.1 or not comparable
+        else "pass"
+        if max(median, update_median) <= 1.1
+        else "regression"
     )
     return {
         "paired_time_per_world_step_ratios": ratios,
         "median_ratio": median,
         "relative_ratio_span": relative_span,
+        "paired_time_per_learner_update_ratios": update_ratios,
+        "median_update_ratio": update_median,
+        "relative_update_ratio_span": update_span,
         "learner_updates_per_world_step_comparable": comparable,
         "time_regression_gate": verdict,
         "limit_ratio": 1.1,
@@ -121,9 +130,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20261114)
     parser.add_argument("--max-duration-s", type=int, default=180)
     args = parser.parse_args()
-    if args.repeats < 5 or min(
-        args.warmup_timesteps, args.measure_timesteps, args.max_duration_s
-    ) < 1:
+    if (
+        args.repeats < 5
+        or min(args.warmup_timesteps, args.measure_timesteps, args.max_duration_s) < 1
+    ):
         parser.error("at least five repeats and positive work/time budgets required")
     if platform.system() != "Linux":
         parser.error("run in the Linux project devcontainer")
@@ -250,15 +260,18 @@ def main() -> None:
             }
             manifest["complete"] = True
             (output / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
-            (output / "manifest.json").write_text(
-                json.dumps(manifest, indent=2) + "\n"
-            )
+            (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
             print(json.dumps(result["summary"], indent=2))
         finally:
             for path in worktrees.values():
                 subprocess.run(
                     [
-                        "git", "-C", str(root), "worktree", "remove", "--force",
+                        "git",
+                        "-C",
+                        str(root),
+                        "worktree",
+                        "remove",
+                        "--force",
                         str(path),
                     ],
                     check=False,

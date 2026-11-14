@@ -112,6 +112,8 @@ def test_dqn_module_masks_inference_and_preserves_exploration_state() -> None:
     updates = []
     state = torch.tensor([[7.0]])
     module = SimpleNamespace(
+        _noisy_online_layers=(),
+        _noisy_target_layers=(),
         compute_q_values=lambda batch: {
             QF_PREDS: torch.tensor([[0.0, 10.0, 0.0]]),
             Columns.STATE_OUT: state,

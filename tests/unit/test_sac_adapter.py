@@ -407,8 +407,7 @@ def test_adapter_matches_stock_rllib_fixed_batch_and_target_schedule() -> None:
                 atol=1e-7,
             )
             assert (
-                TD_ERROR_KEY
-                not in adapter_result.learner_results[0][DEFAULT_MODULE_ID]
+                TD_ERROR_KEY not in adapter_result.learner_results[0][DEFAULT_MODULE_ID]
             )
             assert_tree_close(
                 loss_values(baseline_result),
@@ -685,13 +684,15 @@ def test_pbt_state_transfers_full_model_and_temperature_with_fresh_optimizer() -
 
 def test_legacy_sac_pbt_pickle_fields_keep_their_algorithm() -> None:
     restored = object.__new__(PBTModelState)
-    restored.__setstate__([
-        1,
-        "spaces",
-        "model",
-        {DEFAULT_MODULE_ID: {"weight": np.zeros(2, dtype=np.float32)}},
-        {DEFAULT_MODULE_ID: np.zeros(1, dtype=np.float32)},
-    ])
+    restored.__setstate__(
+        [
+            1,
+            "spaces",
+            "model",
+            {DEFAULT_MODULE_ID: {"weight": np.zeros(2, dtype=np.float32)}},
+            {DEFAULT_MODULE_ID: np.zeros(1, dtype=np.float32)},
+        ]
+    )
     assert restored.algorithm == "SAC"
     assert restored.config_contract is None
     round_trip = pickle.loads(pickle.dumps(restored))

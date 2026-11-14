@@ -43,19 +43,28 @@ def main() -> None:
     for index in range(2):
         seed = args.seed + index
         rollout, modules, _ = build_temporal_hierarchy_configs(
-            episode_length=8, manager_period=3,
-            variable_duration=True, vector_worker=True, seed=seed,
+            episode_length=8,
+            manager_period=3,
+            variable_duration=True,
+            vector_worker=True,
+            seed=seed,
         )
         for config in modules.values():
             config.learners(num_gpus_per_learner=args.num_gpus)
             config.training(
-                n_step=2, train_batch_size_per_learner=4,
+                n_step=2,
+                train_batch_size_per_learner=4,
                 num_steps_sampled_before_learning_starts=0,
                 training_intensity=1.0,
             )
         modules["manager"].training(
-            noisy=True, num_atoms=5, v_min=-10, v_max=10,
-            dueling=True, double_q=True, epsilon=0.0,
+            noisy=True,
+            num_atoms=5,
+            v_min=-10,
+            v_max=10,
+            dueling=True,
+            double_q=True,
+            epsilon=0.0,
         )
         settings = AsyncRuntimeConfig(
             member_id=f"team-{index}",
@@ -75,10 +84,14 @@ def main() -> None:
             num_gpus_per_learner=args.num_gpus,
             seed=seed,
         )
-        members.append(PopulationMemberSpec.for_team(
-            rollout, modules, settings,
-            per_configs={mid: PrioritizedReplayConfig() for mid in modules},
-        ))
+        members.append(
+            PopulationMemberSpec.for_team(
+                rollout,
+                modules,
+                settings,
+                per_configs={mid: PrioritizedReplayConfig() for mid in modules},
+            )
+        )
     pbt = SimplePBTConfig(
         perturbation_interval_reports=2,
         reward_window_episodes=8,
@@ -101,8 +114,10 @@ def main() -> None:
             if report["pbt"]["event_happened"]:
                 replacement = report["pbt"]
             ready = all(
-                all(dict(counters)["optimizer_updates"] > 0
-                    for _, counters in member["learner"]["module_counters"])
+                all(
+                    dict(counters)["optimizer_updates"] > 0
+                    for _, counters in member["learner"]["module_counters"]
+                )
                 for member in report["members"].values()
             )
             if replacement is not None and ready:
@@ -113,13 +128,17 @@ def main() -> None:
         ids = population.runtime_member_ids
         population.stop(graceful=False)
         restored = PopulationAsyncSAC.from_checkpoint(
-            members, args.checkpoint, pbt_config=pbt,
+            members,
+            args.checkpoint,
+            pbt_config=pbt,
         )
         restored.start()
         assert restored.runtime_member_ids == ids
         replay_id = restored.replay_actor._actor_id
-        assert all(member._replay_actor._actor_id == replay_id
-                   for member in restored.members.values())
+        assert all(
+            member._replay_actor._actor_id == replay_id
+            for member in restored.members.values()
+        )
         result = {
             "replacement": replacement,
             "restored": restored.run_for_report_interval(0.2),

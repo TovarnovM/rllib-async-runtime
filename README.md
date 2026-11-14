@@ -22,8 +22,7 @@ deterministic replay oracles, a serialized Ray `ReplayActor`, atomic
 trusted-local replay checkpoints, reader-safe background `FastReplay` index
 publication, a bounded local batch pipeline, version-aware asynchronous
 rollout, replay-isolated evaluation, and a Tune-compatible end-to-end event
-pump. It does **not** yet implement PBT exploit/explore or centralized
-full-graph inference.
+pump. Centralized full-graph inference is not implemented.
 
 The `feature/dqn-hierarchy-gnn` branch adds DQN, graph encoders and mixed
 DQN/SAC teams through the same asynchronous lifecycle. Stage 2 adds raw
@@ -32,7 +31,27 @@ actor/critic encoders. See the [stage 2 report](docs/DQN_STAGE2_STATUS_RU.md),
 [architecture decision](docs/adr/0014-mixed-teams-and-local-sequences.md),
 and [technical specification](docs/DQN_HIERARCHY_GNN_SPEC_RU.md).
 The [stage 1 report](docs/DQN_STAGE1_STATUS_RU.md) records its earlier boundary.
-PER, Noisy DQN and mixed population/PBT remain stage 3 work.
+Stage 3 adds local per-consumer PER, NoisyNet, corrected categorical dueling
+heads, and whole-team population/PBT with exact checkpoint restore. All
+learners still consume one raw replay payload stream per host. See the
+[stage 3 report](docs/DQN_STAGE3_STATUS_RU.md) for measured evidence and open
+acceptance items. GPU acceptance for stages 2 and 3 is intentionally combined
+in one [ordered local campaign](docs/DQN_STAGE2_STAGE3_GPU_ACCEPTANCE_RU.md);
+the runner and test matrix are available, but their GPU result is pending.
+
+Run the mixed population example inside the devcontainer:
+
+```bash
+uv run --locked --extra cpu --group dev \
+  python examples/mixed_population.py --checkpoint /tmp/mixed-population
+```
+
+`--num-gpus 1` assigns one GPU to each of the two teams and requires two GPUs.
+PBT accepts compatible whole teams and scalar learning-rate mutations such as
+`manager/lr`; it does not mutate graph topology or copy optimizer/PER state.
+Full checkpoint restore preserves those states. C51 with dueling uses corrected
+per-atom value heads; checkpoints from the older scalar-head C51/dueling path
+are rejected explicitly. Other existing DQN/SAC checkpoint paths remain supported.
 
 ## Development contract
 

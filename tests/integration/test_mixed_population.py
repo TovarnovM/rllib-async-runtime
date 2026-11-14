@@ -18,7 +18,7 @@ from tests.helpers import assert_learner_parameter_devices, assert_tree_close
 from tests.mixed_population_helpers import mixed_pbt, mixed_specs
 
 
-def _progress(population, minimum=1):
+def _progress(population, *, after=None):
     deadline = time.monotonic() + 40
     report = None
     while time.monotonic() < deadline:
@@ -28,10 +28,15 @@ def _progress(population, minimum=1):
             and member["evaluation"]["rounds_completed"] >= 1
             and member["evaluation"]["latest_module_version"] > 1
             and all(
-                dict(counters)["optimizer_updates"] >= minimum
-                for _, counters in member["learner"]["module_counters"]
+                dict(counters)["optimizer_updates"]
+                > (
+                    after[slot]["module_counters"][mid]["optimizer_updates"]
+                    if after is not None
+                    else 0
+                )
+                for mid, counters in member["learner"]["module_counters"]
             )
-            for member in report["members"].values()
+            for slot, member in report["members"].items()
         ):
             return report
     pytest.fail(f"Both mixed teams did not make progress: {report!r}")
@@ -49,6 +54,7 @@ def _inspect(member, device_type):
             )
             learners[mid] = adapter.get_state()["learner_group"]["learner"]
         return {
+            "state": host._state.value,
             "learners": learners,
             "counters": host._module_counters,
             "rng": {mid: rng.getstate() for mid, rng in host._samplers.items()},
@@ -63,11 +69,7 @@ def _inspect(member, device_type):
     return ray.get(member._learner_actor.__ray_call__.remote(inspect), timeout=15)
 
 
-def _placement_evidence(population, request, prefix, num_gpus):
-    snapshots = {
-        slot: _inspect(member, "cuda" if num_gpus else "cpu")
-        for slot, member in population.members.items()
-    }
+def _placement_evidence(snapshots, request, prefix, num_gpus):
     devices = {slot: value["devices"] for slot, value in snapshots.items()}
     gpu_ids = {slot: value["gpu_ids"] for slot, value in snapshots.items()}
     assert all(len(ids) == num_gpus for ids in gpu_ids.values())
@@ -79,7 +81,6 @@ def _placement_evidence(population, request, prefix, num_gpus):
             (f"{prefix}_accelerator_ids", json.dumps(gpu_ids)),
         ]
     )
-    return snapshots
 
 
 @pytest.mark.integration
@@ -88,7 +89,11 @@ def _placement_evidence(population, request, prefix, num_gpus):
     [pytest.param(0, id="cpu"), pytest.param(1, marks=pytest.mark.gpu, id="two-gpu")],
 )
 def test_mixed_population_replacement_checkpoint_and_resume(
-    ray_runtime, tmp_path, request, num_gpus,
+    ray_runtime,
+    tmp_path,
+    request,
+    monkeypatch,
+    num_gpus,
 ) -> None:
     if num_gpus and torch.cuda.device_count() < 2:
         pytest.skip("This placement acceptance case requires two physical GPUs")
@@ -102,7 +107,11 @@ def test_mixed_population_replacement_checkpoint_and_resume(
     try:
         population.start()
         _progress(population)
-        original = _placement_evidence(population, request, "original", num_gpus)
+        original = {
+            slot: _inspect(member, "cuda" if num_gpus else "cpu")
+            for slot, member in population.members.items()
+        }
+        _placement_evidence(original, request, "original", num_gpus)
         assert all(
             any(
                 optimizer["state"]["state"]
@@ -122,10 +131,12 @@ def test_mixed_population_replacement_checkpoint_and_resume(
         population._reports_since_perturbation = 10_000
         event = population._maybe_run_pbt_step(
             {
-                slot: {"train": {
-                    "episode_reward_mean": score,
-                    "episodes_since_metric_reset": 1,
-                }}
+                slot: {
+                    "train": {
+                        "episode_reward_mean": score,
+                        "episodes_since_metric_reset": 1,
+                    }
+                }
                 for slot, score in (("team-0", 1.0), ("team-1", 2.0))
             }
         )
@@ -171,27 +182,60 @@ def test_mixed_population_replacement_checkpoint_and_resume(
         )
         assert restored.runtime_member_ids == ids
         assert restored._current_hparams == hparams
-        restored.start()
+        snapshots = {}
+        make_member = restored._make_member
+
+        def check_before_start(slot, spec, **kwargs):
+            member = make_member(slot, spec, **kwargs)
+            try:
+                # Population.start creates every member before starting any of
+                # them. Check exact restore here: start intentionally schedules
+                # a learner tick using the budget preserved by the checkpoint.
+                assert member.state.value == "created"
+                assert member._pending_learner_tick is None
+                snapshot = _inspect(member, "cuda" if num_gpus else "cpu")
+                assert snapshot["state"] == "created"
+                assert snapshot["counters"] == saved[slot]["module_counters"]
+                assert snapshot["rng"] == saved[slot]["sampler_rng_states"]
+                assert_tree_close(
+                    snapshot["priorities"], saved[slot]["priority_states"]
+                )
+                for mid, learner in snapshot["learners"].items():
+                    assert_tree_close(
+                        learner,
+                        saved[slot]["adapters"][mid]["learner_group"]["learner"],
+                    )
+                snapshots[slot] = snapshot
+                return member
+            except BaseException:
+                # A failing factory has not yet registered this member for the
+                # population's normal cleanup.
+                member.stop(graceful=False)
+                raise
+
+        with monkeypatch.context() as patch:
+            patch.setattr(restored, "_make_member", check_before_start)
+            restored.start()
         assert (
             ray.get(restored.replay_actor.get_stats.remote()).cursor.mutation_seq
             == replay_state.mutation_seq
         )
-        snapshots = _placement_evidence(restored, request, "restored", num_gpus)
-        for slot, snapshot in snapshots.items():
-            assert snapshot["counters"] == saved[slot]["module_counters"]
-            assert snapshot["rng"] == saved[slot]["sampler_rng_states"]
-            assert_tree_close(snapshot["priorities"], saved[slot]["priority_states"])
-            for mid, learner in snapshot["learners"].items():
-                assert_tree_close(
-                    learner, saved[slot]["adapters"][mid]["learner_group"]["learner"]
-                )
-        _progress(restored)
+        _placement_evidence(snapshots, request, "restored", num_gpus)
+        continued = _progress(restored, after=saved)
+        assert all(
+            dict(counters)["optimizer_updates"]
+            > saved[slot]["module_counters"][mid]["optimizer_updates"]
+            for slot, member in continued["members"].items()
+            for mid, counters in member["learner"]["module_counters"]
+        )
         restored.stop(graceful=False)
 
         if not num_gpus:
             warm = PopulationAsyncSAC.from_warm_start_checkpoint(
-                mixed_specs(seed=700, manager_lr=5e-4), directory,
-                run_id="warm", pbt_config=mixed_pbt(),
+                mixed_specs(seed=700, manager_lr=5e-4),
+                directory,
+                run_id="warm",
+                pbt_config=mixed_pbt(),
             )
             warm.start()
             assert warm.runtime_member_ids != ids

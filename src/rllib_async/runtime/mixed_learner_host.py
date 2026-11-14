@@ -54,9 +54,7 @@ class MixedPBTModelState:
         if not isinstance(self.module_states, Mapping) or not self.module_states:
             raise ValueError("mixed PBT requires a complete module-state mapping")
         if any(
-            not isinstance(mid, str)
-            or not mid
-            or not isinstance(state, PBTModelState)
+            not isinstance(mid, str) or not mid or not isinstance(state, PBTModelState)
             for mid, state in self.module_states.items()
         ):
             raise ValueError("mixed PBT module states are invalid")

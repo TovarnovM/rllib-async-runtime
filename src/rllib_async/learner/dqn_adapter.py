@@ -324,9 +324,7 @@ class DQNLearnerAdapter(_LocalOffPolicyLearnerAdapter):
                 for module_id in config.algorithm_config_overrides_per_module
             ),
         )
-        self._c51_dueling = any(
-            item.dueling and item.num_atoms > 1 for item in configs
-        )
+        self._c51_dueling = any(item.dueling and item.num_atoms > 1 for item in configs)
 
     def get_state(self) -> dict[str, Any]:
         state = super().get_state()

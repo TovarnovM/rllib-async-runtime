@@ -43,7 +43,7 @@ jobs:
         run: >-
           timeout 900 uv run --locked --extra cpu --group dev
           python -m benchmarks.team_acceptance components
-          --sampling per --dqn-profile rainbow
+          --sampling per --dqn-profile rainbow --learning-length 1
           --output artifacts/stage3/components.json
 
       - name: Preregistered five-seed offline memory comparison

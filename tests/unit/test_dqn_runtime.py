@@ -56,13 +56,14 @@ def test_dqn_reuses_runtime_settings_and_tune_resources() -> None:
     assert resources.bundles
 
 
-def test_dqn_rejects_population_and_unsupported_modes_before_actor_creation() -> None:
+def test_dqn_runtime_validates_modes_before_actor_creation() -> None:
     with pytest.raises(ValueError, match="population"):
         AsyncDQNTrainable._parse_config({"dqn_config": make_dqn_config(), "member": {}})
-    with pytest.raises(ValueError, match="noisy"):
-        SingleMemberAsyncDQN(
-            make_dqn_config().training(noisy=True), AsyncRuntimeConfig()
-        )
+    noisy_runtime = SingleMemberAsyncDQN(
+        make_dqn_config().training(noisy=True), AsyncRuntimeConfig()
+    )
+    assert noisy_runtime._sac_config.noisy is True
+    assert noisy_runtime._sac_config.rl_module_spec.model_config["noisy"] is True
     with pytest.raises(ValueError, match="n_step=1"):
         SingleMemberAsyncDQN(make_dqn_config().training(n_step=3), AsyncRuntimeConfig())
     with pytest.raises(ValueError, match="n_step=1"):

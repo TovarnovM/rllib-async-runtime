@@ -6,6 +6,7 @@ import copy
 import json
 import pickle
 import random
+from dataclasses import asdict
 
 import gymnasium as gym
 import numpy as np
@@ -94,8 +95,8 @@ def _graph(index, *, terminal=False):
     if terminal:
         mask[:] = 0
     return {
-        "node_features": np.arange(count * 2, dtype=np.float32).reshape(-1, 2)
-        / 10 + index / 20,
+        "node_features": np.arange(count * 2, dtype=np.float32).reshape(-1, 2) / 10
+        + index / 20,
         "edge_index": np.asarray([range(count - 1), range(1, count)], dtype=np.int64),
         "controlled_node": 0,
         "action_mask": mask,
@@ -109,7 +110,9 @@ def _episode():
         rewards = tuple((index - tick) / 5 for tick in range(duration))
         rows.append(
             MultiModuleTransition(
-                env_t=index, agent_t=index, agent_id="agent",
+                env_t=index,
+                agent_t=index,
+                agent_id="agent",
                 module_id=DEFAULT_MODULE_ID,
                 data={
                     "obs": _graph(index),
@@ -130,11 +133,18 @@ def _episode():
     codec = RawMultiModuleEpisodeCodec()
     payload = codec.encode(rows)
     return EpisodeEnvelope(
-        episode_id="rainbow/runner/0/0", schema_version=codec.schema_version,
-        producer_member_id="rainbow", runner_id="runner", runner_generation=0,
-        local_episode_seq=0, behavior_versions={DEFAULT_MODULE_ID: 0},
-        env_steps=payload.env_steps, agent_steps=payload.transition_count,
-        terminated=True, truncated=False, estimated_bytes=payload.estimated_bytes,
+        episode_id="rainbow/runner/0/0",
+        schema_version=codec.schema_version,
+        producer_member_id="rainbow",
+        runner_id="runner",
+        runner_generation=0,
+        local_episode_seq=0,
+        behavior_versions={DEFAULT_MODULE_ID: 0},
+        env_steps=payload.env_steps,
+        agent_steps=payload.transition_count,
+        terminated=True,
+        truncated=False,
+        estimated_bytes=payload.estimated_bytes,
         payload=payload,
     )
 
@@ -197,7 +207,8 @@ def test_noisy_primitive_reset_eval_gradients_and_autograd_lifetime():
 def test_noisy_exploration_uses_masks_and_keeps_evaluation_deterministic(epsilon):
     torch.manual_seed(20)
     module = GraphDQNTorchRLModule(
-        observation_space=_graph_space(), action_space=gym.spaces.Discrete(3),
+        observation_space=_graph_space(),
+        action_space=gym.spaces.Discrete(3),
         model_config={**_model_config(noisy=True), "epsilon": epsilon},
     )
     with torch.no_grad():
@@ -239,7 +250,8 @@ def test_noisy_train_resets_once_and_shares_online_noise_for_double_q(monkeypatc
     observations = torch.tensor([[0.1, 0.3], [0.2, -0.4]])
     output = module.forward_train(
         {
-            Columns.OBS: observations, Columns.NEXT_OBS: observations,
+            Columns.OBS: observations,
+            Columns.NEXT_OBS: observations,
             Columns.TERMINATEDS: torch.zeros(2, dtype=torch.bool),
         }
     )
@@ -285,7 +297,8 @@ def test_c51_priority_is_unweighted_cross_entropy_of_projected_target(monkeypatc
     )
     spaces = {
         DEFAULT_MODULE_ID: (
-            gym.spaces.Box(-5, 5, (2,), dtype=np.float32), gym.spaces.Discrete(3)
+            gym.spaces.Box(-5, 5, (2,), dtype=np.float32),
+            gym.spaces.Discrete(3),
         )
     }
     with DQNLearnerAdapter(
@@ -322,8 +335,10 @@ def test_c51_priority_is_unweighted_cross_entropy_of_projected_target(monkeypatc
         }
         result = adapter.update(batch, sampled_env_steps=8, return_priority_errors=True)
         np.testing.assert_allclose(
-            result.priority_errors[DEFAULT_MODULE_ID], oracle["signal"],
-            rtol=1e-6, atol=1e-7,
+            result.priority_errors[DEFAULT_MODULE_ID],
+            oracle["signal"],
+            rtol=1e-6,
+            atol=1e-7,
         )
         logged = result.learner_results[0][DEFAULT_MODULE_ID]["qf_loss"]
         actual_loss = logged.peek() if hasattr(logged, "peek") else logged
@@ -335,7 +350,8 @@ def test_legacy_checkpoint_reject_is_limited_to_scalar_c51_value_head(dueling, a
     config = make_dqn_config().training(dueling=dueling, num_atoms=atoms)
     spaces = {
         DEFAULT_MODULE_ID: (
-            gym.spaces.Box(-5, 5, (2,), dtype=np.float32), gym.spaces.Discrete(3)
+            gym.spaces.Box(-5, 5, (2,), dtype=np.float32),
+            gym.spaces.Discrete(3),
         )
     }
     with DQNLearnerAdapter(
@@ -357,14 +373,17 @@ def test_legacy_checkpoint_reject_is_limited_to_scalar_c51_value_head(dueling, a
                 adapter.set_state(legacy)
         else:
             adapter.set_state(legacy)
-        assert_tree_close(adapter.get_state(), before)
+        after = adapter.get_state()
+        for state in (before, after):
+            state["latest_weights"] = asdict(state["latest_weights"])
+        assert_tree_close(after, before)
 
 
 def _update_priorities(sampler, sample, errors):
     offset = 0
     priorities = []
     for window in sample.windows:
-        priorities.append(np.max(np.abs(errors[offset:offset + window.valid_count])))
+        priorities.append(np.max(np.abs(errors[offset : offset + window.valid_count])))
         offset += window.valid_count
     assert offset == len(errors)
     sampler.update_priorities(sample.handles, priorities)
@@ -396,26 +415,38 @@ def test_rainbow_per_next_sample_and_update_after_restore(recurrent, gpus, reque
     )
     rng = random.Random(41)
     config = make_dqn_config().training(
-        double_q=True, dueling=True, num_atoms=1 if recurrent else 5,
-        n_step=3, noisy=True, sigma0=0.5, epsilon=0.0,
-        v_min=-4.0, v_max=4.0,
+        double_q=True,
+        dueling=True,
+        num_atoms=1 if recurrent else 5,
+        n_step=3,
+        noisy=True,
+        sigma0=0.5,
+        epsilon=0.0,
+        v_min=-4.0,
+        v_max=4.0,
     )
     config.learners(num_gpus_per_learner=gpus)
     config.rl_module(
         model_config={
-            "fcnet_hiddens": [8], "head_fcnet_hiddens": [8], "recurrent_hidden_dim": 7
+            "fcnet_hiddens": [8],
+            "head_fcnet_hiddens": [8],
+            "recurrent_hidden_dim": 7,
         },
         rl_module_spec=RLModuleSpec(
             module_class=RecurrentDQNTorchRLModule
-            if recurrent else GraphDQNTorchRLModule
+            if recurrent
+            else GraphDQNTorchRLModule
         ),
     )
     prepared = prepare_dqn_config(config)
     assert prepared.rl_module_spec.model_config["noisy"] is True
     spaces = {DEFAULT_MODULE_ID: (_graph_space(), gym.spaces.Discrete(3))}
     adapter = DQNLearnerAdapter(
-        config, spaces=spaces, member_id="rainbow",
-        publication_interval_updates=1, validate_startup=True,
+        config,
+        spaces=spaces,
+        member_id="rainbow",
+        publication_interval_updates=1,
+        validate_startup=True,
     )
     restored = None
 
@@ -456,8 +487,7 @@ def test_rainbow_per_next_sample_and_update_after_restore(recurrent, gpus, reque
                 if key.startswith(head) and "sigma_" in key
             )
         assert not any(
-            "epsilon" in key
-            for key in adapter.get_inference_state()[DEFAULT_MODULE_ID]
+            "epsilon" in key for key in adapter.get_inference_state()[DEFAULT_MODULE_ID]
         )
         expected_sample = sampler.sample(8, rng=rng)
         expected_batch = batch_for(expected_sample)
@@ -465,8 +495,11 @@ def test_rainbow_per_next_sample_and_update_after_restore(recurrent, gpus, reque
             expected_batch, sampled_env_steps=16, return_priority_errors=True
         )
         restored = DQNLearnerAdapter(
-            config, spaces=spaces, member_id="rainbow",
-            publication_interval_updates=1, validate_startup=True,
+            config,
+            spaces=spaces,
+            member_id="rainbow",
+            publication_interval_updates=1,
+            validate_startup=True,
         )
         restored.set_state(copy.deepcopy(learner_checkpoint))
         restored_devices = assert_learner_parameter_devices(
@@ -495,7 +528,9 @@ def test_rainbow_per_next_sample_and_update_after_restore(recurrent, gpus, reque
         assert_finite_losses(actual.learner_results)
         np.testing.assert_allclose(
             actual.priority_errors[DEFAULT_MODULE_ID],
-            expected.priority_errors[DEFAULT_MODULE_ID], rtol=1e-6, atol=1e-7,
+            expected.priority_errors[DEFAULT_MODULE_ID],
+            rtol=1e-6,
+            atol=1e-7,
         )
         expected_state = adapter.get_state()["learner_group"]["learner"]
         actual_state = restored.get_state()["learner_group"]["learner"]

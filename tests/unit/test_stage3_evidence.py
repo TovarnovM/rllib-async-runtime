@@ -9,7 +9,9 @@ from benchmarks.validate_dqn_gpu import validate_junit
 
 def _junit(path, *, marker=None, device="cuda:0"):
     suite = ET.Element("testsuite")
-    case = ET.SubElement(suite, "testcase", classname="tests.unit.test_gate", name="test_gate[gpu]")
+    case = ET.SubElement(
+        suite, "testcase", classname="tests.unit.test_gate", name="test_gate[gpu]"
+    )
     props = ET.SubElement(case, "properties")
     ET.SubElement(props, "property", name="parameter_devices", value=device)
     if marker is not None:
@@ -32,13 +34,52 @@ def test_gpu_evidence_does_not_accept_skips_or_failed_cases(tmp_path, marker):
     path = tmp_path / "results.xml"
     _junit(path, marker=marker)
     with pytest.raises(ValueError, match="JUnit coverage failed"):
-        validate_junit(path, {"tests/unit/test_gate.py::test_gate[gpu]"}, require_devices=True)
+        validate_junit(
+            path, {"tests/unit/test_gate.py::test_gate[gpu]"}, require_devices=True
+        )
 
 
 def test_gpu_evidence_rejects_cpu_fallback_and_missing_matrix_point(tmp_path):
     path = tmp_path / "results.xml"
     _junit(path, device="cpu")
     with pytest.raises(ValueError, match="CUDA parameter-device"):
-        validate_junit(path, {"tests/unit/test_gate.py::test_gate[gpu]"}, require_devices=True)
+        validate_junit(
+            path, {"tests/unit/test_gate.py::test_gate[gpu]"}, require_devices=True
+        )
     with pytest.raises(ValueError, match="JUnit coverage failed"):
-        validate_junit(path, {"tests/unit/test_other.py::test_gate[gpu]"}, require_devices=False)
+        validate_junit(
+            path, {"tests/unit/test_other.py::test_gate[gpu]"}, require_devices=False
+        )
+
+
+@pytest.mark.parametrize(
+    "sampling, length, accepted",
+    [("per", 5, False), ("per", 1, True), ("uniform", 5, True)],
+)
+def test_exact_position_benchmark_handles_per_window_credit(
+    monkeypatch, capsys, sampling, length, accepted
+):
+    from benchmarks.team_acceptance import parse_args
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "team_acceptance",
+            "components",
+            "--sampling",
+            sampling,
+            "--learning-length",
+            str(length),
+            "--output",
+            "unused.json",
+        ],
+    )
+    if accepted:
+        args = parse_args()
+        assert args.sampling == sampling
+        assert args.learning_length == length
+    else:
+        with pytest.raises(SystemExit) as error:
+            parse_args()
+        assert error.value.code == 2
+        assert "retain residual credit" in capsys.readouterr().err

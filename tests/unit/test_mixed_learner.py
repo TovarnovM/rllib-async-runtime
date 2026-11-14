@@ -388,9 +388,10 @@ def test_mixed_pbt_transfers_targets_and_alpha_with_fresh_optimizer_priorities_r
                 == clock["optimizer_updates"]
                 == 0
             )
-            assert recipient._samplers[mid].getstate() == random.Random(
-                19 + index
-            ).getstate()
+            assert (
+                recipient._samplers[mid].getstate()
+                == random.Random(19 + index).getstate()
+            )
             state = recipient._prioritized_samplers[mid].get_state()
             assert state["max_priority"] == 1.0
             assert all(entry is None or entry[2] == 1.0 for entry in state["entries"])
