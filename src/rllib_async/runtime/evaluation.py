@@ -12,13 +12,13 @@ from typing import Any
 import numpy as np
 import ray
 from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
-from ray.rllib.core import DEFAULT_MODULE_ID
 from ray.util import get_current_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from rllib_async.protocols import (
     FlatEpisodeCodec,
     FrozenVersions,
+    MultiModuleEpisodeCodec,
     WeightsDescriptor,
 )
 from rllib_async.rollout import EpisodeRolloutActor
@@ -26,6 +26,7 @@ from rllib_async.rollout.episode_runner import (
     EpisodeRolloutSummary,
     accept_weight_publication,
 )
+from rllib_async.rollout.group import rollout_module_ids
 
 EVALUATION_GROUP_CHECKPOINT_VERSION = 1
 
@@ -84,7 +85,7 @@ class AsyncEvaluationGroup:
     def __init__(
         self,
         config: AlgorithmConfig,
-        codec: FlatEpisodeCodec,
+        codec: FlatEpisodeCodec | MultiModuleEpisodeCodec,
         *,
         member_id: str,
         initial_weights: WeightsDescriptor,
@@ -99,8 +100,7 @@ class AsyncEvaluationGroup:
             raise RuntimeError("Ray must be initialized before AsyncEvaluationGroup")
         if not isinstance(config, AlgorithmConfig):
             raise TypeError("config must be an AlgorithmConfig")
-        if not isinstance(codec, FlatEpisodeCodec):
-            raise TypeError("AsyncEvaluationGroup requires FlatEpisodeCodec")
+        self._module_ids = rollout_module_ids(config, codec)
         if (
             not isinstance(episode_count, int)
             or isinstance(episode_count, bool)
@@ -124,7 +124,7 @@ class AsyncEvaluationGroup:
             None,
             initial_weights,
             member_id=member_id,
-            module_ids={DEFAULT_MODULE_ID},
+            module_ids=self._module_ids,
         )
 
         self._config = config.copy(copy_frozen=False)
@@ -210,7 +210,7 @@ class AsyncEvaluationGroup:
             self._latest_weights,
             weights,
             member_id=self._member_id,
-            module_ids={DEFAULT_MODULE_ID},
+            module_ids=self._module_ids,
         )
         current_versions = self._latest_weights.module_versions
         candidate_versions = weights.module_versions

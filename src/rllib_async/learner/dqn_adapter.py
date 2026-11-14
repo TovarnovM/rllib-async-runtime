@@ -24,6 +24,7 @@ from rllib_async.learner.sac_adapter import (
     LearnerUpdateResult,
     SACBatchError,
     _LocalOffPolicyLearnerAdapter,
+    _SelectedModuleUpdates,
     build_rllib_multi_module_sac_batch,
     build_rllib_sac_batch,
 )
@@ -69,10 +70,10 @@ def validate_dqn_config(
         if (
             not isinstance(module_config.n_step, int)
             or isinstance(module_config.n_step, bool)
-            or module_config.n_step != 1
+            or module_config.n_step < 1
         ):
             raise ValueError(
-                "DQN supports n_step=1 until replay constructs n-step targets"
+                "DQN n_step must be a positive integer"
             )
         if module_config.noisy:
             raise ValueError("noisy DQN is not supported by the pinned RLlib module")
@@ -147,7 +148,7 @@ def prepare_dqn_config(config: DQNConfig) -> DQNConfig:
     return prepared
 
 
-class CheckpointableDQNTorchLearner(DQNTorchLearner):
+class CheckpointableDQNTorchLearner(_SelectedModuleUpdates, DQNTorchLearner):
     """Serialize the target-update cursor omitted by RLlib 2.56.1."""
 
     def get_state(
@@ -200,10 +201,6 @@ def _validate_dqn_columns(
             raise DQNBatchError("DQN actions must be a one-dimensional integer array")
         sample[Columns.ACTIONS] = np.ascontiguousarray(actions, dtype=np.int64)
         if validate:
-            if np.any(sample["n_step"] != 1):
-                raise DQNBatchError(
-                    "DQN replay must supply one-step transitions (n_step=1)"
-                )
             if np.any(actions < 0) or (
                 action_spaces is not None
                 and np.any(actions >= action_spaces[module_id].n)
@@ -276,6 +273,7 @@ class DQNLearnerAdapter(_LocalOffPolicyLearnerAdapter):
         publication_interval_updates: int,
         learning_starts_satisfied: bool = False,
         validate_startup: bool = False,
+        publish_updates: bool = True,
     ) -> None:
         validate_dqn_config(config, spaces=spaces)
         self._action_spaces = {
@@ -290,6 +288,7 @@ class DQNLearnerAdapter(_LocalOffPolicyLearnerAdapter):
             publication_interval_updates=publication_interval_updates,
             learning_starts_satisfied=learning_starts_satisfied,
             validate_startup=validate_startup,
+            publish_updates=publish_updates,
         )
 
     def _build_batch(

@@ -23,10 +23,15 @@ from ray.rllib.core import (
     DEFAULT_MODULE_ID,
 )
 from ray.rllib.core.columns import Columns
+from ray.rllib.core.learner.utils import update_target_network
+from ray.rllib.core.rl_module.apis import TargetNetworkAPI
 from ray.rllib.policy.sample_batch import MultiAgentBatch, SampleBatch
 from ray.rllib.utils.metrics import (
+    LAST_TARGET_UPDATE_TS,
+    LR_KEY,
     NUM_AGENT_STEPS_SAMPLED_LIFETIME,
     NUM_ENV_STEPS_SAMPLED_LIFETIME,
+    NUM_TARGET_UPDATES,
     WEIGHTS_SEQ_NO,
 )
 
@@ -46,7 +51,7 @@ _REQUIRED_BATCH_COLUMNS = (
     Columns.TERMINATEDS,
     Columns.TRUNCATEDS,
 )
-_OPTIONAL_BATCH_COLUMNS = ("n_step", "weights")
+_OPTIONAL_BATCH_COLUMNS = ("n_step", "weights", "recurrent", "decision_horizons")
 _ALLOWED_BATCH_COLUMNS = frozenset((*_REQUIRED_BATCH_COLUMNS, *_OPTIONAL_BATCH_COLUMNS))
 _CONFIG_CONTRACT_FIELDS = (
     "actor_lr",
@@ -127,7 +132,53 @@ class LearnerUpdateResult:
 SACUpdateResult = LearnerUpdateResult
 
 
-class CheckpointableSACTorchLearner(SACTorchLearner):
+class _SelectedModuleUpdates:
+    """Keep RLlib's LR/target hooks on the modules that actually trained.
+
+    The pinned DQN base hook visits every module, even for a partial batch.
+    Both SAC and DQN use the same supported target-network and LR APIs here.
+    """
+
+    def after_gradient_based_update(self, *, timesteps: dict[str, Any]) -> None:
+        selected = timesteps.get("rllib_async_updated_modules")
+        if selected is None:
+            super().after_gradient_based_update(timesteps=timesteps)
+            return
+        timestep = timesteps.get(NUM_ENV_STEPS_SAMPLED_LIFETIME, 0)
+        for module_id in selected:
+            for optimizer_name in self._module_optimizers.get(module_id, ()):
+                optimizer = self._named_optimizers[optimizer_name]
+                schedule = self._optimizer_lr_schedules.get(optimizer)
+                if schedule is not None:
+                    self._set_optimizer_lr(
+                        optimizer, lr=schedule.update(timestep=timestep)
+                    )
+                self.metrics.log_value(
+                    key=(module_id, f"{optimizer_name[len(module_id) + 1:]}_{LR_KEY}"),
+                    reduce="mean",
+                    value=self._get_optimizer_lr(optimizer),
+                )
+            module = self.module[module_id].unwrapped()
+            config = self.config.get_config_for_module(module_id)
+            if (
+                isinstance(module, TargetNetworkAPI)
+                and timestep - self.last_update_ts_by_mid[module_id]
+                >= config.target_network_update_freq
+            ):
+                for main_net, target_net in module.get_target_network_pairs():
+                    update_target_network(
+                        main_net=main_net, target_net=target_net, tau=config.tau
+                    )
+                self.last_update_ts_by_mid[module_id] = timestep
+                self.metrics.log_value(
+                    (module_id, NUM_TARGET_UPDATES), 1, reduce="lifetime_sum"
+                )
+                self.metrics.log_value(
+                    (module_id, LAST_TARGET_UPDATE_TS), timestep, reduce="max"
+                )
+
+
+class CheckpointableSACTorchLearner(_SelectedModuleUpdates, SACTorchLearner):
     """Add the SAC state omitted by RLlib 2.56.1 checkpoints.
 
     SAC loss, gradients, optimizers, and target updates remain implemented by
@@ -254,9 +305,10 @@ def _build_sac_sample_batch(
     columns: dict[str, Any] = {}
     observations = batch[Columns.OBS]
     next_observations = batch[Columns.NEXT_OBS]
-    graph_observations = isinstance(observations, Mapping)
-    if graph_observations != isinstance(next_observations, Mapping):
+    mapped_observations = isinstance(observations, Mapping)
+    if mapped_observations != isinstance(next_observations, Mapping):
         raise SACBatchError("'obs' and 'new_obs' must use the same representation")
+    graph_observations = mapped_observations and "node_features" in observations
     if graph_observations:
         try:
             packed_observations = validate_packed_graph_batch(observations)
@@ -272,6 +324,13 @@ def _build_sac_sample_batch(
         )
         columns[Columns.OBS] = packed_observations
         columns[Columns.NEXT_OBS] = packed_next_observations
+    elif mapped_observations:
+        current, batch_size = _validate_observation_mapping(observations)
+        following, next_size = _validate_observation_mapping(next_observations)
+        if batch_size != next_size or set(current) != set(following):
+            raise SACBatchError("'obs' and 'new_obs' mappings must have matching keys/counts")
+        columns[Columns.OBS] = current
+        columns[Columns.NEXT_OBS] = following
     else:
         observations_array = _required_batch_array(
             observations,
@@ -338,7 +397,66 @@ def _build_sac_sample_batch(
         raise SACBatchError("column 'weights' must contain finite non-negative scalars")
     columns["weights"] = np.ascontiguousarray(weights, dtype=np.float32)
 
+    if "recurrent" in batch:
+        columns["recurrent"] = _validate_recurrent_metadata(batch["recurrent"], batch_size)
+    if "decision_horizons" in batch:
+        horizons = np.asarray(batch["decision_horizons"])
+        if horizons.shape != (batch_size,) or horizons.dtype.kind not in "iu" or np.any(horizons < 1):
+            raise SACBatchError("decision_horizons must contain one positive integer per loss row")
+        columns["decision_horizons"] = np.ascontiguousarray(horizons, dtype=np.int64)
+
     return SampleBatch(columns)
+
+
+def _validate_observation_mapping(observations: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
+    if not observations:
+        raise SACBatchError("observation mappings must not be empty")
+    columns = {}
+    lengths = set()
+    for name, value in observations.items():
+        if isinstance(value, Mapping):
+            columns[name], count = _validate_observation_mapping(value)
+        else:
+            columns[name] = _required_batch_array(value, name=name)
+            count = len(columns[name])
+        lengths.add(count)
+    if len(lengths) != 1:
+        raise SACBatchError("observation mapping fields must have the same batch dimension")
+    return columns, lengths.pop()
+
+
+def _validate_recurrent_metadata(raw: object, batch_size: int) -> Mapping[str, Any]:
+    required = {"obs", "seq_lens", "prefix_lens", "current_indices", "next_indices"}
+    if not isinstance(raw, Mapping) or set(raw) != required:
+        raise SACBatchError("recurrent metadata has invalid columns")
+    lengths = np.asarray(raw["seq_lens"])
+    prefixes = np.asarray(raw["prefix_lens"])
+    if lengths.ndim != 1 or not len(lengths) or lengths.dtype.kind not in "iu" or np.any(lengths < 1):
+        raise SACBatchError("recurrent seq_lens must contain positive integers")
+    if prefixes.shape != lengths.shape or prefixes.dtype.kind not in "iu" or np.any(prefixes < 0) or np.any(prefixes >= lengths):
+        raise SACBatchError("recurrent prefix_lens are outside their histories")
+    observations = raw["obs"]
+    if isinstance(observations, Mapping) and "graph_ptr" in observations:
+        history_count = len(observations["graph_ptr"]) - 1
+    elif isinstance(observations, Mapping):
+        _, history_count = _validate_observation_mapping(observations)
+    else:
+        history_count = len(_required_batch_array(observations, name="recurrent obs"))
+    if int(lengths.sum()) != history_count:
+        raise SACBatchError("recurrent history lengths do not match observations")
+    indices = []
+    for name in ("current_indices", "next_indices"):
+        value = np.asarray(raw[name])
+        if value.shape != (batch_size,) or value.dtype.kind not in "iu" or np.any(value < 0) or np.any(value >= history_count):
+            raise SACBatchError(f"recurrent {name} is outside its history")
+        indices.append(value)
+    ends = np.cumsum(lengths)
+    current_history = np.searchsorted(ends, indices[0], side="right")
+    next_history = np.searchsorted(ends, indices[1], side="right")
+    starts = np.concatenate(([0], ends[:-1]))
+    if np.any(current_history != next_history) or np.any(indices[1] <= indices[0]) or np.any(indices[0] < starts[current_history] + prefixes[current_history]):
+        raise SACBatchError("recurrent loss/target indices cross prefix or agent boundaries")
+    return raw
 
 
 def _required_batch_array(value: object, *, name: str) -> np.ndarray:
@@ -429,10 +547,14 @@ class _LocalOffPolicyLearnerAdapter:
         publication_interval_updates: int,
         learning_starts_satisfied: bool = False,
         validate_startup: bool = False,
+        publish_updates: bool = True,
     ) -> None:
         if not isinstance(validate_startup, bool):
             raise TypeError("validate_startup must be a bool")
         self._validate_next_batch = validate_startup
+        if not isinstance(publish_updates, bool):
+            raise TypeError("publish_updates must be a bool")
+        self._publish_updates = publish_updates
         if not isinstance(config, self._config_type):
             raise TypeError(f"config must be a {self._config_type.__name__}")
         if not isinstance(member_id, str) or not member_id:
@@ -560,12 +682,13 @@ class _LocalOffPolicyLearnerAdapter:
                 sampled_agent_steps=sampled_agent_steps,
             )
         rllib_batch = self._build_batch(batch, validate=self._validate_next_batch)
-        self._validate_next_batch = False
-        return self._perform_update(
+        update = self._perform_update(
             rllib_batch,
             sampled_env_steps=sampled_env_steps,
             sampled_agent_steps=sampled_agent_steps,
         )
+        self._validate_next_batch = False
+        return update
 
     def update_modules(
         self,
@@ -574,22 +697,22 @@ class _LocalOffPolicyLearnerAdapter:
         sampled_env_steps: int,
         sampled_agent_steps: int,
     ) -> LearnerUpdateResult:
-        """Update every configured module from its own sampled batch view."""
+        """Update a non-empty subset without advancing untouched module hooks."""
 
         self._require_open()
-        if not isinstance(batches, Mapping) or not batches:
+        if not isinstance(batches, Mapping):
             raise self._batch_error(
                 f"multi-module {self._algorithm} batches must be a non-empty mapping"
             )
-        if set(batches) != set(self._module_versions):
+        if not set(batches).issubset(self._module_versions):
             raise self._batch_error(
-                "multi-module batch IDs must match the learner module IDs"
+                "multi-module batch IDs must belong to the learner module IDs"
             )
         sampled_agent_steps, should_update = self._begin_update(
             sampled_env_steps=sampled_env_steps,
             sampled_agent_steps=sampled_agent_steps,
         )
-        if not should_update:
+        if not should_update or not batches:
             return self._skipped_update_result(
                 sampled_env_steps=sampled_env_steps,
                 sampled_agent_steps=sampled_agent_steps,
@@ -597,12 +720,13 @@ class _LocalOffPolicyLearnerAdapter:
         rllib_batch = self._build_multi_module_batch(
             batches, validate=self._validate_next_batch
         )
-        self._validate_next_batch = False
-        return self._perform_update(
+        update = self._perform_update(
             rllib_batch,
             sampled_env_steps=sampled_env_steps,
             sampled_agent_steps=sampled_agent_steps,
         )
+        self._validate_next_batch = False
+        return update
 
     def _begin_update(
         self,
@@ -648,10 +772,11 @@ class _LocalOffPolicyLearnerAdapter:
             timesteps={
                 NUM_ENV_STEPS_SAMPLED_LIFETIME: sampled_env_steps,
                 NUM_AGENT_STEPS_SAMPLED_LIFETIME: sampled_agent_steps,
+                "rllib_async_updated_modules": tuple(learner_batch.policy_batches),
             },
         )
         self._learner_updates += 1
-        published_weights = self.maybe_publish_weights()
+        published_weights = self.maybe_publish_weights() if self._publish_updates else None
         return LearnerUpdateResult(
             performed=True,
             learner_updates=self._learner_updates,
@@ -711,6 +836,12 @@ class _LocalOffPolicyLearnerAdapter:
         self._require_open()
         return self._latest_weights
 
+    def get_inference_state(self) -> Mapping[str, Any]:
+        """Copy current inference state for an atomic multi-learner bundle."""
+
+        self._require_open()
+        return self._get_inference_module_state()
+
     def get_state(self) -> dict[str, Any]:
         """Return a complete in-memory member checkpoint."""
 
@@ -729,6 +860,7 @@ class _LocalOffPolicyLearnerAdapter:
             "state_version": SAC_ADAPTER_STATE_VERSION,
             "member_id": self._member_id,
             "publication_interval_updates": self._publication_interval_updates,
+            "publish_updates": self._publish_updates,
             "learning_starts": self._learning_starts,
             "learning_starts_satisfied": self._learning_starts_satisfied,
             "config_contract": copy.deepcopy(self._config_contract),
@@ -760,6 +892,8 @@ class _LocalOffPolicyLearnerAdapter:
             != self._publication_interval_updates
         ):
             raise ValueError("checkpoint publication interval does not match")
+        if state.get("publish_updates", True) != self._publish_updates:
+            raise ValueError("checkpoint publication ownership does not match")
         if state.get("learning_starts") != self._learning_starts:
             raise ValueError("checkpoint learning-start threshold does not match")
         learning_starts_satisfied = state.get("learning_starts_satisfied")
@@ -1077,6 +1211,7 @@ class SACLearnerAdapter(_LocalOffPolicyLearnerAdapter):
         publication_interval_updates: int,
         learning_starts_satisfied: bool = False,
         validate_startup: bool = False,
+        publish_updates: bool = True,
     ) -> None:
         for module_id, (observation_space, action_space) in spaces.items():
             if (
@@ -1102,6 +1237,7 @@ class SACLearnerAdapter(_LocalOffPolicyLearnerAdapter):
             publication_interval_updates=publication_interval_updates,
             learning_starts_satisfied=learning_starts_satisfied,
             validate_startup=validate_startup,
+            publish_updates=publish_updates,
         )
 
     @staticmethod

@@ -42,6 +42,8 @@ class EpisodeRolloutMetrics:
     episode_return: float
     env_steps: int
     agent_steps: int
+    module_steps: tuple[tuple[str, int], ...] = ()
+    world_steps: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -63,6 +65,25 @@ class EpisodeRolloutMetrics:
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.module_steps:
+            counts = dict(self.module_steps)
+            if len(counts) != len(self.module_steps) or any(
+                not isinstance(module_id, str)
+                or not module_id
+                or not isinstance(count, int)
+                or isinstance(count, bool)
+                or count < 0
+                for module_id, count in self.module_steps
+            ):
+                raise ValueError("module_steps must contain unique module counts")
+            if sum(counts.values()) != self.agent_steps:
+                raise ValueError("module_steps must sum to agent_steps")
+        if self.world_steps is not None and (
+            not isinstance(self.world_steps, int)
+            or isinstance(self.world_steps, bool)
+            or self.world_steps < 1
+        ):
+            raise ValueError("world_steps must be a positive integer or None")
 
 
 @dataclass(frozen=True, slots=True)

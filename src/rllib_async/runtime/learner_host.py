@@ -124,6 +124,7 @@ class LearnerHostStats:
     batch_producer: BatchProducerStats
     node_id: str = ""
     accelerator_ids: tuple[str, ...] = ()
+    module_counters: tuple[tuple[str, tuple[tuple[str, int | float | bool], ...]], ...] = ()
 
 
 class LearnerHost:
@@ -525,18 +526,27 @@ class LearnerHost:
         self._next_sync_at = time.monotonic() + self._sync_interval_s
         self._sync_has_more = delta.has_more
         if delta.full_resync_required:
+            previous_ids = set(self._fast_replay.episode_ids)
             snapshot = ray.get(self._replay_actor.get_snapshot.remote())
             if not isinstance(snapshot, ReplaySnapshot):
                 raise LearnerHostError("replay actor returned an invalid snapshot")
             self._fast_replay.load_snapshot(snapshot)
+            self._record_replay_ingestion(
+                tuple(ep for ep in snapshot.episodes if ep.episode_id not in previous_ids)
+            )
             self._snapshot_loads += 1
             self._full_resyncs += 1
             self._sync_has_more = False
             return 0, False
         self._fast_replay.apply_delta(delta)
+        if delta.transactions:
+            self._record_replay_ingestion(tuple(tx.added for tx in delta.transactions))
         transaction_count = len(delta.transactions)
         self._delta_transactions += transaction_count
         return transaction_count, delta.has_more
+
+    def _record_replay_ingestion(self, episodes: tuple[Any, ...]) -> None:
+        """Mixed consumers account for new local data at this sync boundary."""
 
     def _consume_available_batches(
         self,
@@ -787,7 +797,13 @@ class LearnerHostActor:
         self._accelerator_ids = tuple(
             str(value) for value in context.get_accelerator_ids().get("GPU", ())
         )
-        self._host = LearnerHost(*args, **kwargs)
+        config = args[0] if args else kwargs.get("config")
+        if isinstance(config, Mapping):
+            from rllib_async.runtime.mixed_learner_host import MixedLearnerHost
+
+            self._host = MixedLearnerHost(*args, **kwargs)
+        else:
+            self._host = LearnerHost(*args, **kwargs)
 
     def start(self) -> None:
         self._host.start()

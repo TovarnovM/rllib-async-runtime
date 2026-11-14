@@ -35,6 +35,12 @@ from rllib_async.replay.reference import (
     ReplayError,
     SnapshotTooLargeError,
 )
+from rllib_async.replay.sequences import (
+    SequenceBatchCollator,
+    SequenceConfig,
+    SequenceWindow,
+    collate_sequences,
+)
 
 __all__ = [
     "BatchCollationError",
@@ -63,5 +69,9 @@ __all__ = [
     "ReplayCheckpointError",
     "ReplayClosedError",
     "ReplayError",
+    "SequenceBatchCollator",
+    "SequenceConfig",
+    "SequenceWindow",
     "SnapshotTooLargeError",
+    "collate_sequences",
 ]

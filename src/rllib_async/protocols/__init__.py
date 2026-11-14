@@ -13,7 +13,10 @@ from rllib_async.protocols.episodes import (
     MultiModuleEpisodeCodec,
     MultiModuleEpisodePayload,
     MultiModuleTransition,
+    RawMultiModuleEpisodeCodec,
+    RawMultiModuleEpisodePayload,
     SchemaMismatchError,
+    SequenceEpisodeCodec,
 )
 from rllib_async.protocols.replay import (
     CommitAck,
@@ -40,6 +43,8 @@ __all__ = [
     "MultiModuleEpisodeCodec",
     "MultiModuleEpisodePayload",
     "MultiModuleTransition",
+    "RawMultiModuleEpisodeCodec",
+    "RawMultiModuleEpisodePayload",
     "ReplayCheckpoint",
     "ReplayCursor",
     "ReplayDelta",
@@ -47,5 +52,6 @@ __all__ = [
     "ReplayStats",
     "ReplayTransaction",
     "SchemaMismatchError",
+    "SequenceEpisodeCodec",
     "WeightsDescriptor",
 ]

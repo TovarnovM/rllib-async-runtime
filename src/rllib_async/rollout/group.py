@@ -24,8 +24,10 @@ from rllib_async.protocols import (
     EpisodeEnvelope,
     FlatEpisodeCodec,
     FrozenVersions,
+    MultiModuleEpisodeCodec,
     WeightsDescriptor,
 )
+from rllib_async.protocols.episodes import RawMultiModuleEpisodeCodec
 from rllib_async.rollout.episode_runner import (
     EpisodeMetadata,
     EpisodeRolloutMetrics,
@@ -37,6 +39,18 @@ from rllib_async.rollout.episode_runner import (
 )
 
 ROLLOUT_GROUP_CHECKPOINT_VERSION = 1
+
+
+def rollout_module_ids(
+    config: AlgorithmConfig, codec: FlatEpisodeCodec | MultiModuleEpisodeCodec
+) -> set[str]:
+    """Resolve the same publication contract for training and evaluation actors."""
+
+    if isinstance(codec, MultiModuleEpisodeCodec):
+        return set(config.policies)
+    if isinstance(codec, FlatEpisodeCodec):
+        return {DEFAULT_MODULE_ID}
+    raise TypeError("rollout requires FlatEpisodeCodec or MultiModuleEpisodeCodec")
 
 
 class RolloutGroupError(RuntimeError):
@@ -107,6 +121,8 @@ class RolloutGroupStats:
     episode_time_ms_p95: float
     policy_version_lag_p50: float
     policy_version_lag_p95: float
+    module_steps: tuple[tuple[str, int], ...] = ()
+    world_steps: int = 0
 
 
 @ray.remote(max_concurrency=1)
@@ -116,7 +132,7 @@ class EpisodeRolloutActor:
     def __init__(
         self,
         config: AlgorithmConfig,
-        codec: FlatEpisodeCodec,
+        codec: FlatEpisodeCodec | MultiModuleEpisodeCodec,
         *,
         member_id: str,
         runner_id: str,
@@ -125,7 +141,16 @@ class EpisodeRolloutActor:
         initial_weights: WeightsDescriptor,
         worker_index: int,
     ) -> None:
-        self._runner = EpisodeRunner(
+        runner_type = EpisodeRunner
+        runner_kwargs = {}
+        if isinstance(codec, MultiModuleEpisodeCodec):
+            from rllib_async.rollout.multi_module import MultiModuleEpisodeRunner
+
+            runner_type = MultiModuleEpisodeRunner
+            runner_kwargs["module_ids"] = tuple(initial_weights.module_versions)
+        self._temporal = isinstance(codec, RawMultiModuleEpisodeCodec)
+        self._multi_module = isinstance(codec, MultiModuleEpisodeCodec)
+        self._runner = runner_type(
             config,
             codec,
             member_id=member_id,
@@ -134,6 +159,7 @@ class EpisodeRolloutActor:
             max_episode_steps=max_episode_steps,
             initial_weights=initial_weights,
             worker_index=worker_index,
+            **runner_kwargs,
         )
 
     def collect_episode(
@@ -151,10 +177,14 @@ class EpisodeRolloutActor:
         *,
         explore: bool = True,
         sampled_env_steps: int | None = None,
+        sampled_module_steps: Mapping[str, int] | None = None,
     ) -> tuple[EpisodeEnvelope, EpisodeRolloutSummary]:
-        result = self._runner.collect_episode(
-            weights, explore=explore, sampled_env_steps=sampled_env_steps
-        )
+        clocks = {}
+        if self._temporal:
+            clocks["sampled_module_steps"] = sampled_module_steps
+        elif not self._multi_module:
+            clocks["sampled_env_steps"] = sampled_env_steps
+        result = self._runner.collect_episode(weights, explore=explore, **clocks)
         return result.episode, EpisodeRolloutSummary.from_result(result)
 
     def evaluate(
@@ -182,7 +212,7 @@ class AsyncRolloutGroup:
     def __init__(
         self,
         config: AlgorithmConfig,
-        codec: FlatEpisodeCodec,
+        codec: FlatEpisodeCodec | MultiModuleEpisodeCodec,
         replay_actor: Any,
         *,
         member_id: str,
@@ -202,8 +232,7 @@ class AsyncRolloutGroup:
             raise RuntimeError("Ray must be initialized before AsyncRolloutGroup")
         if not isinstance(config, AlgorithmConfig):
             raise TypeError("config must be an AlgorithmConfig")
-        if not isinstance(codec, FlatEpisodeCodec):
-            raise TypeError("Phase 5 AsyncRolloutGroup requires FlatEpisodeCodec")
+        self._module_ids = rollout_module_ids(config, codec)
         make_episode_id(member_id, "runner-0", 0, 0)
         if (
             not isinstance(runner_count, int)
@@ -257,7 +286,7 @@ class AsyncRolloutGroup:
             None,
             initial_weights,
             member_id=member_id,
-            module_ids={DEFAULT_MODULE_ID},
+            module_ids=self._module_ids,
         )
 
         self._config = config.copy(copy_frozen=False)
@@ -275,9 +304,12 @@ class AsyncRolloutGroup:
         self._num_cpus_per_runner = float(num_cpus_per_runner)
         self._placement_group_bundle_start = placement_group_bundle_start
         self._explore = explore
-        self._member_exploration_clock = isinstance(config, DQNConfig) and (
-            not isinstance(config, SACConfig)
+        self._member_exploration_clock = (
+            isinstance(config, DQNConfig)
+            and not isinstance(config, SACConfig)
+            and isinstance(codec, FlatEpisodeCodec)
         )
+        self._module_exploration_clocks = isinstance(codec, RawMultiModuleEpisodeCodec)
         self._state = RolloutGroupState.CREATED
         self._runners: dict[str, Any] = {}
         self._runner_weight_versions: dict[str, FrozenVersions] = {}
@@ -295,6 +327,8 @@ class AsyncRolloutGroup:
         self._duplicate_commits = 0
         self._env_steps = 0
         self._agent_steps = 0
+        self._module_steps = dict.fromkeys(sorted(self._module_ids), 0)
+        self._world_steps = 0
         self._sample_calls_started = 0
         self._sample_failures = 0
         self._commit_failures = 0
@@ -398,7 +432,7 @@ class AsyncRolloutGroup:
             self._latest_weights,
             weights,
             member_id=self._member_id,
-            module_ids={DEFAULT_MODULE_ID},
+            module_ids=self._module_ids,
         ):
             return False
         self._latest_weights_ref = ray.put(weights)
@@ -496,6 +530,16 @@ class AsyncRolloutGroup:
         return self._agent_steps
 
     @property
+    def module_steps(self) -> dict[str, int]:
+        """Completed real decisions; in-flight episodes are intentionally absent."""
+
+        return dict(self._module_steps)
+
+    @property
+    def world_steps(self) -> int:
+        return self._world_steps
+
+    @property
     def pending_sample_calls(self) -> int:
         return len(self._pending_samples)
 
@@ -568,6 +612,8 @@ class AsyncRolloutGroup:
             episode_time_ms_p95=self._percentile(self._episode_times_ms, 95),
             policy_version_lag_p50=self._percentile(self._policy_lags, 50),
             policy_version_lag_p95=self._percentile(self._policy_lags, 95),
+            module_steps=tuple(self._module_steps.items()),
+            world_steps=self._world_steps,
         )
 
     def reset_reward_metrics(self) -> None:
@@ -599,6 +645,8 @@ class AsyncRolloutGroup:
             "duplicate_commits": self._duplicate_commits,
             "env_steps": self._env_steps,
             "agent_steps": self._agent_steps,
+            "module_steps": dict(self._module_steps),
+            "world_steps": self._world_steps,
             "sample_calls_started": self._sample_calls_started,
             "sample_failures": self._sample_failures,
             "commit_failures": self._commit_failures,
@@ -683,6 +731,33 @@ class AsyncRolloutGroup:
         ):
             raise ValueError("rollout checkpoint weights do not match learner")
 
+        module_steps = state.get("module_steps")
+        if module_steps is None and isinstance(self._codec, FlatEpisodeCodec):
+            module_steps = {
+                DEFAULT_MODULE_ID: self._checkpoint_counter(state, "agent_steps")
+            }
+        if (
+            not isinstance(module_steps, Mapping)
+            or set(module_steps) != self._module_ids
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+                for value in module_steps.values()
+            )
+            or sum(module_steps.values())
+            != self._checkpoint_counter(state, "agent_steps")
+        ):
+            raise ValueError("rollout checkpoint module_steps are invalid")
+        world_steps = state.get("world_steps")
+        if world_steps is None and not self._module_exploration_clocks:
+            world_steps = self._checkpoint_counter(state, "env_steps")
+        if (
+            not isinstance(world_steps, int)
+            or isinstance(world_steps, bool)
+            or world_steps < 0
+            or (sum(module_steps.values()) > 0 and world_steps == 0)
+        ):
+            raise ValueError("rollout checkpoint world_steps are invalid")
+
         generations = state.get("runner_generations")
         if not isinstance(generations, Mapping) or set(generations) != set(
             self._runner_generations
@@ -713,6 +788,8 @@ class AsyncRolloutGroup:
         )
         self._env_steps = self._checkpoint_counter(state, "env_steps")
         self._agent_steps = self._checkpoint_counter(state, "agent_steps")
+        self._module_steps = dict(module_steps)
+        self._world_steps = world_steps
         self._sample_calls_started = self._checkpoint_counter(
             state,
             "sample_calls_started",
@@ -819,6 +896,11 @@ class AsyncRolloutGroup:
                     if self._member_exploration_clock
                     else {}
                 ),
+                **(
+                    {"sampled_module_steps": dict(self._module_steps)}
+                    if self._module_exploration_clocks
+                    else {}
+                ),
             )
             if weights is not None:
                 self._runner_weight_versions[runner_id] = FrozenVersions(
@@ -853,10 +935,29 @@ class AsyncRolloutGroup:
             self._sample_failures += 1
             raise RolloutGroupError("rollout actor returned a stale generation")
 
+        module_steps = dict(result.metrics.module_steps)
+        if not module_steps and isinstance(self._codec, FlatEpisodeCodec):
+            module_steps = {DEFAULT_MODULE_ID: result.episode.agent_steps}
+        if (
+            not set(module_steps) <= self._module_ids
+            or sum(module_steps.values()) != result.episode.agent_steps
+        ):
+            self._sample_failures += 1
+            raise RolloutGroupError("rollout actor returned invalid module counts")
+        world_steps = result.metrics.world_steps
+        if world_steps is None:
+            if self._module_exploration_clocks:
+                self._sample_failures += 1
+                raise RolloutGroupError("temporal rollout is missing world_steps")
+            world_steps = result.episode.env_steps
+
         lag = self._policy_lag(result.episode)
         self._episodes_collected += 1
         self._env_steps += result.episode.env_steps
         self._agent_steps += result.episode.agent_steps
+        self._world_steps += world_steps
+        for module_id, count in module_steps.items():
+            self._module_steps[module_id] += count
         self._episode_times_ms.append(result.metrics.episode_time_s * 1_000.0)
         self._policy_lags.append(lag)
         self._episode_returns.append(result.metrics.episode_return)

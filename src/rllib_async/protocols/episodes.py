@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import pickle
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
+from numbers import Real
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -379,6 +381,15 @@ class ModuleEpisodeCodec(EpisodeCodec, Protocol):
     ) -> MultiModuleTransition: ...
 
 
+@runtime_checkable
+class SequenceEpisodeCodec(ModuleEpisodeCodec, Protocol):
+    """Raw decision histories with explicit recurrent reset boundaries."""
+
+    def module_histories(
+        self, episode: EpisodeEnvelope, module_id: str
+    ) -> tuple[tuple[int, ...], ...]: ...
+
+
 class FlatEpisodeCodec:
     """Correctness-first codec for single-agent flat transitions."""
 
@@ -588,4 +599,160 @@ class MultiModuleEpisodeCodec:
         for candidate, transitions in payload.encoded_module_transitions:
             if candidate == module_id:
                 return transitions
+        raise KeyError(module_id)
+
+
+@dataclass(frozen=True, slots=True)
+class EncodedRawTransition(EncodedModuleTransition):
+    """Small temporal index; observations and raw rewards remain pickled once."""
+
+    world_t: int
+    duration: int
+    state_reset: bool
+    subtask_terminated: bool
+    terminated: bool
+    truncated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RawMultiModuleEpisodePayload(MultiModuleEpisodePayload):
+    """Versioned physical-time decisions, including heterogeneous observations."""
+
+    _module_histories: tuple[
+        tuple[str, tuple[tuple[int, ...], ...]], ...
+    ] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        MultiModuleEpisodePayload.__post_init__(self)
+        module_histories = []
+        for module_id, transitions in self.encoded_module_transitions:
+            histories: list[list[int]] = []
+            active: dict[str, list[int]] = {}
+            previous: dict[str, EncodedRawTransition] = {}
+            for index, transition in enumerate(transitions):
+                if not isinstance(transition, EncodedRawTransition):
+                    raise EpisodeValidationError(
+                        "raw episodes require physical time and raw rewards"
+                    )
+                prior = previous.get(transition.agent_id)
+                if prior is None and not transition.state_reset:
+                    raise EpisodeValidationError(
+                        "the first decision of an agent must reset recurrent state"
+                    )
+                if transition.state_reset:
+                    history: list[int] = []
+                    histories.append(history)
+                    active[transition.agent_id] = history
+                elif prior is not None:
+                    if prior.terminated or prior.truncated or prior.subtask_terminated:
+                        raise EpisodeValidationError(
+                            "a completed history requires state_reset before reuse"
+                        )
+                    if prior.world_t + prior.duration != transition.world_t:
+                        raise EpisodeValidationError(
+                            "physical time must be contiguous within an agent history"
+                        )
+                active[transition.agent_id].append(index)
+                previous[transition.agent_id] = transition
+            module_histories.append(
+                (module_id, tuple(tuple(history) for history in histories))
+            )
+        object.__setattr__(self, "_module_histories", tuple(module_histories))
+
+
+class RawMultiModuleEpisodeCodec(MultiModuleEpisodeCodec):
+    """Store facts before learner-specific discounting or representation.
+
+    Schema 1 sparse rewards cannot be migrated: their physical-time reward
+    trace was not recorded. Existing flat and sparse codecs remain unchanged.
+    """
+
+    codec_id = "raw-multi-module-pickle-v2"
+    schema_version = 2
+
+    def __init__(self, *, validate_startup: bool = False) -> None:
+        self._validate_next_episode = validate_startup
+
+    def encode(
+        self, transitions: Iterable[MultiModuleTransition]
+    ) -> RawMultiModuleEpisodePayload:
+        grouped: dict[str, list[EncodedRawTransition]] = defaultdict(list)
+        for transition in transitions:
+            if not isinstance(transition, MultiModuleTransition):
+                raise EpisodeValidationError(
+                    "raw episodes require MultiModuleTransition values"
+                )
+            data = dict(transition.data)
+            required = {
+                "obs", "new_obs", "actions", "rewards", "terminateds", "truncateds",
+                "world_t", "duration", "raw_rewards", "state_reset",
+                "subtask_terminated",
+            }
+            missing = required - data.keys()
+            if missing:
+                raise EpisodeValidationError(
+                    f"raw transition is missing {sorted(missing)!r}; "
+                    "sparse aggregated rewards cannot be migrated"
+                )
+            for name, minimum in (("world_t", 0), ("duration", 1)):
+                value = data[name]
+                if type(value) is not int or value < minimum:
+                    raise EpisodeValidationError(f"{name} must be an integer >= {minimum}")
+            for name in (
+                "state_reset", "subtask_terminated", "terminateds", "truncateds"
+            ):
+                if type(data[name]) is not bool:
+                    raise EpisodeValidationError(f"{name} must be boolean")
+            rewards = data["raw_rewards"]
+            if not isinstance(rewards, (tuple, list)) or len(rewards) != data["duration"]:
+                raise EpisodeValidationError("raw_rewards must contain one reward per tick")
+            if any(
+                not isinstance(value, Real) or isinstance(value, bool)
+                or not math.isfinite(value) for value in rewards
+            ):
+                raise EpisodeValidationError("raw_rewards must contain finite real values")
+            data["raw_rewards"] = tuple(float(value) for value in rewards)
+            if (
+                not isinstance(data["rewards"], Real)
+                or isinstance(data["rewards"], bool)
+                or not math.isclose(
+                    float(data["rewards"]), sum(data["raw_rewards"]),
+                    rel_tol=1e-6, abs_tol=1e-7,
+                )
+            ):
+                raise EpisodeValidationError("rewards must be the undiscounted raw reward sum")
+            grouped[transition.module_id].append(
+                EncodedRawTransition(
+                    env_t=transition.env_t,
+                    agent_t=transition.agent_t,
+                    agent_id=transition.agent_id,
+                    encoded_data=pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL),
+                    world_t=data["world_t"],
+                    duration=data["duration"],
+                    state_reset=data["state_reset"],
+                    subtask_terminated=data["subtask_terminated"],
+                    terminated=data["terminateds"],
+                    truncated=data["truncateds"],
+                )
+            )
+        payload = RawMultiModuleEpisodePayload(
+            tuple((module_id, tuple(grouped[module_id])) for module_id in sorted(grouped))
+        )
+        self._validate_next_episode = False
+        return payload
+
+    @staticmethod
+    def _payload(episode: EpisodeEnvelope) -> RawMultiModuleEpisodePayload:
+        if not isinstance(episode.payload, RawMultiModuleEpisodePayload):
+            raise EpisodeValidationError(
+                "raw sequence replay requires schema 2 physical durations and raw rewards"
+            )
+        return episode.payload
+
+    def module_histories(
+        self, episode: EpisodeEnvelope, module_id: str
+    ) -> tuple[tuple[int, ...], ...]:
+        for candidate, histories in self._payload(episode)._module_histories:
+            if candidate == module_id:
+                return histories
         raise KeyError(module_id)

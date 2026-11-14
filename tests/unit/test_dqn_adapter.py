@@ -83,7 +83,7 @@ def test_discrete_batch_contract() -> None:
         (Columns.ACTIONS, np.zeros(8, dtype=np.float32), "integer array"),
         (Columns.ACTIONS, np.zeros((8, 1), dtype=np.int64), "one-dimensional"),
         (Columns.ACTIONS, -np.ones(8, dtype=np.int64), "Discrete action"),
-        ("n_step", np.full(8, 2, dtype=np.int64), "one-step"),
+        ("n_step", np.zeros(8, dtype=np.int64), "positive integers"),
     ],
 )
 def test_rejects_invalid_dqn_batches(column, value, message) -> None:
@@ -96,8 +96,8 @@ def test_rejects_invalid_dqn_batches(column, value, message) -> None:
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
-        ({"n_step": 3}, "n_step=1"),
-        ({"n_step": (1, 3)}, "n_step=1"),
+        ({"n_step": 0}, "positive integer"),
+        ({"n_step": (1, 3)}, "positive integer"),
         ({"noisy": True}, "noisy"),
         ({"burn_in_len": 2}, "recurrent"),
         ({"num_atoms": 0}, "num_atoms"),

@@ -52,6 +52,7 @@ from rllib_async.runtime.population import (
     SimplePBTConfig,
     make_runtime_member_id,
 )
+from rllib_async.runtime.team import SingleMemberAsyncTeam
 
 __all__ = [
     "PBT_STATE_FILENAME",
@@ -89,6 +90,7 @@ __all__ = [
     "SimplePBTConfig",
     "SingleMemberAsyncDQN",
     "SingleMemberAsyncSAC",
+    "SingleMemberAsyncTeam",
     "make_runtime_member_id",
     "read_pbt_checkpoint_metadata",
     "read_population_checkpoint_bundle",

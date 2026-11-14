@@ -1,0 +1,125 @@
+from __future__ import annotations
+
+from collections import Counter
+
+import gymnasium as gym
+import numpy as np
+import pytest
+import torch
+from ray.rllib.core.columns import Columns
+from ray.rllib.core.rl_module.multi_rl_module import MultiRLModuleSpec
+from ray.rllib.core.rl_module.rl_module import RLModuleSpec
+from ray.rllib.core.rl_module.torch.torch_rl_module import TorchRLModule
+
+from rllib_async.examples.temporal_hierarchy import build_temporal_hierarchy_configs
+from rllib_async.gnn.episodes import NODE_FEATURES
+from rllib_async.protocols.episodes import RawMultiModuleEpisodeCodec
+from rllib_async.protocols.weights import WeightsDescriptor
+from rllib_async.rollout.multi_module import MultiModuleEpisodeRunner
+
+
+class _ScriptedModule(TorchRLModule):
+    """Fixed actions make the environment-to-replay numerical oracle exact."""
+
+    def setup(self):
+        self.observed_clocks = []
+
+    def _forward_inference(self, batch, **kwargs):
+        del kwargs
+        observations = batch[Columns.OBS]
+        features = observations[NODE_FEATURES][:, 0] if isinstance(observations, dict) else observations
+        if self.model_config["role"] == "manager":
+            actions = (features[:, 2] > 0).long()
+        elif isinstance(self.action_space, gym.spaces.Discrete):
+            actions = torch.zeros(features.shape[0], dtype=torch.int64)
+        else:
+            actions = torch.ones((features.shape[0], 1), dtype=torch.float32)
+        return {Columns.ACTIONS: actions}
+
+    def _forward_exploration(self, batch, t, **kwargs):
+        self.observed_clocks.append(t)
+        return self._forward_inference(batch, **kwargs)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("time_limit", [False, True])
+def test_raw_collector_preserves_actual_step_rewards_and_decision_clocks(time_limit):
+    config, _, spaces = build_temporal_hierarchy_configs(
+        episode_length=8,
+        manager_period=3,
+        vector_worker=True,
+        time_limit=time_limit,
+    )
+    config.rl_module(
+        rl_module_spec=MultiRLModuleSpec(
+            rl_module_specs={
+                module_id: RLModuleSpec(
+                    module_class=_ScriptedModule,
+                    observation_space=obs,
+                    action_space=act,
+                    model_config={"role": module_id},
+                )
+                for module_id, (obs, act) in spaces.items()
+            }
+        )
+    )
+    weights = WeightsDescriptor(
+        member_id="temporal-oracle",
+        module_versions={module_id: 0 for module_id in spaces},
+        learner_updates=0,
+        published_at_monotonic=0,
+        state={module_id: {} for module_id in spaces},
+    )
+    codec = RawMultiModuleEpisodeCodec()
+    runner = MultiModuleEpisodeRunner(
+        config,
+        codec,
+        member_id="temporal-oracle",
+        runner_id="runner",
+        runner_generation=0,
+        max_episode_steps=16,
+        module_ids=tuple(spaces),
+        initial_weights=weights,
+        worker_index=0,
+    )
+    try:
+        result = runner.collect_episode(
+            explore=True,
+            sampled_module_steps={"manager": 10, "worker_0": 100, "worker_1": 200},
+        )
+        manager = [
+            codec.get_module_transition(result.episode, "manager", index)
+            for index in range(codec.module_transition_count(result.episode, "manager"))
+        ]
+        assert [transition.data["duration"] for transition in manager] == [2, 3, 3]
+        raw_steps = runner._env_runner.raw_steps
+        for transition in manager:
+            data = transition.data
+            rewards = tuple(
+                step.rewards["manager"]
+                for step in raw_steps
+                if step.next_world_t > step.world_t
+                and data["world_t"] < step.next_world_t <= data["world_t"] + data["duration"]
+            )
+            assert data["raw_rewards"] == rewards
+            assert data[Columns.REWARDS] == pytest.approx(sum(rewards))
+            assert not data["subtask_terminated"]
+        assert manager[-1].data[Columns.TRUNCATEDS] is time_limit
+        assert manager[-1].data[Columns.TERMINATEDS] is not time_limit
+        all_transitions = [codec.get_transition(result.episode, index) for index in range(result.episode.agent_steps)]
+        assert result.metrics.world_steps == 8
+        assert result.episode.env_steps == 11
+        assert result.episode.agent_steps == 11
+        assert dict(result.metrics.module_steps) == {"manager": 3, "worker_0": 5, "worker_1": 3}
+        assert Counter(item.agent_id for item in all_transitions) == {
+            "manager": 3, "worker_0:0": 2, "worker_0:1": 3, "worker_1:2": 3
+        }
+        modules = runner._env_runner.module
+        assert modules["manager"].observed_clocks == [10, 11, 12]
+        assert modules["worker_0"].observed_clocks == list(range(100, 105))
+        assert modules["worker_1"].observed_clocks == list(range(200, 203))
+        final_obs = manager[-1].data[Columns.NEXT_OBS][NODE_FEATURES]
+        assert final_obs[0, 3] == pytest.approx(1.0)
+        assert not np.array_equal(final_obs, manager[0].data[Columns.OBS][NODE_FEATURES])
+    finally:
+        runner.close()

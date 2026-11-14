@@ -16,6 +16,7 @@ from rllib_async.protocols.episodes import (
     EpisodeEnvelope,
     ModuleEpisodeCodec,
     MultiModuleTransition,
+    SequenceEpisodeCodec,
 )
 from rllib_async.protocols.replay import (
     ReplayCursor,
@@ -26,6 +27,11 @@ from rllib_async.replay.reference import (
     CursorMismatchError,
     FullResyncRequiredError,
     ReplayError,
+)
+from rllib_async.replay.sequences import (
+    SequenceConfig,
+    SequenceWindow,
+    make_sequence_window,
 )
 
 
@@ -98,6 +104,9 @@ class _MaterializedView:
     total_estimated_bytes: int
     producer_episode_counts: tuple[tuple[str, int], ...]
     producer_transition_counts: tuple[tuple[str, int], ...]
+    sequence_positions: Mapping[
+        tuple[int, str], tuple[tuple[tuple[int, ...], int], ...]
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -539,6 +548,31 @@ class FastReplay:
             )
         ]
 
+    def sample_sequences(
+        self,
+        module_id: str,
+        batch_size: int,
+        *,
+        rng: random.Random,
+        sequence_config: SequenceConfig = SequenceConfig(),
+        n_step: int = 1,
+    ) -> list[SequenceWindow]:
+        """Sample uniformly over real decisions, retaining short window tails."""
+
+        if not isinstance(self._codec, SequenceEpisodeCodec):
+            raise TypeError("sequence sampling requires raw physical-time episode data")
+        view = self._capture_active_view()
+        windows = []
+        for episode_index, transition_index in self._sample_module_positions(
+            view, module_id, batch_size, rng=rng
+        ):
+            history, start = view.sequence_positions[episode_index, module_id][transition_index]
+            windows.append(make_sequence_window(
+                self._codec, view.episodes[episode_index], module_id, history, start,
+                sequence_config=sequence_config, n_step=n_step,
+            ))
+        return windows
+
     def close(
         self,
         *,
@@ -623,6 +657,7 @@ class FastReplay:
         module_episode_indices: dict[str, list[int]] = {}
         module_cumulative_lengths: dict[str, list[int]] = {}
         module_totals: dict[str, int] = {}
+        sequence_positions = {}
         producer_episode_counts: Counter[str] = Counter()
         producer_transition_counts: Counter[str] = Counter()
         module_codec = (
@@ -658,6 +693,14 @@ class FastReplay:
                     module_cumulative_lengths.setdefault(module_id, []).append(
                         module_totals[module_id]
                     )
+                    if isinstance(module_codec, SequenceEpisodeCodec):
+                        by_position = {}
+                        for history in module_codec.module_histories(record.episode, module_id):
+                            for position, index in enumerate(history):
+                                by_position[index] = (history, position)
+                        sequence_positions[episode_index, module_id] = tuple(
+                            by_position[index] for index in range(module_count)
+                        )
                 if episode_module_total != record.transition_count:
                     raise ReplayError(
                         "module transition totals do not match the episode total"
@@ -687,6 +730,7 @@ class FastReplay:
             producer_transition_counts=tuple(
                 sorted(producer_transition_counts.items())
             ),
+            sequence_positions=MappingProxyType(sequence_positions),
         )
 
     def _schedule_rebuild_locked(self) -> None:

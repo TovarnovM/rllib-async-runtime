@@ -156,7 +156,7 @@ class SingleMemberAsyncSAC:
         self._budget_updates_origin = self._learner_update_budget_for_sampled(
             self._budget_sampled_origin
         )
-        self._codec = FlatEpisodeCodec()
+        self._codec = self._make_codec()
         self._state = RuntimeState.CREATED
         self._replay_actor: Any | None = None
         self._learner_actor: Any | None = None
@@ -301,6 +301,10 @@ class SingleMemberAsyncSAC:
     @property
     def state(self) -> RuntimeState:
         return self._state
+
+    @staticmethod
+    def _make_codec() -> FlatEpisodeCodec:
+        return FlatEpisodeCodec()
 
     @property
     def owns_replay_actor(self) -> bool:
@@ -876,8 +880,7 @@ class SingleMemberAsyncSAC:
             remaining_updates = self._remaining_learner_update_budget(rollout)
             tick = ray.get(
                 self._learner_actor.drain.remote(
-                    sampled_env_steps=rollout.env_steps,
-                    sampled_agent_steps=rollout.agent_steps,
+                    **self._sampled_step_kwargs(rollout),
                     max_updates=remaining_updates,
                     timeout_s=self._remaining(deadline),
                 ),
@@ -948,13 +951,19 @@ class SingleMemberAsyncSAC:
         if remaining_updates == 0:
             return
         self._pending_learner_tick = self._learner_actor.tick.remote(
-            sampled_env_steps=rollout.env_steps,
-            sampled_agent_steps=rollout.agent_steps,
+            **self._sampled_step_kwargs(rollout),
             max_updates=min(
                 self._config.learner_updates_per_tick,
                 remaining_updates,
             ),
         )
+
+    @staticmethod
+    def _sampled_step_kwargs(rollout: AsyncRolloutGroup) -> dict[str, Any]:
+        return {
+            "sampled_env_steps": rollout.env_steps,
+            "sampled_agent_steps": rollout.agent_steps,
+        }
 
     def _poll_learner_tick(self) -> None:
         if self._pending_learner_tick is None:

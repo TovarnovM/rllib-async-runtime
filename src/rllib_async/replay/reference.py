@@ -19,6 +19,7 @@ from rllib_async.protocols.episodes import (
     FlatEpisodePayload,
     ModuleEpisodeCodec,
     MultiModuleTransition,
+    SequenceEpisodeCodec,
 )
 from rllib_async.protocols.replay import (
     CommitAck,
@@ -27,6 +28,11 @@ from rllib_async.protocols.replay import (
     ReplaySnapshot,
     ReplayStats,
     ReplayTransaction,
+)
+from rllib_async.replay.sequences import (
+    SequenceConfig,
+    SequenceWindow,
+    make_sequence_window,
 )
 
 EPISODE_STORE_STATE_VERSION = 2
@@ -1056,6 +1062,31 @@ class ReferenceFastReplay:
                 rng=rng,
             )
         ]
+
+    def sample_sequences(
+        self,
+        module_id: str,
+        batch_size: int,
+        *,
+        rng: random.Random,
+        sequence_config: SequenceConfig = SequenceConfig(),
+        n_step: int = 1,
+    ) -> list[SequenceWindow]:
+        """Reference oracle: locate each uniformly selected start by scanning histories."""
+
+        if not isinstance(self._codec, SequenceEpisodeCodec):
+            raise TypeError("sequence sampling requires raw physical-time episode data")
+        windows = []
+        for episode_id, index in self.sample_module_coordinates(module_id, batch_size, rng=rng):
+            episode = self._episodes[episode_id]
+            for history in self._codec.module_histories(episode, module_id):
+                if index in history:
+                    windows.append(make_sequence_window(
+                        self._codec, episode, module_id, history, history.index(index),
+                        sequence_config=sequence_config, n_step=n_step,
+                    ))
+                    break
+        return windows
 
     def apply_deltas(self, deltas: Sequence[ReplayDelta]) -> None:
         for delta in deltas:

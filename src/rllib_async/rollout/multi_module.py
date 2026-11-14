@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import copy
 import time
+from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
 from ray.rllib.core import COMPONENT_RL_MODULE
 from ray.rllib.core.columns import Columns
+from ray.rllib.core.rl_module.multi_rl_module import MultiRLModule, MultiRLModuleSpec
+from ray.rllib.env.env_runner import ENV_STEP_FAILURE
 from ray.rllib.env.multi_agent_env_runner import MultiAgentEnvRunner
 from ray.rllib.utils.metrics import WEIGHTS_SEQ_NO
 
@@ -18,6 +23,7 @@ from rllib_async.protocols.episodes import (
     FrozenVersions,
     MultiModuleEpisodeCodec,
     MultiModuleTransition,
+    RawMultiModuleEpisodeCodec,
 )
 from rllib_async.protocols.weights import WeightsDescriptor
 from rllib_async.rollout.episode_runner import (
@@ -28,6 +34,163 @@ from rllib_async.rollout.episode_runner import (
     accept_weight_publication,
     make_episode_id,
 )
+
+
+class _DecisionClockMultiRLModule(MultiRLModule):
+    """Use each module's real decisions for its exploration schedule."""
+
+    def setup(self) -> None:
+        super().setup()
+        self.decision_steps: dict[str, int] = {}
+
+    def _forward_exploration(
+        self, batch: dict[str, Any], **kwargs: Any
+    ) -> dict[str, Any]:
+        kwargs.pop("t", None)
+        return {
+            module_id: self[module_id].forward_exploration(
+                module_batch,
+                t=self.decision_steps.get(module_id, 0),
+                **kwargs,
+            )
+            for module_id, module_batch in batch.items()
+            if module_id in self
+        }
+
+
+@dataclass(frozen=True)
+class _RawStep:
+    world_t: int
+    next_world_t: int
+    actions: Mapping[str, Any]
+    rewards: Mapping[str, float]
+    observed_agents: frozenset[str]
+    terminateds: Mapping[str, bool]
+    truncateds: Mapping[str, bool]
+    subtask_terminated: frozenset[str]
+
+
+class _RawRewardEnvRunner(MultiAgentEnvRunner):
+    """Capture the pinned RLlib env-step seam before sparse reward aggregation.
+
+    A temporal environment exposes integer ``world_t`` and advances by zero
+    (routing) or one physical tick per call. This contract prevents treating an
+    already aggregated reward as a recoverable sequence of physical rewards.
+    """
+
+    def _reset_envs(self, *args: Any, **kwargs: Any) -> Any:
+        self.raw_steps: list[_RawStep] = []
+        return super()._reset_envs(*args, **kwargs)
+
+    def _world_t(self) -> int:
+        value = getattr(self.env.envs[0].unwrapped, "world_t", None)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise EpisodeRunnerError(
+                "raw temporal collection requires env.world_t, a non-negative integer"
+            )
+        return value
+
+    def _try_env_step(self, actions: Any) -> Any:
+        world_t = self._world_t()
+        results = super()._try_env_step(actions)
+        if results == ENV_STEP_FAILURE:
+            return results
+        next_world_t = self._world_t()
+        if next_world_t - world_t not in (0, 1):
+            raise EpisodeRunnerError(
+                "one env.step must advance zero or one physical world tick"
+            )
+        observations, rewards, terminateds, truncateds, infos = results
+        step_rewards = {agent: float(value) for agent, value in rewards[0].items()}
+        if not all(np.isfinite(value) for value in step_rewards.values()):
+            raise EpisodeRunnerError("raw rewards must be finite")
+        if next_world_t == world_t and any(step_rewards.values()):
+            raise EpisodeRunnerError("a zero-time routing turn cannot carry reward")
+        self.raw_steps.append(
+            _RawStep(
+                world_t=world_t,
+                next_world_t=next_world_t,
+                actions=copy.deepcopy(actions[0]),
+                rewards=step_rewards,
+                observed_agents=frozenset(observations[0]),
+                terminateds=dict(terminateds[0]),
+                truncateds=dict(truncateds[0]),
+                subtask_terminated=frozenset(
+                    agent
+                    for agent, info in infos[0].items()
+                    if info.get("subtask_terminated", False)
+                ),
+            )
+        )
+        assert isinstance(self.module, _DecisionClockMultiRLModule)
+        episode = self._ongoing_episodes[0]
+        for agent in actions[0]:
+            module_id = episode.module_for(agent)
+            self.module.decision_steps[module_id] = (
+                self.module.decision_steps.get(module_id, 0) + 1
+            )
+        return results
+
+
+def _raw_decisions(steps: Sequence[_RawStep]) -> dict[tuple[str, int], dict[str, Any]]:
+    """Close real decisions at the next observation, keeping each physical reward."""
+
+    pending: dict[str, dict[str, Any]] = {}
+    next_agent_t: Counter[str] = Counter()
+    completed: dict[tuple[str, int], dict[str, Any]] = {}
+    for env_t, step in enumerate(steps):
+        for agent, action in step.actions.items():
+            if agent in pending:
+                raise EpisodeRunnerError("agent acted before its previous decision closed")
+            pending[agent] = {
+                "env_t": env_t,
+                "world_t": step.world_t,
+                Columns.ACTIONS: action,
+                "raw_rewards": [],
+            }
+        if step.next_world_t > step.world_t:
+            for agent, decision in pending.items():
+                decision["raw_rewards"].append(step.rewards.get(agent, 0.0))
+        for agent in tuple(pending):
+            done = bool(
+                step.terminateds.get(agent, False)
+                or step.terminateds.get("__all__", False)
+                or step.truncateds.get(agent, False)
+                or step.truncateds.get("__all__", False)
+            )
+            if agent not in step.observed_agents:
+                if done:
+                    raise EpisodeRunnerError(
+                        "a completed decision requires its real final observation"
+                    )
+                continue
+            decision = pending.pop(agent)
+            duration = step.next_world_t - decision["world_t"]
+            if duration < 1 or duration != len(decision["raw_rewards"]):
+                raise EpisodeRunnerError("every training decision needs positive duration")
+            agent_t = next_agent_t[agent]
+            local_terminal = agent in step.subtask_terminated
+            decision.update(
+                {
+                    "duration": duration,
+                    "raw_rewards": tuple(decision["raw_rewards"]),
+                    "state_reset": agent_t == 0,
+                    "subtask_terminated": local_terminal,
+                    Columns.TERMINATEDS: bool(
+                        step.terminateds.get("__all__", False)
+                        or (step.terminateds.get(agent, False) and not local_terminal)
+                    ),
+                    Columns.TRUNCATEDS: bool(
+                        step.truncateds.get("__all__", False)
+                        or step.truncateds.get(agent, False)
+                    ),
+                }
+            )
+            completed[(agent, agent_t)] = decision
+            next_agent_t[agent] += 1
+    if pending:
+        raise EpisodeRunnerError("whole episode contains unfinished agent decisions")
+    return completed
 
 
 class MultiModuleEpisodeRunner:
@@ -98,7 +261,19 @@ class MultiModuleEpisodeRunner:
             batch_mode="complete_episodes",
             episodes_to_numpy=True,
         )
-        self._env_runner = MultiAgentEnvRunner(
+        self._temporal = isinstance(codec, RawMultiModuleEpisodeCodec)
+        if self._temporal:
+            spec = runner_config.rl_module_spec
+            if not isinstance(spec, MultiRLModuleSpec) or spec.multi_rl_module_class not in (
+                MultiRLModule,
+                _DecisionClockMultiRLModule,
+            ):
+                raise ValueError(
+                    "temporal collection requires a standard explicit MultiRLModuleSpec"
+                )
+            spec.multi_rl_module_class = _DecisionClockMultiRLModule
+        runner_class = _RawRewardEnvRunner if self._temporal else MultiAgentEnvRunner
+        self._env_runner = runner_class(
             config=runner_config,
             worker_index=worker_index,
         )
@@ -151,6 +326,7 @@ class MultiModuleEpisodeRunner:
         weights: WeightsDescriptor | None = None,
         *,
         explore: bool = True,
+        sampled_module_steps: Mapping[str, int] | None = None,
     ) -> EpisodeRolloutResult:
         """Apply optional fresh weights, then collect one complete episode."""
 
@@ -158,6 +334,21 @@ class MultiModuleEpisodeRunner:
         if weights is not None:
             self.install_weights(weights)
         assert self._weights is not None
+
+        if self._temporal and sampled_module_steps is not None:
+            module = self._env_runner.module
+            assert isinstance(module, _DecisionClockMultiRLModule)
+            for module_id, count in sampled_module_steps.items():
+                if (
+                    module_id not in self._module_id_set
+                    or not isinstance(count, int)
+                    or isinstance(count, bool)
+                    or count < 0
+                ):
+                    raise ValueError("sampled_module_steps must contain known module counters")
+                module.decision_steps[module_id] = max(
+                    module.decision_steps.get(module_id, 0), count
+                )
 
         started = time.monotonic()
         episodes = self._env_runner.sample(num_episodes=1, explore=explore)
@@ -167,6 +358,9 @@ class MultiModuleEpisodeRunner:
                 f"RLlib returned {len(episodes)} episodes instead of one"
             )
         source = episodes[0]
+        raw_decisions = (
+            _raw_decisions(self._env_runner.raw_steps) if self._temporal else None
+        )
         env_steps = len(source)
         if env_steps < 1:
             raise EpisodeRunnerError("RLlib returned an empty episode")
@@ -295,6 +489,13 @@ class MultiModuleEpisodeRunner:
                         },
                     )
                 )
+                if raw_decisions is not None:
+                    raw = dict(raw_decisions[(agent_id, agent_t)])
+                    if raw.pop("env_t") != env_t:
+                        raise EpisodeRunnerError("raw decisions disagree with RLlib action turns")
+                    if not np.isclose(sum(raw["raw_rewards"]), rewards[agent_t]):
+                        raise EpisodeRunnerError("raw reward history disagrees with RLlib aggregation")
+                    transitions[-1].data.update(raw)
                 next_agent_t[agent_id] += 1
         if any(
             next_agent_t[agent_id] != data["count"]
@@ -342,6 +543,15 @@ class MultiModuleEpisodeRunner:
             episode_return=total_return,
             env_steps=env_steps,
             agent_steps=agent_steps,
+            module_steps=tuple(
+                sorted(Counter(item.module_id for item in transitions).items())
+            ),
+            world_steps=(
+                self._env_runner.raw_steps[-1].next_world_t
+                - self._env_runner.raw_steps[0].world_t
+                if self._temporal
+                else None
+            ),
         )
         self._local_episode_seq += 1
         return EpisodeRolloutResult(episode=envelope, metrics=metrics)
