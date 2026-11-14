@@ -71,7 +71,9 @@ def make_population_specs(
         )
         runtime_config = AsyncSACRuntimeConfig(
             member_id=f"member-{index}",
-            runner_count=4,
+            # Population lifecycle needs two producers, one per member.
+            # Multi-runner scheduling/backpressure has its own integration tests.
+            runner_count=1,
             max_episode_steps=4,
             replay_capacity_transitions=2_048,
             replay_capacity_bytes=20_000_000,

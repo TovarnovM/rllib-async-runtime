@@ -254,7 +254,10 @@ class GraphBatchCollator:
             }
             for item in transitions
         ]
-        batch: GraphModuleBatch = self._scalar_collator.collate(scalar_rows)
+        scalar_collator = (
+            FlatBatchCollator() if self._validate_next_batch else self._scalar_collator
+        )
+        batch: GraphModuleBatch = scalar_collator.collate(scalar_rows)
         batch[Columns.OBS] = pack_graph_observations(
             observations, validate=self._validate_next_batch
         )

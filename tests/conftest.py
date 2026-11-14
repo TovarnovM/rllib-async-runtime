@@ -6,14 +6,16 @@ import pytest
 import ray
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def ray_runtime() -> Iterator[None]:
-    """Start Ray only for tests that actually exercise remote scheduling."""
+    """Share Ray startup; each test still owns and stops its own actors."""
     ray.init(
         num_cpus=2,
         include_dashboard=False,
         ignore_reinit_error=True,
         log_to_driver=False,
     )
-    yield
-    ray.shutdown()
+    try:
+        yield
+    finally:
+        ray.shutdown()
