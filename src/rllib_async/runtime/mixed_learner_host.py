@@ -8,7 +8,7 @@ import random
 import time
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -18,10 +18,15 @@ from ray.rllib.algorithms.dqn import DQNConfig
 from ray.rllib.algorithms.sac import SACConfig
 
 from rllib_async.learner import DQNLearnerAdapter, SACLearnerAdapter
+from rllib_async.learner.sac_adapter import PBTModelState
 from rllib_async.protocols import ReplayCursor, ReplaySnapshot, WeightsDescriptor
 from rllib_async.protocols.episodes import SequenceEpisodeCodec
 from rllib_async.replay import BatchProducerStats, FastReplay
 from rllib_async.replay.batching import BatchProducerState
+from rllib_async.replay.prioritized import (
+    PrioritizedReplayConfig,
+    PrioritizedSequenceSampler,
+)
 from rllib_async.replay.sequences import SequenceBatchCollator, SequenceConfig
 from rllib_async.runtime.learner_host import (
     LearnerHost,
@@ -31,6 +36,52 @@ from rllib_async.runtime.learner_host import (
     LearnerHostTick,
     decode_learner_host_checkpoint,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class MixedPBTModelState:
+    """One complete model-only team transfer; replay and optimizer state are absent."""
+
+    state_version: int
+    module_states: Mapping[str, PBTModelState]
+    trainable_modules: tuple[str, ...]
+    sequence_configs: Mapping[str, SequenceConfig]
+    rollout_contract: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.state_version) is not int or self.state_version != 1:
+            raise ValueError("unsupported mixed PBT model state version")
+        if not isinstance(self.module_states, Mapping) or not self.module_states:
+            raise ValueError("mixed PBT requires a complete module-state mapping")
+        if any(
+            not isinstance(mid, str)
+            or not mid
+            or not isinstance(state, PBTModelState)
+            for mid, state in self.module_states.items()
+        ):
+            raise ValueError("mixed PBT module states are invalid")
+        if (
+            not isinstance(self.trainable_modules, tuple)
+            or not self.trainable_modules
+            or len(set(self.trainable_modules)) != len(self.trainable_modules)
+            or not set(self.trainable_modules) <= set(self.module_states)
+        ):
+            raise ValueError("mixed PBT trainable modules are invalid")
+        if not isinstance(self.sequence_configs, Mapping) or set(
+            self.sequence_configs
+        ) != set(self.module_states):
+            raise ValueError("mixed PBT sequence configuration does not match modules")
+        if any(
+            not isinstance(value, SequenceConfig)
+            for value in self.sequence_configs.values()
+        ):
+            raise ValueError("mixed PBT sequence configurations are invalid")
+        if self.rollout_contract is not None and (
+            not isinstance(self.rollout_contract, str) or not self.rollout_contract
+        ):
+            raise ValueError("mixed PBT rollout contract is invalid")
+        object.__setattr__(self, "module_states", dict(self.module_states))
+        object.__setattr__(self, "sequence_configs", dict(self.sequence_configs))
 
 
 class MixedLearnerHost(LearnerHost):
@@ -62,6 +113,7 @@ class MixedLearnerHost(LearnerHost):
         learning_starts_satisfied: bool = False,
         trainable_modules: tuple[str, ...] | None = None,
         sequence_configs: Mapping[str, SequenceConfig] | None = None,
+        per_configs: Mapping[str, PrioritizedReplayConfig] | None = None,
     ) -> None:
         if not isinstance(config, Mapping) or not config:
             raise ValueError("mixed module configurations must be a non-empty mapping")
@@ -75,8 +127,12 @@ class MixedLearnerHost(LearnerHost):
             raise ValueError(
                 "mixed sequence learners require direct batching (capacity=0)"
             )
-        if pbt_state is not None or learning_starts_satisfied:
-            raise ValueError("mixed warm start/PBT is not part of the stage 2 contract")
+        if checkpoint_state is not None and pbt_state is not None:
+            raise ValueError("mixed learner accepts only one restore source")
+        if learning_starts_satisfied:
+            raise ValueError(
+                "mixed readiness is determined from compatible replay decisions"
+            )
         if type(batch_seed) is not int:
             raise ValueError("batch_seed must be an integer")
         if not isinstance(allow_replay_ahead_on_restore, bool):
@@ -108,6 +164,15 @@ class MixedLearnerHost(LearnerHost):
         self._trainable_modules = tuple(
             mid for mid in self._module_ids if mid in selected
         )
+        self._per_configs = dict(per_configs or {})
+        if not set(self._per_configs) <= set(self._trainable_modules) or any(
+            not isinstance(value, PrioritizedReplayConfig)
+            for value in self._per_configs.values()
+        ):
+            raise ValueError(
+                "per_configs must map trainable modules to PrioritizedReplayConfig"
+            )
+        self._prioritized_samplers: dict[str, PrioritizedSequenceSampler] = {}
         sequence_configs = dict(sequence_configs or {})
         if set(sequence_configs) - set(config) or any(
             not isinstance(value, SequenceConfig) for value in sequence_configs.values()
@@ -234,7 +299,25 @@ class MixedLearnerHost(LearnerHost):
                     validate_startup=validate_startup,
                     include_history=recurrent,
                 )
+                if mid in self._per_configs:
+                    if self._sequence_configs[mid].learning_length > size:
+                        raise ValueError(
+                            "PER learning_length must not exceed module batch size"
+                        )
+                    self._prioritized_samplers[mid] = PrioritizedSequenceSampler(
+                        self._fast_replay,
+                        mid,
+                        sequence_config=self._sequence_configs[mid],
+                        n_step=module_config.n_step,
+                        config=self._per_configs[mid],
+                    )
             self._record_replay_ingestion(snapshot.episodes, initial=True)
+            if pbt_state is not None:
+                self.validate_pbt_state(pbt_state)
+                for mid, adapter in self._adapters.items():
+                    adapter.load_pbt_state(pbt_state.module_states[mid])
+                self._publication_epoch = 1
+                self._weight_publications = 1
             self._latest_weights = self._build_publication()
             if checkpoint_state is not None:
                 if isinstance(checkpoint_state, bytes):
@@ -340,20 +423,31 @@ class MixedLearnerHost(LearnerHost):
             if not clock["ready"] or budget < 1 or not available.get(mid, 0):
                 missed += 1
                 continue
-            missed = 0
             spec = self._sequence_configs[mid]
+            prioritized = self._prioritized_samplers.get(mid)
+            if prioritized is not None and budget < spec.learning_length:
+                missed += 1
+                continue
+            missed = 0
             length = min(spec.learning_length, self._batch_sizes[mid], budget)
             spec = replace(spec, learning_length=length)
             windows_count = max(1, min(self._batch_sizes[mid], budget) // length)
             started = time.monotonic()
-            windows = self._fast_replay.sample_sequences(
-                mid,
-                windows_count,
-                rng=self._samplers[mid],
-                sequence_config=spec,
-                n_step=self._configs[mid].n_step,
-            )
+            selection = None
+            if prioritized is None:
+                windows = self._fast_replay.sample_sequences(
+                    mid,
+                    windows_count,
+                    rng=self._samplers[mid],
+                    sequence_config=spec,
+                    n_step=self._configs[mid].n_step,
+                )
+            else:
+                selection = prioritized.sample(windows_count, rng=self._samplers[mid])
+                windows = selection.windows
             batch = self._collators[mid].collate(windows)
+            if selection is not None:
+                batch["weights"] = selection.weights
             batch.pop("decision_horizons", None)
             if not self._recurrent[mid]:
                 batch.pop("recurrent", None)
@@ -366,11 +460,21 @@ class MixedLearnerHost(LearnerHost):
                 {mid: batch},
                 sampled_env_steps=int(clock["ingested_decisions"]),
                 sampled_agent_steps=int(clock["ingested_decisions"]),
+                return_priority_errors=prioritized is not None,
             )
             if not update.performed:
                 raise LearnerHostError(
                     "ready mixed learner unexpectedly skipped its update"
                 )
+            if selection is not None:
+                errors = update.priority_errors[mid]
+                offset = 0
+                priorities = []
+                for window in windows:
+                    stop = offset + window.valid_count
+                    priorities.append(float(np.max(np.abs(errors[offset:stop]))))
+                    offset = stop
+                prioritized.update_priorities(selection.handles, priorities)
             clock["learned_positions"] = int(clock["learned_positions"]) + positions
             clock["optimizer_updates"] = update.learner_updates
             clock["budget"] = max(0.0, float(clock["budget"]) - positions)
@@ -406,8 +510,37 @@ class MixedLearnerHost(LearnerHost):
         self._require_not_stopped()
         return self._latest_weights
 
-    def export_pbt_state(self) -> object:
-        raise ValueError("mixed-team PBT is implemented in stage 3")
+    def export_pbt_state(self) -> MixedPBTModelState:
+        self._require_not_stopped()
+        return MixedPBTModelState(
+            state_version=1,
+            module_states={
+                mid: adapter.export_pbt_state()
+                for mid, adapter in self._adapters.items()
+            },
+            trainable_modules=self._trainable_modules,
+            sequence_configs=self._sequence_configs,
+        )
+
+    def validate_pbt_state(self, state: MixedPBTModelState) -> None:
+        """Preflight the whole team before a population discards its recipient."""
+
+        self._require_not_stopped()
+        if not isinstance(state, MixedPBTModelState) or state.state_version != 1:
+            raise ValueError("unsupported mixed PBT model state")
+        if set(state.module_states) != set(self._module_ids):
+            raise ValueError("mixed PBT module IDs do not match")
+        if (
+            state.trainable_modules != self._trainable_modules
+            or state.sequence_configs != self._sequence_configs
+        ):
+            raise ValueError("mixed PBT team/sequence configuration does not match")
+        for mid, adapter in self._adapters.items():
+            if state.module_states[mid].config_contract is None:
+                raise ValueError(
+                    "mixed PBT requires complete algorithm/model contracts"
+                )
+            adapter.validate_pbt_state(state.module_states[mid])
 
     def drain(
         self,
@@ -530,6 +663,11 @@ class MixedLearnerHost(LearnerHost):
             "trainable_modules": self._trainable_modules,
             "sequence_configs": dict(self._sequence_configs),
             "training_intensities": dict(self._intensities),
+            "per_configs": dict(self._per_configs),
+            "priority_states": {
+                mid: sampler.get_state()
+                for mid, sampler in self._prioritized_samplers.items()
+            },
             "adapters": {
                 mid: adapter.get_state() for mid, adapter in self._adapters.items()
             },
@@ -566,6 +704,13 @@ class MixedLearnerHost(LearnerHost):
             raise ValueError("unsupported mixed learner checkpoint")
         if state.get("member_id") != self._member_id:
             raise ValueError("mixed checkpoint member_id does not match")
+        if state.get("per_configs", {}) != self._per_configs:
+            raise ValueError("mixed checkpoint PER configuration differs")
+        priority_states = state.get("priority_states", {})
+        if not isinstance(priority_states, Mapping) or set(priority_states) != set(
+            self._prioritized_samplers
+        ):
+            raise ValueError("mixed checkpoint priority consumers differ")
         if (
             state.get("trainable_modules") != self._trainable_modules
             or state.get("sequence_configs") != self._sequence_configs
@@ -682,6 +827,11 @@ class MixedLearnerHost(LearnerHost):
             for value, current in zip(cuda_rng, current_cuda, strict=True)
         )
         # These adapters are still constructor-owned and cannot be observed live.
+        for mid, sampler in self._prioritized_samplers.items():
+            sampler.set_state(
+                priority_states[mid],
+                allow_replay_ahead=self._allow_replay_ahead_on_restore,
+            )
         for mid, adapter in self._adapters.items():
             adapter.set_state(adapters[mid])
             self._samplers[mid].setstate(samplers[mid])

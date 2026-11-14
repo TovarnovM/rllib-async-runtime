@@ -98,7 +98,7 @@ def test_rejects_invalid_dqn_batches(column, value, message) -> None:
     [
         ({"n_step": 0}, "positive integer"),
         ({"n_step": (1, 3)}, "positive integer"),
-        ({"noisy": True}, "noisy"),
+        ({"noisy": True, "sigma0": 0.0}, "sigma0"),
         ({"burn_in_len": 2}, "recurrent"),
         ({"num_atoms": 0}, "num_atoms"),
         ({"num_atoms": 5, "v_min": 1.0, "v_max": 1.0}, "v_min"),
@@ -158,6 +158,9 @@ def test_adapter_matches_stock_dqn_learner(double_q, dueling, num_atoms) -> None
         # Replay supplies physical tick exponents, which can exceed the number
         # of decisions in the configured target horizon.
         batch["n_step"] = np.asarray([1, 2, 4, 3, 1, 2, 3, 4], dtype=np.int64)
+        batch["weights"] = np.asarray(
+            [0.1, 0.3, 0.7, 1.0, 0.2, 0.5, 0.8, 0.4], dtype=np.float32
+        )
         expected = baseline.update(
             batch=build_rllib_dqn_batch(batch),
             timesteps={
@@ -371,7 +374,7 @@ def test_discrete_action_bounds_checked_by_startup_diagnostics() -> None:
     ("override", "message"),
     [
         ({"n_step": 0}, "positive integer"),
-        ({"noisy": True}, "noisy"),
+        ({"noisy": True, "sigma0": -1.0}, "sigma0"),
         ({"model_config": {"use_lstm": True}}, "RLModuleSpec"),
     ],
 )

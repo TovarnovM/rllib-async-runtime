@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 from collections import defaultdict
 from collections.abc import Collection, Mapping
+from dataclasses import asdict, is_dataclass
 from typing import Any
 
 import gymnasium as gym
@@ -13,6 +15,7 @@ from ray.rllib.algorithms.dqn.torch.default_dqn_torch_rl_module import (
     DefaultDQNTorchRLModule,
 )
 from ray.rllib.algorithms.dqn.torch.dqn_torch_learner import DQNTorchLearner
+from ray.rllib.core import DEFAULT_MODULE_ID
 from ray.rllib.core.columns import Columns
 from ray.rllib.core.rl_module.multi_rl_module import MultiRLModuleSpec
 from ray.rllib.env import INPUT_ENV_SINGLE_SPACES, INPUT_ENV_SPACES
@@ -32,6 +35,7 @@ from rllib_async.learner.sac_adapter import (
 DQN_ADAPTER_STATE_VERSION = 1
 DQN_TARGET_UPDATE_STATE = SAC_TARGET_UPDATE_STATE
 DQNUpdateResult = LearnerUpdateResult
+C51_DUELING_HEAD_VERSION = 2
 
 
 class DQNBatchError(ValueError):
@@ -73,8 +77,15 @@ def validate_dqn_config(
             or module_config.n_step < 1
         ):
             raise ValueError("DQN n_step must be a positive integer")
-        if module_config.noisy:
-            raise ValueError("noisy DQN is not supported by the pinned RLlib module")
+        if not isinstance(module_config.noisy, bool):
+            raise ValueError("DQN noisy must be a bool")
+        if module_config.noisy and (
+            not isinstance(module_config.sigma0, int | float)
+            or isinstance(module_config.sigma0, bool)
+            or not np.isfinite(module_config.sigma0)
+            or module_config.sigma0 <= 0
+        ):
+            raise ValueError("noisy DQN requires finite positive sigma0")
         if module_config.burn_in_len:
             raise ValueError(
                 "recurrent DQN requires sequence replay and burn-in support"
@@ -135,13 +146,29 @@ def prepare_dqn_config(config: DQNConfig) -> DQNConfig:
     prepared = config.copy(copy_frozen=False)
     spec = prepared.rl_module_spec
     specs = (
-        spec.rl_module_specs.values()
+        spec.rl_module_specs.items()
         if isinstance(spec, MultiRLModuleSpec)
-        else (spec,)
+        else ((DEFAULT_MODULE_ID, spec),)
     )
-    for item in specs:
+    for module_id, item in specs:
         if item.module_class is DefaultDQNTorchRLModule:
             item.module_class = ActionMaskedDQNTorchRLModule
+        module_config = prepared.get_config_for_module(module_id)
+        model = item.model_config or {}
+        if is_dataclass(model):
+            model = asdict(model)
+        if "noisy" in model and model["noisy"] != module_config.noisy:
+            raise ValueError("configure noisy through DQNConfig.training(noisy=...)")
+        if module_config.noisy:
+            if not isinstance(item.module_class, type) or not issubclass(
+                item.module_class, ActionMaskedDQNTorchRLModule
+            ):
+                raise ValueError("noisy DQN requires a supported DQN module class")
+            item.model_config = {
+                **model,
+                "noisy": True,
+                "std_init": module_config.sigma0,
+            }
     prepared.rl_module(rl_module_spec=spec)
     return prepared
 
@@ -251,7 +278,9 @@ class DQNLearnerAdapter(_LocalOffPolicyLearnerAdapter):
         "learner_config_dict",
         "lr",
         "n_step",
+        "noisy",
         "num_atoms",
+        "sigma0",
         "target_network_update_freq",
         "tau",
         "td_error_loss_fn",
@@ -288,6 +317,49 @@ class DQNLearnerAdapter(_LocalOffPolicyLearnerAdapter):
             validate_startup=validate_startup,
             publish_updates=publish_updates,
         )
+        configs = (
+            config,
+            *(
+                config.get_config_for_module(module_id)
+                for module_id in config.algorithm_config_overrides_per_module
+            ),
+        )
+        self._c51_dueling = any(
+            item.dueling and item.num_atoms > 1 for item in configs
+        )
+
+    def get_state(self) -> dict[str, Any]:
+        state = super().get_state()
+        if self._c51_dueling:
+            state["c51_dueling_head_version"] = C51_DUELING_HEAD_VERSION
+        return state
+
+    def set_state(self, state: Mapping[str, Any]) -> None:
+        if not isinstance(state, Mapping):
+            raise ValueError("adapter state must be a mapping")
+        if (
+            self._c51_dueling
+            and state.get("c51_dueling_head_version") != C51_DUELING_HEAD_VERSION
+        ):
+            raise ValueError(
+                "legacy C51 dueling checkpoint has a scalar value head; "
+                "resume requires the per-atom value-head checkpoint version"
+            )
+        # Non-noisy stage-1/2 checkpoints predate these two config fields. Their
+        # network shape and next-update semantics are unchanged.
+        contract = state.get("config_contract")
+        if (
+            isinstance(contract, Mapping)
+            and "noisy" not in contract
+            and "sigma0" not in contract
+        ):
+            state = copy.deepcopy(dict(state))
+            state["config_contract"] = {
+                **contract,
+                "noisy": False,
+                "sigma0": self._config.sigma0,
+            }
+        super().set_state(state)
 
     def _build_batch(
         self, batch: Mapping[str, Any], *, validate: bool

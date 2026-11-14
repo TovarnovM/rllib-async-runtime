@@ -30,6 +30,7 @@ from rllib_async.replay.reference import (
 )
 from rllib_async.replay.sequences import (
     SequenceConfig,
+    SequenceReadView,
     SequenceWindow,
     make_sequence_window,
 )
@@ -107,6 +108,7 @@ class _MaterializedView:
     sequence_positions: Mapping[
         tuple[int, str], tuple[tuple[tuple[int, ...], int], ...]
     ]
+    sequence_views: Mapping[str, SequenceReadView]
 
 
 @dataclass(frozen=True, slots=True)
@@ -584,6 +586,35 @@ class FastReplay:
             )
         return windows
 
+    def get_sequence_view(self, module_id: str) -> SequenceReadView:
+        """Capture one shared index/payload lease without rebuilding or decoding."""
+        if not isinstance(self._codec, SequenceEpisodeCodec):
+            raise TypeError("sequence sampling requires raw physical-time episode data")
+        view = self._capture_active_view()
+        sequence_view = view.sequence_views.get(module_id)
+        if sequence_view is not None:
+            return sequence_view
+        return SequenceReadView(
+            view.cursor,
+            module_id,
+            self._codec,
+            MappingProxyType({}),
+            MappingProxyType({}),
+            MappingProxyType({}),
+            (),
+            (),
+        )
+
+    def episode_retained(self, episode_id: str, store_generation: str) -> bool:
+        """Check logical retention before applying a late learner-local priority."""
+        with self._condition:
+            self._ensure_open_locked()
+            return (
+                self._target is not None
+                and self._target.cursor.store_generation == store_generation
+                and episode_id in self._records
+            )
+
     def close(
         self,
         *,
@@ -729,6 +760,37 @@ class FastReplay:
             )
             for module_id in sorted(module_totals)
         }
+        sequence_views = {}
+        if isinstance(module_codec, SequenceEpisodeCodec):
+            for module_id, index in module_sampling_indices.items():
+                episode_map = {
+                    episodes[position].episode_id: episodes[position]
+                    for position in index.episode_indices
+                }
+                sequence_views[module_id] = SequenceReadView(
+                    cursor=request.cursor,
+                    module_id=module_id,
+                    codec=module_codec,
+                    episodes=MappingProxyType(episode_map),
+                    positions=MappingProxyType(
+                        {
+                            episodes[position].episode_id: sequence_positions[
+                                position, module_id
+                            ]
+                            for position in index.episode_indices
+                        }
+                    ),
+                    decision_ids=MappingProxyType(
+                        {
+                            episode_id: module_codec.module_decision_ids(
+                                episode, module_id
+                            )
+                            for episode_id, episode in episode_map.items()
+                        }
+                    ),
+                    episode_ids=tuple(episode_map),
+                    cumulative_lengths=index.cumulative_lengths,
+                )
         return _MaterializedView(
             cursor=request.cursor,
             episodes=tuple(episodes),
@@ -744,6 +806,7 @@ class FastReplay:
                 sorted(producer_transition_counts.items())
             ),
             sequence_positions=MappingProxyType(sequence_positions),
+            sequence_views=MappingProxyType(sequence_views),
         )
 
     def _schedule_rebuild_locked(self) -> None:

@@ -32,8 +32,10 @@ from ray.rllib.utils.metrics import (
     NUM_AGENT_STEPS_SAMPLED_LIFETIME,
     NUM_ENV_STEPS_SAMPLED_LIFETIME,
     NUM_TARGET_UPDATES,
+    TD_ERROR_KEY,
     WEIGHTS_SEQ_NO,
 )
+from ray.rllib.utils.numpy import convert_to_numpy
 
 from rllib_async.gnn.graph_batch import validate_packed_graph_batch
 from rllib_async.protocols.weights import WeightsDescriptor
@@ -93,8 +95,12 @@ class PBTModelState:
     model_fingerprint: str
     module_state: Mapping[str, Any]
     temperature_state: Mapping[str, Any]
+    algorithm: str = "SAC"
+    config_contract: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.algorithm not in {"SAC", "DQN"}:
+            raise ValueError("unsupported PBT algorithm")
         if (
             not isinstance(self.state_version, int)
             or isinstance(self.state_version, bool)
@@ -111,9 +117,48 @@ class PBTModelState:
             ("module_state", self.module_state),
             ("temperature_state", self.temperature_state),
         ):
-            if not isinstance(value, Mapping) or not value:
+            if not isinstance(value, Mapping) or (
+                not value and (name == "module_state" or self.algorithm == "SAC")
+            ):
                 raise ValueError(f"{name} must be a non-empty mapping")
             object.__setattr__(self, name, copy.deepcopy(dict(value)))
+        if self.algorithm == "DQN" and self.temperature_state:
+            raise ValueError("DQN PBT state cannot contain SAC temperature")
+        if self.config_contract is not None:
+            if not isinstance(self.config_contract, Mapping):
+                raise ValueError("PBT configuration contract must be a mapping")
+            object.__setattr__(
+                self, "config_contract", copy.deepcopy(dict(self.config_contract))
+            )
+
+    def __getstate__(self) -> list[Any]:
+        return [
+            self.state_version,
+            self.spaces_fingerprint,
+            self.model_fingerprint,
+            self.module_state,
+            self.temperature_state,
+            self.algorithm,
+            self.config_contract,
+        ]
+
+    def __setstate__(self, state: list[Any]) -> None:
+        if len(state) == 5:
+            state = [*state, "SAC", None]
+        if len(state) != 7:
+            raise ValueError("invalid PBT model state")
+        names = (
+            "state_version",
+            "spaces_fingerprint",
+            "model_fingerprint",
+            "module_state",
+            "temperature_state",
+            "algorithm",
+            "config_contract",
+        )
+        for name, value in zip(names, state, strict=True):
+            object.__setattr__(self, name, value)
+        self.__post_init__()
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +171,7 @@ class LearnerUpdateResult:
     sampled_agent_steps: int
     learner_results: list[dict[str, Any]] | None
     published_weights: WeightsDescriptor | None
+    priority_errors: Mapping[str, np.ndarray] | None = None
 
 
 # Preserve the public SAC result type and checkpoint import path.
@@ -732,6 +778,7 @@ class _LocalOffPolicyLearnerAdapter:
         *,
         sampled_env_steps: int,
         sampled_agent_steps: int | None = None,
+        return_priority_errors: bool = False,
     ) -> LearnerUpdateResult:
         """Perform at most one RLlib update at absolute sampled-step counters."""
 
@@ -755,6 +802,7 @@ class _LocalOffPolicyLearnerAdapter:
             rllib_batch,
             sampled_env_steps=sampled_env_steps,
             sampled_agent_steps=sampled_agent_steps,
+            return_priority_errors=return_priority_errors,
         )
         self._validate_next_batch = False
         return update
@@ -765,6 +813,7 @@ class _LocalOffPolicyLearnerAdapter:
         *,
         sampled_env_steps: int,
         sampled_agent_steps: int,
+        return_priority_errors: bool = False,
     ) -> LearnerUpdateResult:
         """Update a non-empty subset without advancing untouched module hooks."""
 
@@ -793,6 +842,7 @@ class _LocalOffPolicyLearnerAdapter:
             rllib_batch,
             sampled_env_steps=sampled_env_steps,
             sampled_agent_steps=sampled_agent_steps,
+            return_priority_errors=return_priority_errors,
         )
         self._validate_next_batch = False
         return update
@@ -835,6 +885,7 @@ class _LocalOffPolicyLearnerAdapter:
         *,
         sampled_env_steps: int,
         sampled_agent_steps: int,
+        return_priority_errors: bool = False,
     ) -> LearnerUpdateResult:
         learner_results = self._learner_group.update(
             batch=learner_batch,
@@ -843,6 +894,11 @@ class _LocalOffPolicyLearnerAdapter:
                 NUM_AGENT_STEPS_SAMPLED_LIFETIME: sampled_agent_steps,
                 "rllib_async_updated_modules": tuple(learner_batch.policy_batches),
             },
+        )
+        priority_errors = self._take_priority_errors(
+            learner_results,
+            learner_batch,
+            enabled=return_priority_errors,
         )
         self._learner_updates += 1
         published_weights = (
@@ -855,7 +911,50 @@ class _LocalOffPolicyLearnerAdapter:
             sampled_agent_steps=sampled_agent_steps,
             learner_results=learner_results,
             published_weights=published_weights,
+            priority_errors=priority_errors,
         )
+
+    def _take_priority_errors(
+        self,
+        results: list[dict[str, Any]],
+        batch: MultiAgentBatch,
+        *,
+        enabled: bool,
+    ) -> dict[str, np.ndarray] | None:
+        """Consume RLlib's item-series signal once, without retaining it in reports.
+
+        DQN uses absolute TD error, C51 uses its distributional cross entropy,
+        and SAC uses the mean absolute error of its critics. No loss is changed.
+        """
+
+        pieces: dict[str, list[np.ndarray]] = defaultdict(list)
+        for result in results:
+            for module_id, module_result in result.items():
+                if not isinstance(module_result, dict):
+                    continue
+                signal = module_result.pop(TD_ERROR_KEY, None)
+                if signal is not None and enabled and module_id in batch.policy_batches:
+                    pieces[module_id].extend(convert_to_numpy(signal.peek()))
+        if not enabled:
+            return None
+        if set(pieces) != set(batch.policy_batches):
+            raise self._adapter_error(
+                "learner priority signals do not match batch modules"
+            )
+        errors = {}
+        for module_id, chunks in pieces.items():
+            if not chunks:
+                raise self._adapter_error("learner priority signal is empty")
+            values = np.concatenate(chunks, axis=0).reshape(-1)
+            if (
+                values.shape != (batch.policy_batches[module_id].count,)
+                or not np.isfinite(values).all()
+            ):
+                raise self._adapter_error(
+                    "learner priority signal is not aligned with loss rows"
+                )
+            errors[module_id] = values
+        return errors
 
     def _skipped_update_result(
         self,
@@ -1111,6 +1210,123 @@ class _LocalOffPolicyLearnerAdapter:
             state=state,
         )
 
+    def export_pbt_state(self) -> PBTModelState:
+        """Export model state without optimizer, RNG, counters, or member identity."""
+
+        self._require_open()
+        learner_group_state = self._learner_group.get_state(
+            components=f"{COMPONENT_LEARNER}/{COMPONENT_RL_MODULE}",
+        )
+        learner_state = learner_group_state.get(COMPONENT_LEARNER)
+        if not isinstance(learner_state, Mapping):
+            raise self._adapter_error("learner state is missing")
+        module_state = learner_state.get(COMPONENT_RL_MODULE)
+        learner = getattr(self._learner_group, "_learner", None)
+        temperature_state = (
+            learner.get_temperature_state() if self._algorithm == "SAC" else {}
+        )
+        if not isinstance(module_state, Mapping):
+            raise self._adapter_error("learner PBT state is incomplete")
+        return PBTModelState(
+            state_version=PBT_MODEL_STATE_VERSION,
+            spaces_fingerprint=self._spaces_fingerprint,
+            model_fingerprint=self._fingerprint_model_state(module_state),
+            module_state=module_state,
+            temperature_state=temperature_state,
+            algorithm=self._algorithm,
+            config_contract=self._pbt_config_contract(),
+        )
+
+    def _pbt_config_contract(self) -> dict[str, Any]:
+        return {
+            "algorithm": self._algorithm,
+            "learner": {
+                key: value
+                for key, value in self._config_contract.items()
+                if key not in {"lr", "actor_lr", "critic_lr", "alpha_lr"}
+            },
+            "modules": copy.deepcopy(self._module_config_contract),
+        }
+
+    def validate_pbt_state(
+        self, state: PBTModelState, *, require_fresh: bool = False
+    ) -> None:
+        """Validate a transfer without changing a live learner or its clocks."""
+
+        self._require_open()
+        if not isinstance(state, PBTModelState):
+            raise TypeError("state must be PBTModelState")
+        if state.state_version != PBT_MODEL_STATE_VERSION:
+            raise ValueError("unsupported PBT model state version")
+        if state.algorithm != self._algorithm:
+            raise ValueError("PBT algorithms do not match")
+        if state.config_contract is not None:
+            if state.config_contract != self._pbt_config_contract():
+                raise ValueError("PBT algorithm/model configuration does not match")
+        elif self._algorithm != "SAC":
+            raise ValueError("DQN PBT requires a complete configuration contract")
+        if state.spaces_fingerprint != self._spaces_fingerprint:
+            raise ValueError("PBT observation/action spaces do not match")
+        if require_fresh and any(
+            value != 0
+            for value in (
+                self._learner_updates,
+                self._sampled_env_steps,
+                self._sampled_agent_steps,
+                self._last_published_update,
+            )
+        ):
+            raise self._adapter_error("PBT state requires a fresh learner")
+        if state.model_fingerprint != self._fingerprint_model_state(state.module_state):
+            raise ValueError("PBT model state fingerprint is invalid")
+
+        learner_group_state = self._learner_group.get_state(
+            components=f"{COMPONENT_LEARNER}/{COMPONENT_RL_MODULE}",
+        )
+        learner_state = learner_group_state.get(COMPONENT_LEARNER)
+        if not isinstance(learner_state, Mapping):
+            raise self._adapter_error("learner state is missing")
+        current_module_state = learner_state.get(COMPONENT_RL_MODULE)
+        if not isinstance(current_module_state, Mapping):
+            raise self._adapter_error("learner model state is missing")
+        if state.model_fingerprint != self._fingerprint_model_state(
+            current_module_state
+        ):
+            raise ValueError("PBT model structure does not match")
+        if self._algorithm == "SAC":
+            self._learner_group._learner._validate_temperatures(state.temperature_state)
+        elif state.temperature_state:
+            raise ValueError("DQN PBT state cannot contain SAC temperature")
+
+    def load_pbt_state(self, state: PBTModelState) -> WeightsDescriptor:
+        """Import all model/target state; optimizer, clocks and RNG stay fresh."""
+
+        self.validate_pbt_state(state, require_fresh=True)
+
+        imported_state = {
+            COMPONENT_LEARNER: {
+                COMPONENT_RL_MODULE: copy.deepcopy(state.module_state),
+            }
+        }
+        if self._algorithm == "SAC":
+            imported_state[COMPONENT_LEARNER][SAC_TEMPERATURE_STATE] = copy.deepcopy(
+                state.temperature_state
+            )
+        self._learner_group.set_state(imported_state)
+
+        module_versions = {
+            module_id: version + 1
+            for module_id, version in self._module_versions.items()
+        }
+        descriptor = self._new_descriptor(
+            self._get_inference_module_state(),
+            module_versions=module_versions,
+            learner_updates=0,
+        )
+        self._module_versions = module_versions
+        self._latest_weights = descriptor
+        return copy.deepcopy(descriptor)
+
     def _get_inference_module_state(self) -> dict[str, Any]:
         state = self._learner_group.get_state(
             components=f"{COMPONENT_LEARNER}/{COMPONENT_RL_MODULE}",
@@ -1320,84 +1536,3 @@ class SACLearnerAdapter(_LocalOffPolicyLearnerAdapter):
         batches: Mapping[str, Mapping[str, Any]], *, validate: bool
     ) -> MultiAgentBatch:
         return build_rllib_multi_module_sac_batch(batches, validate=validate)
-
-    def export_pbt_state(self) -> PBTModelState:
-        """Export model state without optimizer, RNG, counters, or member identity."""
-
-        self._require_open()
-        learner_group_state = self._learner_group.get_state(
-            components=f"{COMPONENT_LEARNER}/{COMPONENT_RL_MODULE}",
-        )
-        learner_state = learner_group_state.get(COMPONENT_LEARNER)
-        if not isinstance(learner_state, Mapping):
-            raise SACLearnerAdapterError("learner state is missing")
-        module_state = learner_state.get(COMPONENT_RL_MODULE)
-        learner = getattr(self._learner_group, "_learner", None)
-        if not isinstance(learner, CheckpointableSACTorchLearner):
-            raise SACLearnerAdapterError("checkpointable SAC learner is missing")
-        temperature_state = learner.get_temperature_state()
-        if not isinstance(module_state, Mapping):
-            raise SACLearnerAdapterError("learner PBT state is incomplete")
-        return PBTModelState(
-            state_version=PBT_MODEL_STATE_VERSION,
-            spaces_fingerprint=self._spaces_fingerprint,
-            model_fingerprint=self._fingerprint_model_state(module_state),
-            module_state=module_state,
-            temperature_state=temperature_state,
-        )
-
-    def load_pbt_state(self, state: PBTModelState) -> WeightsDescriptor:
-        """Import model state into a fresh learner and publish target-owned weights."""
-
-        self._require_open()
-        if not isinstance(state, PBTModelState):
-            raise TypeError("state must be PBTModelState")
-        if state.spaces_fingerprint != self._spaces_fingerprint:
-            raise ValueError("PBT observation/action spaces do not match")
-        if any(
-            value != 0
-            for value in (
-                self._learner_updates,
-                self._sampled_env_steps,
-                self._sampled_agent_steps,
-                self._last_published_update,
-            )
-        ):
-            raise SACLearnerAdapterError("PBT state requires a fresh learner")
-        if state.model_fingerprint != self._fingerprint_model_state(state.module_state):
-            raise ValueError("PBT model state fingerprint is invalid")
-
-        learner_group_state = self._learner_group.get_state(
-            components=f"{COMPONENT_LEARNER}/{COMPONENT_RL_MODULE}",
-        )
-        learner_state = learner_group_state.get(COMPONENT_LEARNER)
-        if not isinstance(learner_state, Mapping):
-            raise SACLearnerAdapterError("fresh learner state is missing")
-        current_module_state = learner_state.get(COMPONENT_RL_MODULE)
-        if not isinstance(current_module_state, Mapping):
-            raise SACLearnerAdapterError("fresh learner model state is missing")
-        if state.model_fingerprint != self._fingerprint_model_state(
-            current_module_state
-        ):
-            raise ValueError("PBT model structure does not match")
-
-        imported_state = {
-            COMPONENT_LEARNER: {
-                COMPONENT_RL_MODULE: copy.deepcopy(state.module_state),
-                SAC_TEMPERATURE_STATE: copy.deepcopy(state.temperature_state),
-            }
-        }
-        self._learner_group.set_state(imported_state)
-
-        module_versions = {
-            module_id: version + 1
-            for module_id, version in self._module_versions.items()
-        }
-        descriptor = self._new_descriptor(
-            self._get_inference_module_state(),
-            module_versions=module_versions,
-            learner_updates=0,
-        )
-        self._module_versions = module_versions
-        self._latest_weights = descriptor
-        return copy.deepcopy(descriptor)

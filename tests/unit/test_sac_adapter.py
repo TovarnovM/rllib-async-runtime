@@ -20,7 +20,9 @@ from ray.rllib.env.single_agent_env_runner import SingleAgentEnvRunner
 from ray.rllib.utils.metrics import (
     NUM_AGENT_STEPS_SAMPLED_LIFETIME,
     NUM_ENV_STEPS_SAMPLED_LIFETIME,
+    TD_ERROR_KEY,
 )
+from ray.rllib.utils.numpy import convert_to_numpy
 
 from rllib_async.examples import (
     HIERARCHY_MODULE_IDS,
@@ -204,8 +206,11 @@ def test_multi_module_adapter_updates_discrete_manager_and_continuous_workers() 
             {WORKER_0_MODULE_ID: worker_0_batch},
             sampled_env_steps=16,
             sampled_agent_steps=32,
+            return_priority_errors=True,
         )
         assert result.performed
+        assert set(result.priority_errors) == {WORKER_0_MODULE_ID}
+        assert result.priority_errors[WORKER_0_MODULE_ID].shape == (8,)
         after = adapter.get_state()["learner_group"]["learner"]
         for mid in (MANAGER_MODULE_ID, WORKER_1_MODULE_ID):
             assert_tree_close(
@@ -361,6 +366,9 @@ def test_adapter_matches_stock_rllib_fixed_batch_and_target_schedule() -> None:
         adapter_state = adapter.get_state()
         baseline.set_state(copy.deepcopy(adapter_state["learner_group"]))
         flat_batch = make_fixed_batch()
+        flat_batch["weights"] = np.linspace(
+            0.1, 1.0, len(flat_batch[Columns.REWARDS]), dtype=np.float32
+        )
         rllib_batch = build_rllib_sac_batch(flat_batch)
 
         initial = adapter.get_published_weights()
@@ -381,11 +389,27 @@ def test_adapter_matches_stock_rllib_fixed_batch_and_target_schedule() -> None:
             adapter_result = adapter.update(
                 flat_batch,
                 sampled_env_steps=sampled_steps,
+                return_priority_errors=True,
             )
 
             assert adapter_result.performed
             assert_finite_losses(baseline_result)
             assert_finite_losses(adapter_result.learner_results)
+            expected_errors = np.concatenate(
+                convert_to_numpy(
+                    baseline_result[0][DEFAULT_MODULE_ID][TD_ERROR_KEY].peek()
+                )
+            )
+            np.testing.assert_allclose(
+                adapter_result.priority_errors[DEFAULT_MODULE_ID],
+                expected_errors,
+                rtol=1e-6,
+                atol=1e-7,
+            )
+            assert (
+                TD_ERROR_KEY
+                not in adapter_result.learner_results[0][DEFAULT_MODULE_ID]
+            )
             assert_tree_close(
                 loss_values(baseline_result),
                 loss_values(adapter_result.learner_results),
@@ -589,6 +613,8 @@ def test_pbt_state_transfers_full_model_and_temperature_with_fresh_optimizer() -
             "model_fingerprint",
             "module_state",
             "temperature_state",
+            "algorithm",
+            "config_contract",
         }
         assert any(
             "target" in path.lower()
@@ -655,6 +681,21 @@ def test_pbt_state_transfers_full_model_and_temperature_with_fresh_optimizer() -
         if incompatible_target is not None:
             incompatible_target.close()
         runner.stop()
+
+
+def test_legacy_sac_pbt_pickle_fields_keep_their_algorithm() -> None:
+    restored = object.__new__(PBTModelState)
+    restored.__setstate__([
+        1,
+        "spaces",
+        "model",
+        {DEFAULT_MODULE_ID: {"weight": np.zeros(2, dtype=np.float32)}},
+        {DEFAULT_MODULE_ID: np.zeros(1, dtype=np.float32)},
+    ])
+    assert restored.algorithm == "SAC"
+    assert restored.config_contract is None
+    round_trip = pickle.loads(pickle.dumps(restored))
+    assert_tree_close(round_trip.module_state, restored.module_state)
 
 
 @pytest.mark.parametrize("validate_startup", [False, True])

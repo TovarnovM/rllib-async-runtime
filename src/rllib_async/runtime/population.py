@@ -1,4 +1,4 @@
-"""Legacy fixed and single-trial PBT SAC population runtimes."""
+"""Fixed SAC populations and single-trial PBT for SAC or mixed teams."""
 
 from __future__ import annotations
 
@@ -19,14 +19,23 @@ from typing import Any, Literal
 import ray
 from ray import cloudpickle, tune
 from ray.air import RunConfig
+from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
+from ray.rllib.algorithms.dqn import DQNConfig
 from ray.rllib.algorithms.sac import SACConfig
 from ray.tune import ResultGrid, Trainable
 from ray.tune.execution.placement_groups import PlacementGroupFactory
 
 from rllib_async.learner import PBTModelState, SACLearnerAdapter
-from rllib_async.protocols import FlatEpisodeCodec, ReplayCursor, ReplayStats
+from rllib_async.protocols import (
+    FlatEpisodeCodec,
+    RawMultiModuleEpisodeCodec,
+    ReplayCursor,
+    ReplayStats,
+)
 from rllib_async.replay import ReplayActor
+from rllib_async.replay.prioritized import PrioritizedReplayConfig
 from rllib_async.replay.reference import EpisodeStoreState
+from rllib_async.replay.sequences import SequenceConfig
 from rllib_async.runtime.checkpoint import (
     InvalidPopulationCheckpointError,
     PopulationCheckpoint,
@@ -44,6 +53,11 @@ from rllib_async.runtime.controller import (
     AsyncSACTrainable,
     RuntimeState,
     SingleMemberAsyncSAC,
+)
+from rllib_async.runtime.team import (
+    SingleMemberAsyncTeam,
+    _rollout_contract,
+    prepare_team_config,
 )
 
 
@@ -87,6 +101,17 @@ _SAC_STRUCTURAL_SETTINGS = (
     "enable_rl_module_and_learner",
     "enable_env_runner_and_connector_v2",
 )
+
+
+def _allowed_mutation_name(name: object) -> bool:
+    if not isinstance(name, str):
+        return False
+    if name in _MUTABLE_HPARAMS:
+        return True
+    parts = name.split("/")
+    return len(parts) == 2 and bool(parts[0]) and parts[1] in (
+        "lr", *_MUTABLE_HPARAMS
+    )
 
 
 def _config_value_fingerprint(value: object) -> str:
@@ -206,7 +231,7 @@ class SimplePBTConfig:
         mutations = self.mutations
         if not isinstance(mutations, Mapping):
             raise TypeError("mutations must be a mapping")
-        unknown = set(mutations) - set(_MUTABLE_HPARAMS)
+        unknown = {name for name in mutations if not _allowed_mutation_name(name)}
         if unknown:
             raise ValueError(f"unknown PBT mutation keys {sorted(unknown)!r}")
         resolved: dict[str, FloatMutation] = {}
@@ -248,6 +273,8 @@ class _PBTMemberCheckpointMetadata:
     sac_seed: int
     env_fingerprint: str
     env_config_fingerprint: str
+    team_contract: str | None = None
+    module_seeds: Mapping[str, int] | None = None
 
     @classmethod
     def from_mapping(
@@ -266,6 +293,10 @@ class _PBTMemberCheckpointMetadata:
             "env_fingerprint",
             "env_config_fingerprint",
         }
+        team_contract = value.get("team_contract")
+        if team_contract is not None:
+            expected -= set(_MUTABLE_HPARAMS)
+            expected |= {"team_contract", "module_seeds", "team_hparams"}
         if set(value) != expected:
             raise ValueError(f"PBT member {slot_id!r} metadata fields do not match")
         generation = value["generation"]
@@ -297,7 +328,30 @@ class _PBTMemberCheckpointMetadata:
             ):
                 raise ValueError(f"PBT member {slot_id!r} {name} is invalid")
             fingerprints[name] = fingerprint
-        hparams = {name: value[name] for name in _MUTABLE_HPARAMS}
+        module_seeds = None
+        if team_contract is None:
+            hparams = {name: value[name] for name in _MUTABLE_HPARAMS}
+        else:
+            if (
+                not isinstance(team_contract, str)
+                or len(team_contract) != 64
+                or any(c not in "0123456789abcdef" for c in team_contract)
+            ):
+                raise ValueError("PBT team contract is invalid")
+            module_seeds = value["module_seeds"]
+            hparams = value["team_hparams"]
+            if not isinstance(module_seeds, Mapping) or not module_seeds or any(
+                not isinstance(mid, str) or not mid or type(seed) is not int
+                for mid, seed in module_seeds.items()
+            ):
+                raise ValueError("PBT module seeds are invalid")
+            if not isinstance(hparams, Mapping) or not hparams or any(
+                not _allowed_mutation_name(name)
+                or "/" not in name
+                or name.split("/")[0] not in module_seeds
+                for name in hparams
+            ):
+                raise ValueError("PBT team learning-rate keys are invalid")
         return cls(
             generation=generation,
             runtime_member_id=runtime_member_id,
@@ -306,13 +360,23 @@ class _PBTMemberCheckpointMetadata:
             sac_seed=sac_seed,
             env_fingerprint=fingerprints["env_fingerprint"],
             env_config_fingerprint=fingerprints["env_config_fingerprint"],
+            team_contract=team_contract,
+            module_seeds=module_seeds,
         )
 
     def to_mapping(self) -> dict[str, Any]:
         return {
             "generation": self.generation,
             "runtime_member_id": self.runtime_member_id,
-            **dict(self.hparams),
+            **(
+                dict(self.hparams)
+                if self.team_contract is None
+                else {
+                    "team_hparams": dict(self.hparams),
+                    "team_contract": self.team_contract,
+                    "module_seeds": dict(self.module_seeds or {}),
+                }
+            ),
             "exploit_count_as_target": self.exploit_count_as_target,
             "sac_seed": self.sac_seed,
             "env_fingerprint": self.env_fingerprint,
@@ -349,7 +413,7 @@ class _PBTCheckpointMetadata:
             }
             if set(value) != expected:
                 raise ValueError("PBT checkpoint metadata fields do not match")
-            if value["schema_version"] != _PBT_CHECKPOINT_SCHEMA_VERSION:
+            if value["schema_version"] not in (_PBT_CHECKPOINT_SCHEMA_VERSION, 3):
                 raise ValueError("unsupported PBT checkpoint schema version")
             run_id = _validate_id_segment(value["run_id"], name="PBT run_id")
             counters: dict[str, int] = {}
@@ -390,6 +454,11 @@ class _PBTCheckpointMetadata:
                 )
                 for slot_id, item in raw_members.items()
             }
+            if any(
+                (member.team_contract is not None) != (value["schema_version"] == 3)
+                for member in members.values()
+            ):
+                raise ValueError("PBT metadata schema does not match member type")
             if len(members) != counters["population_size"]:
                 raise ValueError(
                     "PBT checkpoint population size does not match members"
@@ -446,7 +515,14 @@ class _PBTCheckpointMetadata:
 
     def to_mapping(self) -> dict[str, Any]:
         return {
-            "schema_version": _PBT_CHECKPOINT_SCHEMA_VERSION,
+            "schema_version": (
+                3
+                if any(
+                    member.team_contract is not None
+                    for member in self.members.values()
+                )
+                else _PBT_CHECKPOINT_SCHEMA_VERSION
+            ),
             "run_id": self.run_id,
             "population_report_index": self.population_report_index,
             "reports_since_perturbation": self.reports_since_perturbation,
@@ -499,14 +575,138 @@ def _member_trial_directory(trial: Any) -> str:
 class PopulationMemberSpec:
     """One fixed Tune member configuration."""
 
-    sac_config: SACConfig
+    sac_config: AlgorithmConfig
     runtime_config: AsyncSACRuntimeConfig
+    module_configs: Mapping[str, SACConfig | DQNConfig] | None = None
+    trainable_modules: tuple[str, ...] | None = None
+    sequence_configs: Mapping[str, SequenceConfig] | None = None
+    per_configs: Mapping[str, PrioritizedReplayConfig] | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.sac_config, SACConfig):
+        if self.module_configs is None and not isinstance(self.sac_config, SACConfig):
             raise TypeError("sac_config must be an SACConfig")
         if not isinstance(self.runtime_config, AsyncSACRuntimeConfig):
             raise TypeError("runtime_config must be AsyncSACRuntimeConfig")
+        if self.module_configs is not None:
+            rollout, configs, _, trainable, sequences = prepare_team_config(
+                self.sac_config,
+                self.module_configs,
+                self.runtime_config,
+                trainable_modules=self.trainable_modules,
+                sequence_configs=self.sequence_configs,
+            )
+            per_configs = dict(self.per_configs or {})
+            if set(per_configs) - set(trainable) or any(
+                not isinstance(value, PrioritizedReplayConfig)
+                for value in per_configs.values()
+            ):
+                raise ValueError(
+                    "per_configs must map trainable team modules to PER configs"
+                )
+            object.__setattr__(self, "sac_config", rollout)
+            object.__setattr__(self, "module_configs", configs)
+            object.__setattr__(self, "trainable_modules", trainable)
+            object.__setattr__(self, "sequence_configs", sequences)
+            object.__setattr__(self, "per_configs", per_configs)
+        elif any(
+            value is not None
+            for value in (
+                self.trainable_modules, self.sequence_configs, self.per_configs
+            )
+        ):
+            raise ValueError("team sampling settings require module_configs")
+
+    @classmethod
+    def for_team(
+        cls,
+        rollout_config: AlgorithmConfig,
+        module_configs: Mapping[str, SACConfig | DQNConfig],
+        runtime_config: AsyncSACRuntimeConfig,
+        *,
+        trainable_modules: Sequence[str] | None = None,
+        sequence_configs: Mapping[str, SequenceConfig] | None = None,
+        per_configs: Mapping[str, PrioritizedReplayConfig] | None = None,
+    ) -> PopulationMemberSpec:
+        """Describe one mixed team without using the legacy SAC argument name."""
+
+        return cls(
+            rollout_config,
+            runtime_config,
+            module_configs,
+            None if trainable_modules is None else tuple(trainable_modules),
+            sequence_configs,
+            per_configs,
+        )
+
+
+def _member_hparams(member: PopulationMemberSpec) -> dict[str, Any]:
+    if member.module_configs is None:
+        return {name: getattr(member.sac_config, name) for name in _MUTABLE_HPARAMS}
+    return {
+        f"{mid}/{name}": getattr(config, name)
+        for mid, config in sorted(member.module_configs.items())
+        for name in (("lr",) if isinstance(config, DQNConfig) else _MUTABLE_HPARAMS)
+    }
+
+
+def _team_contract(member: PopulationMemberSpec) -> str | None:
+    if member.module_configs is None:
+        return None
+    modules = {}
+    for mid, config in sorted(member.module_configs.items()):
+        values = config.to_dict()
+        for key in ("seed", "lr", *_MUTABLE_HPARAMS):
+            values.pop(key, None)
+        modules[mid] = (type(config).__module__, type(config).__qualname__, values)
+    return _config_value_fingerprint(
+        (
+            _rollout_contract(member.sac_config),
+            modules,
+            member.trainable_modules,
+            member.sequence_configs,
+            member.per_configs,
+        )
+    )
+
+
+def _updated_member(
+    member: PopulationMemberSpec,
+    *,
+    runtime_config: AsyncSACRuntimeConfig,
+    hparams: Mapping[str, Any] | None = None,
+    rollout_seed: int | None = None,
+    module_seeds: Mapping[str, int] | None = None,
+) -> PopulationMemberSpec:
+    rollout = member.sac_config.copy(copy_frozen=False)
+    if rollout_seed is not None:
+        rollout.debugging(seed=rollout_seed)
+    if member.module_configs is None:
+        if hparams is not None:
+            rollout.training(**dict(hparams))
+        return PopulationMemberSpec(rollout, runtime_config)
+    configs = {
+        mid: config.copy(copy_frozen=False)
+        for mid, config in member.module_configs.items()
+    }
+    if hparams is not None:
+        if set(hparams) != set(_member_hparams(member)):
+            raise ValueError("team learning-rate keys do not match module algorithms")
+        for path, value in hparams.items():
+            mid, name = path.split("/")
+            configs[mid].training(**{name: value})
+    if module_seeds is not None:
+        if set(module_seeds) != set(configs):
+            raise ValueError("team module seeds do not match")
+        for mid, seed in module_seeds.items():
+            configs[mid].debugging(seed=seed)
+    return PopulationMemberSpec.for_team(
+        rollout,
+        configs,
+        runtime_config,
+        trainable_modules=member.trainable_modules,
+        sequence_configs=member.sequence_configs,
+        per_configs=member.per_configs,
+    )
 
 
 def _validate_population_members(
@@ -525,6 +725,32 @@ def _validate_population_members(
         return resolved
 
     first_runtime = resolved[0].runtime_config
+    if any(member.module_configs is not None for member in resolved):
+        if any(member.module_configs is None for member in resolved):
+            raise ValueError("flat and mixed members cannot share one replay codec")
+        expected = _team_contract(resolved[0])
+        first_settings = asdict(first_runtime)
+        for name in ("member_id", "seed"):
+            first_settings.pop(name)
+        for member in resolved[1:]:
+            for name in _SHARED_REPLAY_SETTINGS:
+                if getattr(member.runtime_config, name) != getattr(first_runtime, name):
+                    raise ValueError(
+                        f"population members must share replay setting {name!r}"
+                    )
+            if validate_structure:
+                settings = asdict(member.runtime_config)
+                for name in ("member_id", "seed"):
+                    settings.pop(name)
+                if settings != first_settings:
+                    raise ValueError("population members must share runtime topology")
+            if (validate_structure or validate_spaces) and (
+                _team_contract(member) != expected
+            ):
+                raise ValueError(
+                    "population members must share the complete team contract"
+                )
+        return resolved
     first_runtime_settings: dict[str, Any] | None = None
     first_sac_settings: tuple[Any, ...] | None = None
     first_training_intensity: float | None = None
@@ -635,6 +861,10 @@ class PopulationLauncher:
             validate_spaces=True,
             validate_structure=False,
         )
+        if any(member.module_configs is not None for member in self._members):
+            raise ValueError(
+                "mixed teams use PopulationAsyncSAC or PopulationTrainable"
+            )
         member_ids = tuple(member.runtime_config.member_id for member in self._members)
 
         actor_name = (
@@ -871,7 +1101,7 @@ class PopulationLauncher:
 
 
 class PopulationAsyncSAC:
-    """Own N active SAC members and one authoritative replay in one process."""
+    """Own active SAC members or mixed teams with one authoritative replay."""
 
     _POLL_SLEEP_S = 0.001
     _TRAIN_METRIC_KEY = "train/episode_reward_mean"
@@ -913,6 +1143,7 @@ class PopulationAsyncSAC:
         self._member_specs: dict[str, PopulationMemberSpec] = {}
         self._base_runtime_seeds: dict[str, int] = {}
         self._base_sac_seeds: dict[str, int] = {}
+        self._base_module_seeds: dict[str, dict[str, int]] = {}
         for slot_id, member in zip(self._slot_ids, templates, strict=True):
             runtime_member_id = make_runtime_member_id(
                 self._run_id,
@@ -925,9 +1156,16 @@ class PopulationAsyncSAC:
                 if member.sac_config.seed is None
                 else int(member.sac_config.seed)
             )
-            self._member_specs[slot_id] = PopulationMemberSpec(
-                member.sac_config.copy(copy_frozen=False),
-                replace(
+            self._base_module_seeds[slot_id] = {
+                mid: (
+                    member.runtime_config.seed
+                    if config.seed is None else int(config.seed)
+                )
+                for mid, config in (member.module_configs or {}).items()
+            }
+            self._member_specs[slot_id] = _updated_member(
+                member,
+                runtime_config=replace(
                     member.runtime_config,
                     member_id=runtime_member_id,
                 ),
@@ -936,14 +1174,27 @@ class PopulationAsyncSAC:
         self._generations = dict.fromkeys(self._slot_ids, 0)
         self._exploit_count_as_target = dict.fromkeys(self._slot_ids, 0)
         self._current_hparams = {
-            slot_id: {
-                name: getattr(self._member_specs[slot_id].sac_config, name)
-                for name in _MUTABLE_HPARAMS
-            }
+            slot_id: _member_hparams(self._member_specs[slot_id])
             for slot_id in self._slot_ids
         }
         if self._pbt_config is not None:
             for slot_id, hparams in self._current_hparams.items():
+                if set(self._pbt_config.mutations) - set(hparams):
+                    raise ValueError("PBT mutations do not match member algorithms")
+                member = self._member_specs[slot_id]
+                if member.module_configs is not None:
+                    if self._pbt_config.metric_key not in (
+                        self._TRAIN_METRIC_KEY,
+                        "evaluation/latest_return_mean",
+                    ):
+                        raise ValueError(
+                            "mixed PBT fitness must be a team return metric"
+                        )
+                    if any(
+                        name.split("/")[0] not in member.trainable_modules
+                        for name in self._pbt_config.mutations
+                    ):
+                        raise ValueError("PBT cannot mutate a frozen module")
                 for name, value in hparams.items():
                     if (
                         not isinstance(value, int | float)
@@ -1118,6 +1369,12 @@ class PopulationAsyncSAC:
                 raise ValueError(
                     f"exact resume SAC seed for {slot_id!r} does not match checkpoint"
                 )
+            if member_metadata.team_contract != _team_contract(template):
+                raise ValueError("exact resume team contract does not match checkpoint")
+            if member_metadata.module_seeds is not None and dict(
+                member_metadata.module_seeds
+            ) != self._base_module_seeds[slot_id]:
+                raise ValueError("exact resume module seeds do not match checkpoint")
             for name, expected in (
                 ("env", member_metadata.env_fingerprint),
                 ("env_config", member_metadata.env_config_fingerprint),
@@ -1130,11 +1387,6 @@ class PopulationAsyncSAC:
                         f"exact resume SAC {name} for {slot_id!r} "
                         "does not match checkpoint"
                     )
-            sac_config = template.sac_config.copy(copy_frozen=False)
-            sac_config.training(**dict(member_metadata.hparams))
-            sac_config.debugging(
-                seed=self._base_sac_seeds[slot_id] + member_metadata.generation
-            )
             runtime_config = replace(
                 template.runtime_config,
                 member_id=member_metadata.runtime_member_id,
@@ -1149,9 +1401,18 @@ class PopulationAsyncSAC:
                 raise ValueError(
                     f"exact resume runtime config for {slot_id!r} does not match"
                 )
-            restored_specs[slot_id] = PopulationMemberSpec(
-                sac_config,
-                runtime_config,
+            restored_specs[slot_id] = _updated_member(
+                template,
+                runtime_config=runtime_config,
+                hparams=member_metadata.hparams,
+                rollout_seed=self._base_sac_seeds[slot_id] + member_metadata.generation,
+                module_seeds=(
+                    {
+                        mid: seed + member_metadata.generation
+                        for mid, seed in self._base_module_seeds[slot_id].items()
+                    }
+                    if template.module_configs is not None else None
+                ),
             )
             restored_states[slot_id] = checkpoint_state
             expected_runtime_ids.add(member_metadata.runtime_member_id)
@@ -1201,11 +1462,11 @@ class PopulationAsyncSAC:
                     f"PBT checkpoint is missing member {slot_id!r}"
                 )
             target_template = self._member_specs[slot_id]
-            source_sac_config = target_template.sac_config.copy(copy_frozen=False)
-            source_sac_config.training(**dict(member_metadata.hparams))
+            if member_metadata.team_contract != _team_contract(target_template):
+                raise ValueError("warm start team contract does not match checkpoint")
             source_runtime_config = AsyncSACRuntimeConfig.from_mapping(
                 checkpoint_state.runtime_config,
-                sac_config=source_sac_config,
+                sac_config=target_template.sac_config,
             )
             requested_runtime = asdict(target_template.runtime_config)
             source_runtime = asdict(source_runtime_config)
@@ -1217,9 +1478,18 @@ class PopulationAsyncSAC:
                     f"warm start runtime topology for {slot_id!r} does not match"
                 )
             source_states[slot_id] = checkpoint_state
-            source_specs[slot_id] = PopulationMemberSpec(
-                source_sac_config,
-                source_runtime_config,
+            source_specs[slot_id] = _updated_member(
+                target_template,
+                runtime_config=source_runtime_config,
+                hparams=member_metadata.hparams,
+                rollout_seed=member_metadata.sac_seed + member_metadata.generation,
+                module_seeds=(
+                    {
+                        mid: seed + member_metadata.generation
+                        for mid, seed in member_metadata.module_seeds.items()
+                    }
+                    if member_metadata.module_seeds is not None else None
+                ),
             )
             expected_runtime_ids.add(member_metadata.runtime_member_id)
         if set(member_states) != expected_runtime_ids:
@@ -1262,6 +1532,61 @@ class PopulationAsyncSAC:
                         f"[{mutation.low}, {mutation.high}]"
                     )
 
+    def _make_member(
+        self,
+        slot_id: str,
+        member: PopulationMemberSpec,
+        *,
+        checkpoint_state: RuntimeCheckpointState | None = None,
+        pbt_state: Any = None,
+    ) -> SingleMemberAsyncSAC:
+        kwargs = {
+            "replay_actor": self._replay_actor,
+            "reward_window_episodes": (
+                self._pbt_config.reward_window_episodes
+                if self._pbt_config is not None else 100
+            ),
+            "worker_bundle_start": self._worker_bundle_start(slot_id),
+        }
+        if member.module_configs is not None:
+            return SingleMemberAsyncTeam(
+                member.sac_config,
+                member.module_configs,
+                member.runtime_config,
+                trainable_modules=member.trainable_modules,
+                sequence_configs=member.sequence_configs,
+                per_configs=member.per_configs,
+                member_checkpoint_state=checkpoint_state,
+                pbt_state=pbt_state,
+                **kwargs,
+            )
+        if checkpoint_state is not None:
+            return SingleMemberAsyncSAC.from_member_checkpoint_state(
+                member.sac_config, member.runtime_config, checkpoint_state, **kwargs
+            )
+        if pbt_state is not None:
+            return SingleMemberAsyncSAC.from_pbt_state(
+                member.sac_config, member.runtime_config, pbt_state, **kwargs
+            )
+        return SingleMemberAsyncSAC(member.sac_config, member.runtime_config, **kwargs)
+
+    def _warm_start_model_state(self, slot_id: str) -> Any:
+        source = self._warm_start_source_specs[slot_id]
+        state = self._warm_start_source_states[slot_id]
+        if source.module_configs is None:
+            return SingleMemberAsyncSAC.pbt_state_from_member_checkpoint_state(
+                source.sac_config, source.runtime_config, state,
+                replay_actor=self._replay_actor,
+            )
+        return SingleMemberAsyncTeam.pbt_state_from_member_checkpoint_state(
+            source.sac_config, source.module_configs, source.runtime_config, state,
+            replay_actor=self._replay_actor,
+            trainable_modules=source.trainable_modules,
+            sequence_configs=source.sequence_configs,
+            per_configs=source.per_configs,
+            worker_bundle_start=self._worker_bundle_start(slot_id),
+        )
+
     def start(self) -> None:
         if self._state is RuntimeState.RUNNING:
             return
@@ -1275,7 +1600,11 @@ class PopulationAsyncSAC:
                 num_cpus=replay_config.num_cpus_per_replay,
                 **replay_config.core_actor_options(),
             ).remote(
-                FlatEpisodeCodec(),
+                (
+                    RawMultiModuleEpisodeCodec()
+                    if self._member_specs[self._slot_ids[0]].module_configs is not None
+                    else FlatEpisodeCodec()
+                ),
                 capacity_transitions=replay_config.replay_capacity_transitions,
                 capacity_bytes=replay_config.replay_capacity_bytes,
                 journal_capacity=replay_config.replay_journal_capacity,
@@ -1300,51 +1629,21 @@ class PopulationAsyncSAC:
                 self._checkpoint_replay_state = None
             for slot_id in self._slot_ids:
                 member = self._member_specs[slot_id]
-                reward_window_episodes = (
-                    self._pbt_config.reward_window_episodes
-                    if self._pbt_config is not None
-                    else 100
-                )
                 if self._checkpoint_member_states is not None:
-                    self._members[slot_id] = (
-                        SingleMemberAsyncSAC.from_member_checkpoint_state(
-                            member.sac_config,
-                            member.runtime_config,
-                            self._checkpoint_member_states[slot_id],
-                            replay_actor=self._replay_actor,
-                            reward_window_episodes=reward_window_episodes,
-                            worker_bundle_start=self._worker_bundle_start(slot_id),
-                        )
+                    self._members[slot_id] = self._make_member(
+                        slot_id, member,
+                        checkpoint_state=self._checkpoint_member_states[slot_id],
                     )
                 elif (
                     self._warm_start_source_states is not None
                     and self._warm_start_source_specs is not None
                 ):
-                    source = self._warm_start_source_specs[slot_id]
-                    pbt_state = (
-                        SingleMemberAsyncSAC.pbt_state_from_member_checkpoint_state(
-                            source.sac_config,
-                            source.runtime_config,
-                            self._warm_start_source_states[slot_id],
-                            replay_actor=self._replay_actor,
-                        )
-                    )
-                    self._members[slot_id] = SingleMemberAsyncSAC.from_pbt_state(
-                        member.sac_config,
-                        member.runtime_config,
-                        pbt_state,
-                        replay_actor=self._replay_actor,
-                        reward_window_episodes=reward_window_episodes,
-                        worker_bundle_start=self._worker_bundle_start(slot_id),
+                    pbt_state = self._warm_start_model_state(slot_id)
+                    self._members[slot_id] = self._make_member(
+                        slot_id, member, pbt_state=pbt_state,
                     )
                 else:
-                    self._members[slot_id] = SingleMemberAsyncSAC(
-                        member.sac_config,
-                        member.runtime_config,
-                        replay_actor=self._replay_actor,
-                        reward_window_episodes=reward_window_episodes,
-                        worker_bundle_start=self._worker_bundle_start(slot_id),
-                    )
+                    self._members[slot_id] = self._make_member(slot_id, member)
             self._checkpoint_member_states = None
             self._warm_start_source_states = None
             self._warm_start_source_specs = None
@@ -1508,6 +1807,11 @@ class PopulationAsyncSAC:
                 ),
                 env_config_fingerprint=_config_value_fingerprint(
                     self._member_specs[slot_id].sac_config.env_config
+                ),
+                team_contract=_team_contract(self._member_specs[slot_id]),
+                module_seeds=(
+                    self._base_module_seeds[slot_id]
+                    if self._member_specs[slot_id].module_configs is not None else None
                 ),
             )
             for slot_id in self._slot_ids
@@ -1805,7 +2109,10 @@ class PopulationAsyncSAC:
             or exploit_count < 0
         ):
             raise ValueError("exploit_count must be a non-negative integer")
-        missing = set(_MUTABLE_HPARAMS) - set(hparams)
+        names = (
+            tuple(hparams) if any("/" in name for name in hparams) else _MUTABLE_HPARAMS
+        )
+        missing = (set(names) | set(config.mutations)) - set(hparams)
         if missing:
             raise ValueError(f"mutable hparams are missing {sorted(missing)!r}")
 
@@ -1851,7 +2158,7 @@ class PopulationAsyncSAC:
         parameter = rng.choice(tuple(sorted(candidates)))
         factor, new_value = rng.choice(candidates[parameter])
         old_value = float(hparams[parameter])
-        mutated = {name: float(hparams[name]) for name in _MUTABLE_HPARAMS}
+        mutated = {name: float(hparams[name]) for name in names}
         mutated[parameter] = new_value
         parameter_index = tuple(sorted(config.mutations)).index(parameter)
         return (
@@ -1894,26 +2201,35 @@ class PopulationAsyncSAC:
         )
         runtime_seed = self._base_runtime_seeds[target_slot] + generation
         sac_seed = self._base_sac_seeds[target_slot] + generation
-        sac_config = old_spec.sac_config.copy(copy_frozen=False)
-        sac_config.training(**dict(new_hparams))
-        sac_config.debugging(seed=sac_seed)
         runtime_config = replace(
             old_spec.runtime_config,
             member_id=runtime_member_id,
             seed=runtime_seed,
         )
+        replacement_spec = _updated_member(
+            old_spec,
+            runtime_config=runtime_config,
+            hparams=new_hparams,
+            rollout_seed=sac_seed,
+            module_seeds=(
+                {
+                    mid: seed + generation
+                    for mid, seed in self._base_module_seeds[target_slot].items()
+                }
+                if old_spec.module_configs is not None else None
+            ),
+        )
+        if old_spec.module_configs is not None:
+            # Validate the whole donor without touching recipient model state or
+            # stopping a healthy generation. Shape equality alone is insufficient.
+            old_target.validate_pbt_state(donor_state)
 
         self._restarting_slot = target_slot
         replacement: SingleMemberAsyncSAC | None = None
         try:
             old_target.stop()
-            replacement = SingleMemberAsyncSAC.from_pbt_state(
-                sac_config,
-                runtime_config,
-                donor_state,
-                replay_actor=self.replay_actor,
-                reward_window_episodes=self._pbt_config.reward_window_episodes,
-                worker_bundle_start=self._worker_bundle_start(target_slot),
+            replacement = self._make_member(
+                target_slot, replacement_spec, pbt_state=donor_state,
             )
             replacement.start()
         except Exception as error:
@@ -1927,10 +2243,7 @@ class PopulationAsyncSAC:
             self._restarting_slot = None
 
         self._members[target_slot] = replacement
-        self._member_specs[target_slot] = PopulationMemberSpec(
-            sac_config,
-            runtime_config,
-        )
+        self._member_specs[target_slot] = replacement_spec
         self._generations[target_slot] = generation
         self._exploit_count_as_target[target_slot] += 1
         self._current_hparams[target_slot] = dict(new_hparams)
@@ -2010,7 +2323,7 @@ class PopulationAsyncSAC:
 
 
 class PopulationTrainable(Trainable):
-    """One Tune trial owning a complete SAC population."""
+    """One Tune trial owning a complete population of compatible members."""
 
     @classmethod
     def default_resource_request(
@@ -2153,11 +2466,37 @@ class PopulationTrainable(Trainable):
                 continue
             if not isinstance(value, Mapping):
                 raise TypeError("population members must be specs or mappings")
-            member_unknown = set(value) - {"sac_config", "runtime"}
+            member_unknown = set(value) - {
+                "sac_config", "rollout_config", "module_configs", "runtime",
+                "trainable_modules", "sequence_configs", "per_configs",
+            }
             if member_unknown:
                 raise ValueError(
                     f"unknown population member settings {sorted(member_unknown)!r}"
                 )
+            if "module_configs" in value:
+                if "sac_config" in value:
+                    raise ValueError("mixed members use rollout_config, not sac_config")
+                rollout = value.get("rollout_config")
+                if not isinstance(rollout, SACConfig | DQNConfig):
+                    raise TypeError(
+                        "member rollout_config must be an RLlib off-policy config"
+                    )
+                members.append(
+                    PopulationMemberSpec.for_team(
+                        rollout,
+                        value["module_configs"],
+                        AsyncSACRuntimeConfig.from_mapping(
+                            value.get("runtime"), sac_config=rollout,
+                        ),
+                        trainable_modules=value.get("trainable_modules"),
+                        sequence_configs=value.get("sequence_configs"),
+                        per_configs=value.get("per_configs"),
+                    )
+                )
+                continue
+            if set(value) - {"sac_config", "runtime"}:
+                raise ValueError("team settings require module_configs")
             sac_config = value.get("sac_config")
             if not isinstance(sac_config, SACConfig):
                 raise TypeError("member sac_config must be an SACConfig")

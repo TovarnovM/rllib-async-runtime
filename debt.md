@@ -1,9 +1,21 @@
 # Technical debt
 
-This file is the single source of truth for target-hardware GPU validation.
+This file records target-hardware GPU validation for the original SAC phases.
 The Phase 8, Phase 10, and Phase 11 gates were executed and reviewed on
 2026-07-28. The commands below remain the reproduction protocol; CPU tests,
 component profiling, and CI alone do not substitute for this evidence.
+
+## DQN stages 2 and 3: combined GPU campaign pending
+
+The user authorized completing stage 3 before running the stage-2 and stage-3
+GPU checks together on the local workstation. This is a scheduling decision,
+not a GPU pass. The ordered runner, exact test matrix, device/JUnit evidence
+requirements and quality/performance commands are maintained in
+[`docs/DQN_STAGE2_STAGE3_GPU_ACCEPTANCE_RU.md`](docs/DQN_STAGE2_STAGE3_GPU_ACCEPTANCE_RU.md).
+Run `python -m benchmarks.validate_dqn_gpu --output <new-artifact-directory>`
+inside the locked `cu118` devcontainer. It requires two allocated GPUs, preserves
+the parent device allocation and rejects skips or CPU fallback. Earlier closure
+evidence below does not cover the new recurrent/PER/Noisy/mixed-PBT code.
 
 ## Closure evidence
 

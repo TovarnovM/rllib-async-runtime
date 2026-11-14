@@ -107,6 +107,34 @@ The synthetic flat and graph episodes are seeded and deterministic. The graph
 workload varies between one and four live nodes and exercises the same
 `GraphEpisodeCodec` and `GraphBatchCollator` contracts as the Phase 10 example.
 
+### DQN stages 2 and 3
+
+`python -m benchmarks.team_acceptance components` measures the existing mixed
+learner host on one captured raw dataset. It supports uniform/PER sampling,
+stateless/full-prefix/bounded-burn-in models and baseline/C51/Rainbow DQN.
+There is one authoritative source and one local replay per host. The benchmark
+forbids replay RPCs during local training, checks unchanged payload hashes and
+shared episode references, and verifies that empty deltas do not rebuild indices.
+
+`python -m benchmarks.team_acceptance quality` compares memory modes offline on
+identical captured experience per training seed. World-step and valid learning
+position budgets are exact; optimizer update counts are reported separately.
+Five training seeds, disjoint shared evaluation seed streams and a reward
+criterion are recorded before execution. `--require-quality` rejects an unmet
+criterion while preserving the raw results. These comparisons are outside
+ordinary CPU CI and do not measure online runtime throughput.
+
+Reports separate measured process RSS/CUDA allocator peaks and interface byte
+counters from estimated retained payload capacity. Interface counters include
+background traffic in the network namespace; local shared-memory transfer is
+not inter-node network evidence. A `--profile-dir` run profiles the learner
+actor's CPU work and must be kept separate from unprofiled timing results.
+
+Exact commands, the configuration matrix, interpretation limits and combined
+GPU execution protocol are in
+[`DQN_STAGE2_STAGE3_GPU_ACCEPTANCE_RU.md`](DQN_STAGE2_STAGE3_GPU_ACCEPTANCE_RU.md).
+No new throughput, memory or reward improvement is implied by adding the harness.
+
 ## Cheap CPU instrumentation check
 
 Run inside the devcontainer:
@@ -320,8 +348,8 @@ metadata remains monotonic, as documented in the architecture and README.
   belongs to target-system profiling.
 - End-to-end synthetic throughput covers the flat single-agent runtime.
   Variable-size GNN costs are isolated by the graph component benchmark and
-  the shared-GNN example; a generic asynchronous graph controller is not
-  claimed.
+  the shared-GNN example. Mixed/recurrent measurements use the separate
+  stage-2/3 harness described above.
 - One logical environment still belongs to each rollout actor.
 - The two-member mode measures the custom shared-replay topology only; there
   is no fabricated stock equivalent.

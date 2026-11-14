@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +15,7 @@ from rllib_async.protocols.episodes import (
     MultiModuleTransition,
     SequenceEpisodeCodec,
 )
+from rllib_async.protocols.replay import ReplayCursor
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +31,50 @@ class SequenceConfig:
             type(self.burn_in) is not int or self.burn_in < 0
         ):
             raise ValueError("burn_in must be None or a non-negative integer")
+
+
+@dataclass(frozen=True, slots=True)
+class SequenceReadView:
+    """An immutable index lease shared by all local sequence consumers."""
+
+    cursor: ReplayCursor
+    module_id: str
+    codec: SequenceEpisodeCodec
+    episodes: Mapping[str, EpisodeEnvelope]
+    positions: Mapping[str, tuple[tuple[tuple[int, ...], int], ...]]
+    decision_ids: Mapping[str, tuple[tuple[str, int], ...]]
+    episode_ids: tuple[str, ...]
+    cumulative_lengths: tuple[int, ...]
+
+    @property
+    def total_starts(self) -> int:
+        return self.cumulative_lengths[-1] if self.cumulative_lengths else 0
+
+    def coordinate(self, index: int) -> tuple[str, int]:
+        if not 0 <= index < self.total_starts:
+            raise IndexError(index)
+        episode_index = bisect_right(self.cumulative_lengths, index)
+        start = self.cumulative_lengths[episode_index - 1] if episode_index else 0
+        return self.episode_ids[episode_index], index - start
+
+    def window(
+        self,
+        episode_id: str,
+        index: int,
+        *,
+        sequence_config: SequenceConfig,
+        n_step: int,
+    ) -> SequenceWindow:
+        history, start = self.positions[episode_id][index]
+        return make_sequence_window(
+            self.codec,
+            self.episodes[episode_id],
+            self.module_id,
+            history,
+            start,
+            sequence_config=sequence_config,
+            n_step=n_step,
+        )
 
 
 @dataclass(frozen=True, slots=True)

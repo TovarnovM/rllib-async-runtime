@@ -6,9 +6,11 @@ import copy
 import hashlib
 import os
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 import gymnasium as gym
+import ray
 from ray import cloudpickle
 from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
 from ray.rllib.algorithms.dqn import DQNConfig
@@ -19,11 +21,13 @@ from ray.rllib.policy.policy import PolicySpec
 
 from rllib_async.learner.dqn_adapter import prepare_dqn_config, validate_dqn_config
 from rllib_async.protocols.episodes import RawMultiModuleEpisodeCodec
+from rllib_async.replay.prioritized import PrioritizedReplayConfig
 from rllib_async.replay.sequences import SequenceConfig
 from rllib_async.runtime.checkpoint import RuntimeCheckpointState
 from rllib_async.runtime.config import AsyncRuntimeConfig
 from rllib_async.runtime.controller import SingleMemberAsyncSAC
 from rllib_async.runtime.learner_host import LearnerHostActor
+from rllib_async.runtime.mixed_learner_host import MixedPBTModelState
 
 
 def _rollout_contract(config: AlgorithmConfig) -> str:
@@ -177,6 +181,7 @@ class SingleMemberAsyncTeam(SingleMemberAsyncSAC):
 
     _algorithm = "team"
     _algorithm_config_type = AlgorithmConfig
+    _pbt_state_type = MixedPBTModelState
 
     def __init__(
         self,
@@ -186,7 +191,11 @@ class SingleMemberAsyncTeam(SingleMemberAsyncSAC):
         *,
         trainable_modules: Sequence[str] | None = None,
         sequence_configs: Mapping[str, SequenceConfig] | None = None,
+        per_configs: Mapping[str, PrioritizedReplayConfig] | None = None,
         checkpoint_dir: str | os.PathLike[str] | None = None,
+        replay_actor: Any | None = None,
+        member_checkpoint_state: RuntimeCheckpointState | None = None,
+        pbt_state: MixedPBTModelState | None = None,
         reward_window_episodes: int = 100,
         worker_bundle_start: int = 2,
     ) -> None:
@@ -204,10 +213,23 @@ class SingleMemberAsyncTeam(SingleMemberAsyncSAC):
             sequence_configs=sequence_configs,
         )
         self._team_rollout_contract = _rollout_contract(rollout)
+        self._per_configs = dict(per_configs or {})
+        if set(self._per_configs) - set(self._trainable_modules) or any(
+            not isinstance(value, PrioritizedReplayConfig)
+            for value in self._per_configs.values()
+        ):
+            raise ValueError(
+                "per_configs must map trainable team modules to PER configs"
+            )
+        if pbt_state is not None:
+            self._validate_transfer_contract(pbt_state)
         super().__init__(
             rollout,
             runtime_config,
             checkpoint_dir=checkpoint_dir,
+            replay_actor=replay_actor,
+            member_checkpoint_state=member_checkpoint_state,
+            pbt_state=pbt_state,
             reward_window_episodes=reward_window_episodes,
             worker_bundle_start=worker_bundle_start,
         )
@@ -244,6 +266,7 @@ class SingleMemberAsyncTeam(SingleMemberAsyncSAC):
             codec,
             trainable_modules=self._trainable_modules,
             sequence_configs=self._sequence_configs,
+            per_configs=self._per_configs,
             member_id=runtime_config.member_id,
             publication_interval_updates=runtime_config.publication_interval_updates,
             batch_size=runtime_config.batch_size,
@@ -255,7 +278,7 @@ class SingleMemberAsyncTeam(SingleMemberAsyncSAC):
             checkpoint_state=checkpoint_state,
             allow_replay_ahead_on_restore=allow_replay_ahead_on_restore,
             pbt_state=pbt_state,
-            learning_starts_satisfied=learning_starts_satisfied,
+            learning_starts_satisfied=False,
         )
 
     @staticmethod
@@ -293,8 +316,90 @@ class SingleMemberAsyncTeam(SingleMemberAsyncSAC):
             report["learner"].pop(name, None)
         return report
 
-    def export_pbt_state(self) -> Any:
-        raise ValueError("mixed-team PBT transfer is reserved for stage 3")
+    def _validate_transfer_contract(self, state: MixedPBTModelState) -> None:
+        if not isinstance(state, MixedPBTModelState):
+            raise TypeError("pbt_state must be MixedPBTModelState")
+        if state.rollout_contract != self._team_rollout_contract:
+            raise ValueError(
+                "PBT environment, routing or action semantics do not match"
+            )
+
+    def validate_pbt_state(self, state: MixedPBTModelState) -> None:
+        """Preflight a complete donor before the population stops this member."""
+
+        self._require_not_stopped()
+        self._validate_transfer_contract(state)
+        ray.get(self._learner_actor.validate_pbt_state.remote(state))
+
+    def export_pbt_state(self) -> MixedPBTModelState:
+        state = super().export_pbt_state()
+        return replace(state, rollout_contract=self._team_rollout_contract)
+
+    @classmethod
+    def from_member_checkpoint_state(
+        cls,
+        rollout_config: AlgorithmConfig,
+        module_configs: Mapping[str, SACConfig | DQNConfig],
+        runtime_config: AsyncRuntimeConfig,
+        checkpoint_state: RuntimeCheckpointState,
+        *,
+        replay_actor: Any,
+        **kwargs: Any,
+    ) -> SingleMemberAsyncTeam:
+        return cls(
+            rollout_config,
+            module_configs,
+            runtime_config,
+            replay_actor=replay_actor,
+            member_checkpoint_state=checkpoint_state,
+            **kwargs,
+        )
+
+    @classmethod
+    def from_pbt_state(
+        cls,
+        rollout_config: AlgorithmConfig,
+        module_configs: Mapping[str, SACConfig | DQNConfig],
+        runtime_config: AsyncRuntimeConfig,
+        pbt_state: MixedPBTModelState,
+        *,
+        replay_actor: Any,
+        **kwargs: Any,
+    ) -> SingleMemberAsyncTeam:
+        return cls(
+            rollout_config,
+            module_configs,
+            runtime_config,
+            replay_actor=replay_actor,
+            pbt_state=pbt_state,
+            **kwargs,
+        )
+
+    @classmethod
+    def pbt_state_from_member_checkpoint_state(
+        cls,
+        rollout_config: AlgorithmConfig,
+        module_configs: Mapping[str, SACConfig | DQNConfig],
+        runtime_config: AsyncRuntimeConfig,
+        checkpoint_state: RuntimeCheckpointState,
+        *,
+        replay_actor: Any,
+        **kwargs: Any,
+    ) -> MixedPBTModelState:
+        """Extract models on the learner device, releasing it before warm start."""
+
+        source = cls.from_member_checkpoint_state(
+            rollout_config,
+            module_configs,
+            runtime_config,
+            checkpoint_state,
+            replay_actor=replay_actor,
+            **kwargs,
+        )
+        try:
+            return source.export_pbt_state()
+        finally:
+            source.stop(graceful=False)
 
     def _controller_checkpoint_state(
         self, *, checkpoint_sequence: int

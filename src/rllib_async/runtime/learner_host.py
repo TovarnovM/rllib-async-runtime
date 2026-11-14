@@ -844,6 +844,9 @@ class LearnerHostActor:
     def export_pbt_state(self) -> PBTModelState:
         return self._host.export_pbt_state()
 
+    def validate_pbt_state(self, state: Any) -> None:
+        self._host.validate_pbt_state(state)
+
     def get_stats(self) -> LearnerHostStats:
         return replace(
             self._host.get_stats(),

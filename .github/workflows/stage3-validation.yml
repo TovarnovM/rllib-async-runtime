@@ -1,0 +1,88 @@
+name: Stage 3 CPU experiments
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/dqn-hierarchy-gnn
+
+permissions:
+  contents: read
+
+jobs:
+  experiments:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[stage3-validation]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+
+    steps:
+      - name: Check out candidate and baseline history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Install locked CPU environment
+        id: dependencies
+        run: uv sync --locked --extra cpu --group dev
+
+      - name: Mixed recurrent Rainbow and PER component measurements
+        id: components
+        run: >-
+          timeout 900 uv run --locked --extra cpu --group dev
+          python -m benchmarks.team_acceptance components
+          --sampling per --dqn-profile rainbow
+          --output artifacts/stage3/components.json
+
+      - name: Preregistered five-seed offline memory comparison
+        if: ${{ !cancelled() && steps.components.outcome == 'success' }}
+        run: >-
+          timeout 1800 uv run --locked --extra cpu --group dev
+          python -m benchmarks.team_acceptance quality --require-quality
+          --output artifacts/stage3/quality.json
+
+      - name: Paired flat SAC regression on this runner
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: >-
+          timeout 1800 uv run --locked --extra cpu --group dev
+          python -m benchmarks.compare_flat_revisions
+          --output artifacts/stage3/flat-comparison
+
+      - name: Print concise experiment results
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: |
+          uv run --locked --extra cpu --group dev python - <<'PY'
+          import json
+          from pathlib import Path
+          for path in Path("artifacts/stage3").glob("*.json"):
+              data = json.loads(path.read_text())
+              print(json.dumps({
+                  "report": str(path),
+                  "quality": data.get("quality"),
+                  "gates": [item.get("gates") for item in data.get("results", [])],
+              }, sort_keys=True))
+          path = Path("artifacts/stage3/flat-comparison/summary.json")
+          if path.exists():
+              print(json.dumps({"flat_regression": json.loads(path.read_text())["summary"]}))
+          PY
+
+      - name: Save raw measurements and execution logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage3-cpu-evidence-${{ github.sha }}
+          path: artifacts/stage3/
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import copy
+import random
 from dataclasses import replace
 
 import gymnasium as gym
 import numpy as np
+import pytest
+from ray.rllib.core import COMPONENT_OPTIMIZER, COMPONENT_RL_MODULE
 from ray.rllib.policy.policy import PolicySpec
 
 import rllib_async.runtime.learner_host as host_module
+from rllib_async.learner import SAC_TEMPERATURE_STATE
 from rllib_async.protocols import EpisodeEnvelope
 from rllib_async.protocols.episodes import (
     MultiModuleTransition,
     RawMultiModuleEpisodeCodec,
 )
+from rllib_async.replay.prioritized import PrioritizedReplayConfig
 from rllib_async.replay.reference import EpisodeStore
 from rllib_async.replay.sequences import SequenceConfig
 from rllib_async.runtime.config import AsyncRuntimeConfig
@@ -113,11 +118,11 @@ def make_host(configs, spaces, store, codec, **kwargs):
         spaces,
         ImmediateReplayActor(store),
         codec,
-        member_id="team",
+        member_id=kwargs.pop("member_id", "team"),
         publication_interval_updates=1,
         batch_size=2,
         batch_queue_capacity=0,
-        batch_seed=7,
+        batch_seed=kwargs.pop("batch_seed", 7),
         replay_sync_max_bytes=1_000_000,
         sequence_configs={mid: SequenceConfig(learning_length=2) for mid in configs},
         **kwargs,
@@ -203,12 +208,16 @@ def test_partial_readiness_fair_budget_duplicates_eviction_and_frozen_worker(
         frozen.stop()
 
 
-def test_mixed_checkpoint_replays_next_selection_and_optimizer_step(monkeypatch):
+@pytest.mark.parametrize("prioritized", [False, True])
+def test_mixed_checkpoint_replays_next_selection_and_optimizer_step(
+    monkeypatch, prioritized
+):
     monkeypatch.setattr(host_module.ray, "get", lambda value: value)
     codec = RawMultiModuleEpisodeCodec()
     store = EpisodeStore(codec, capacity_transitions=100, capacity_bytes=10_000_000)
     configs, spaces = team_configuration()
-    source = make_host(configs, spaces, store, codec)
+    per = {mid: PrioritizedReplayConfig() for mid in configs} if prioritized else {}
+    source = make_host(configs, spaces, store, codec, per_configs=per)
     restored = None
     try:
         source.start()
@@ -227,7 +236,13 @@ def test_mixed_checkpoint_replays_next_selection_and_optimizer_step(monkeypatch)
             mid: adapter.get_state()["learner_group"]
             for mid, adapter in source._adapters.items()
         }
-        restored = make_host(configs, spaces, store, codec, checkpoint_state=saved)
+        expected_priorities = {
+            mid: sampler.get_state()
+            for mid, sampler in source._prioritized_samplers.items()
+        }
+        restored = make_host(
+            configs, spaces, store, codec, checkpoint_state=saved, per_configs=per
+        )
         assert restored._module_counters == saved["module_counters"]
         restored.start()
         tick(restored, max_updates=2)
@@ -239,6 +254,10 @@ def test_mixed_checkpoint_replays_next_selection_and_optimizer_step(monkeypatch)
             assert_tree_close(
                 adapter.get_state()["learner_group"], expected_learners[mid]
             )
+        assert {
+            mid: sampler.get_state()
+            for mid, sampler in restored._prioritized_samplers.items()
+        } == expected_priorities
     finally:
         source.stop()
         if restored is not None:
@@ -270,3 +289,114 @@ def test_ingestion_budget_uses_valid_positions_and_does_not_reset_on_eviction():
     )
     assert host._module_counters["worker"]["ingested_decisions"] == 10
     assert host._module_counters["worker"]["budget"] == 17.5
+
+
+def test_per_residual_budget_returns_without_sampling_or_busy_loop():
+    class BoundedClocks(dict):
+        reads = 0
+
+        def __getitem__(self, key):
+            self.reads += 1
+            assert self.reads <= 4, "residual budgets caused unbounded polling"
+            return super().__getitem__(key)
+
+    host = object.__new__(MixedLearnerHost)
+    host._trainable_modules = ("manager", "worker")
+    host._next_module = 0
+    host._module_counters = BoundedClocks(
+        {mid: {"ready": True, "budget": 1.0} for mid in host._trainable_modules}
+    )
+    host._sequence_configs = {
+        mid: SequenceConfig(learning_length=2) for mid in host._trainable_modules
+    }
+    host._prioritized_samplers = {mid: object() for mid in host._trainable_modules}
+    host._fast_replay = type(
+        "Replay",
+        (),
+        {"module_transition_counts": (("manager", 10), ("worker", 10))},
+    )()
+    host._maybe_publish = lambda: None
+    assert host._consume_ready(100) == (0, None)
+    assert host._module_counters.reads == 2
+
+
+def test_mixed_pbt_transfers_targets_and_alpha_with_fresh_optimizer_priorities_rng(
+    monkeypatch,
+):
+    monkeypatch.setattr(host_module.ray, "get", lambda value: value)
+    codec = RawMultiModuleEpisodeCodec()
+    store = EpisodeStore(codec, capacity_transitions=100, capacity_bytes=10_000_000)
+    configs, spaces = team_configuration()
+    per = {mid: PrioritizedReplayConfig() for mid in configs}
+    source = make_host(configs, spaces, store, codec, per_configs=per)
+    recipient = None
+    try:
+        source.start()
+        store.commit_episode(
+            raw_episode(codec, number=0, counts={"manager": 6, "worker": 6})
+        )
+        sync(source)
+        tick(source, max_updates=2)
+        transferred = source.export_pbt_state()
+        assert transferred.module_states["manager"].algorithm == "DQN"
+        assert transferred.module_states["worker"].algorithm == "SAC"
+        before = copy.deepcopy(source.get_published_weights())
+        mismatched = replace(
+            transferred,
+            module_states={
+                **transferred.module_states,
+                "worker": replace(
+                    transferred.module_states["worker"], config_contract={}
+                ),
+            },
+        )
+        with pytest.raises(ValueError, match="configuration"):
+            source.validate_pbt_state(mismatched)
+        assert_tree_close(source.get_published_weights().state, before.state)
+
+        mutated = {
+            mid: config.copy(copy_frozen=False) for mid, config in configs.items()
+        }
+        mutated["manager"].training(lr=0.002)
+        mutated["worker"].training(actor_lr=0.002, critic_lr=0.002, alpha_lr=0.002)
+        recipient = make_host(
+            mutated,
+            spaces,
+            store,
+            codec,
+            per_configs=per,
+            pbt_state=transferred,
+            member_id="recipient",
+            batch_seed=19,
+        )
+        assert recipient.get_published_weights().member_id == "recipient"
+        assert recipient.get_published_weights().learner_updates == 0
+        for index, mid in enumerate(sorted(configs)):
+            donor = source._adapters[mid].get_state()["learner_group"]["learner"]
+            received = recipient._adapters[mid].get_state()["learner_group"]["learner"]
+            assert_tree_close(received[COMPONENT_RL_MODULE], donor[COMPONENT_RL_MODULE])
+            for optimizer in received[COMPONENT_OPTIMIZER].values():
+                assert not optimizer["state"]["state"]
+            if mid == "worker":
+                assert_tree_close(
+                    received[SAC_TEMPERATURE_STATE], donor[SAC_TEMPERATURE_STATE]
+                )
+            clock = recipient._module_counters[mid]
+            assert (
+                clock["budget"]
+                == clock["learned_positions"]
+                == clock["optimizer_updates"]
+                == 0
+            )
+            assert recipient._samplers[mid].getstate() == random.Random(
+                19 + index
+            ).getstate()
+            state = recipient._prioritized_samplers[mid].get_state()
+            assert state["max_priority"] == 1.0
+            assert all(entry is None or entry[2] == 1.0 for entry in state["entries"])
+        recipient.start()
+        assert tick(recipient, max_updates=100).updates_performed == 0
+    finally:
+        source.stop()
+        if recipient is not None:
+            recipient.stop()

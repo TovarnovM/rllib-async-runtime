@@ -58,6 +58,7 @@ from rllib_async.learner.action_masks import (
     mask_dqn_train_output,
     masked_action_probabilities,
 )
+from rllib_async.learner.noisy import noisy_forward
 
 RECURRENT = "recurrent"
 
@@ -269,6 +270,7 @@ class RecurrentDQNTorchRLModule(ActionMaskedDQNTorchRLModule):
             kwargs["catalog_class"] = RecurrentDQNCatalog
         super().__init__(*args, **kwargs)
 
+    @noisy_forward("train")
     def _forward_train(self, batch: dict[str, Any]) -> dict[str, Any]:
         if self.inference_only:
             raise RuntimeError("recurrent DQN training requires inference_only=False")

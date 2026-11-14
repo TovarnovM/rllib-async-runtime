@@ -42,6 +42,7 @@ from rllib_async.runtime.learner_host import (
     LearnerHostStats,
     LearnerHostTick,
 )
+from rllib_async.runtime.mixed_learner_host import MixedPBTModelState
 from rllib_async.runtime.population import (
     FloatMutation,
     PopulationAsyncSAC,
@@ -74,6 +75,7 @@ __all__ = [
     "LearnerHostState",
     "LearnerHostStats",
     "LearnerHostTick",
+    "MixedPBTModelState",
     "PopulationAsyncSAC",
     "PopulationCheckpoint",
     "PopulationCheckpointState",

@@ -67,6 +67,7 @@ class SingleMemberAsyncSAC:
 
     _algorithm = "sac"
     _algorithm_config_type = SACConfig
+    _pbt_state_type = PBTModelState
 
     def __init__(
         self,
@@ -111,8 +112,8 @@ class SingleMemberAsyncSAC:
             raise ValueError("PBT construction cannot restore a full checkpoint")
         if pbt_state is not None and replay_actor is None:
             raise ValueError("PBT construction requires an external replay")
-        if pbt_state is not None and not isinstance(pbt_state, PBTModelState):
-            raise TypeError("pbt_state must be PBTModelState")
+        if pbt_state is not None and not isinstance(pbt_state, self._pbt_state_type):
+            raise TypeError(f"pbt_state must be {self._pbt_state_type.__name__}")
         if self._algorithm == "dqn" and (
             pbt_state is not None or replay_actor is not None
         ):
@@ -662,7 +663,7 @@ class SingleMemberAsyncSAC:
         self._require_not_stopped()
         assert self._learner_actor is not None
         state = ray.get(self._learner_actor.export_pbt_state.remote())
-        if not isinstance(state, PBTModelState):
+        if not isinstance(state, self._pbt_state_type):
             raise RuntimeError("learner actor returned invalid PBT state")
         return state
 

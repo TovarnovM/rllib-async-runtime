@@ -8,6 +8,7 @@ from typing import Any
 import gymnasium as gym
 import torch
 from ray.rllib.algorithms.dqn.default_dqn_rl_module import (
+    ATOMS,
     QF_LOGITS,
     QF_NEXT_PREDS,
     QF_PREDS,
@@ -33,6 +34,12 @@ from ray.rllib.algorithms.sac.torch.default_sac_torch_rl_module import (
 )
 from ray.rllib.core.columns import Columns
 from ray.rllib.core.models.base import ENCODER_OUT
+
+from rllib_async.learner.noisy import (
+    install_noisy_heads,
+    noisy_forward,
+    register_noisy_targets,
+)
 
 
 def _legal_actions(
@@ -144,6 +151,42 @@ def masked_action_probabilities(
 class ActionMaskedDQNTorchRLModule(DefaultDQNTorchRLModule):
     """Default DQN with semantic masks and value-independent random actions."""
 
+    def setup(self) -> None:
+        if self.model_config.get("dueling") and self.model_config["num_atoms"] > 1:
+            # C51's value stream needs one logit per atom. The pinned catalog's
+            # scalar value cancels entirely when its atom logits are normalized.
+            self.catalog.vf_head_config.output_layer_dim = self.model_config[
+                "num_atoms"
+            ]
+        super().setup()
+        install_noisy_heads(self)
+
+    def make_target_networks(self) -> None:
+        super().make_target_networks()
+        register_noisy_targets(self)
+
+    def _qf_forward_helper(self, batch, encoder, head):
+        if not (self.uses_dueling and self.num_atoms > 1):
+            return super()._qf_forward_helper(batch, encoder, head)
+        encoded = encoder(batch)
+        advantage = self.compute_advantage_distribution(
+            head["af"](encoded[ENCODER_OUT])
+        )
+        values = head["vf"](encoded[ENCODER_OUT]).unsqueeze(-2)
+        logits = advantage["logits"]
+        logits = values + logits - logits.mean(dim=-2, keepdim=True)
+        probabilities = torch.nn.functional.softmax(logits, dim=-1)
+        output = {
+            ATOMS: advantage[ATOMS],
+            QF_LOGITS: logits,
+            QF_PROBS: probabilities,
+            QF_PREDS: (probabilities * advantage[ATOMS]).sum(dim=-1),
+        }
+        if Columns.STATE_OUT in encoded:
+            output[Columns.STATE_OUT] = encoded[Columns.STATE_OUT]
+        return output
+
+    @noisy_forward("inference")
     def _forward_inference(self, batch: dict[str, Any]) -> dict[str, Any]:
         qf_outs = self.compute_q_values(batch)
         output = {
@@ -155,6 +198,7 @@ class ActionMaskedDQNTorchRLModule(DefaultDQNTorchRLModule):
             output[Columns.STATE_OUT] = qf_outs[Columns.STATE_OUT]
         return output
 
+    @noisy_forward("exploration")
     def _forward_exploration(self, batch: dict[str, Any], t: int) -> dict[str, Any]:
         qf_outs = self.compute_q_values(batch)
         self.epsilon_schedule.update(t)
@@ -169,6 +213,7 @@ class ActionMaskedDQNTorchRLModule(DefaultDQNTorchRLModule):
             output[Columns.STATE_OUT] = qf_outs[Columns.STATE_OUT]
         return output
 
+    @noisy_forward("train")
     def _forward_train(self, batch: dict[str, Any]) -> dict[str, Any]:
         output = super()._forward_train(batch)
         if self.uses_double_q and self.num_atoms > 1:

@@ -389,6 +389,10 @@ class SequenceEpisodeCodec(ModuleEpisodeCodec, Protocol):
         self, episode: EpisodeEnvelope, module_id: str
     ) -> tuple[tuple[int, ...], ...]: ...
 
+    def module_decision_ids(
+        self, episode: EpisodeEnvelope, module_id: str
+    ) -> tuple[tuple[str, int], ...]: ...
+
 
 class FlatEpisodeCodec:
     """Correctness-first codec for single-agent flat transitions."""
@@ -825,6 +829,14 @@ class RawMultiModuleEpisodeCodec(MultiModuleEpisodeCodec):
             if candidate == module_id:
                 return histories
         raise KeyError(module_id)
+
+    def module_decision_ids(
+        self, episode: EpisodeEnvelope, module_id: str
+    ) -> tuple[tuple[str, int], ...]:
+        return tuple(
+            (transition.agent_id, transition.agent_t)
+            for transition in self._module_transitions(episode, module_id)
+        )
 
 
 def _observations_equal(left: object, right: object) -> bool:
