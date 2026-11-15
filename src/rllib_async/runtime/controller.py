@@ -943,6 +943,29 @@ class SingleMemberAsyncSAC:
             self._state = RuntimeState.FAILED
             raise
 
+    def stop_for_replacement(self) -> None:
+        """Commit this generation's episodes, then discard its learner.
+
+        Other members keep writing the shared replay during PBT. Waiting for
+        this discarded learner to catch up with that stream could never finish.
+        A checkpoint still uses the coordinated full drain above.
+        """
+
+        deadline = time.monotonic() + self._config.shutdown_timeout_s
+        on_wait = getattr(self, "_on_wait", None)
+        try:
+            if self._rollout_group is not None:
+                self._rollout_group.drain(
+                    timeout_s=self._remaining(deadline), on_wait=on_wait
+                )
+            self._finish_learner_tick(timeout_s=self._remaining(deadline))
+            if self._evaluation_group is not None:
+                self._evaluation_group.drain(
+                    timeout_s=self._remaining(deadline), on_wait=on_wait
+                )
+        finally:
+            self.stop(graceful=False)
+
     def stop(
         self,
         *,

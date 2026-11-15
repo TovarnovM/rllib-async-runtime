@@ -53,12 +53,14 @@ def summarize(directory: Path) -> dict:
                         for suffix in ("bytes_per_s", "link_fraction"):
                             key = f"{direction}_{suffix}"
                             if key in values:
-                                metrics[f"network/{interface}/{key}"].append(values[key])
+                                metrics[f"network/{interface}/{key}"].append(
+                                    values[key]
+                                )
                 for values in sample["processes"].values():
                     if "cpu_percent_one_core" in values:
-                        metrics[f"process/{values['name']}/cpu_percent_one_core"].append(
-                            values["cpu_percent_one_core"]
-                        )
+                        metrics[
+                            f"process/{values['name']}/cpu_percent_one_core"
+                        ].append(values["cpu_percent_one_core"])
                 for gpu in sample["gpu"].get("devices", []):
                     for key in ("utilization.gpu", "memory.used", "power.draw"):
                         try:

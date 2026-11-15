@@ -33,6 +33,25 @@ continuous action через one-hot; соответствие исходной 
 включая `marl` extra. Использовать существующие Slurm/Docker и локальный registry;
 лаунчер не создаёт кластер, не управляет Slurm и не останавливает чужие Ray jobs.
 
+Для упаковки уже предусмотрен `.devcontainer/Dockerfile.cluster`, основанный
+на devcontainer проекта. На узле с интернетом собрать базовый образ, затем
+кластерный с `--build-arg BASE_IMAGE=<базовый образ>`; тег привязать к SHA.
+Кластерный образ включает исходники, CUDA wheel, `marl` extra и `/opt/uv-cache`;
+после сборки включён `UV_OFFLINE=1`. На workers остаётся скачать этот образ из
+локального registry. Перед кампанией проверить создание Ray worker в таком
+образе при отключённом интернете. Сборка самого образа требует Docker и
+проверяется локальным агентом отдельно от CPU CI.
+
+Пример сборки на head (подставить фактический тег SHA вместо `<sha>`):
+
+```bash
+docker build -f .devcontainer/Dockerfile -t rllib-async-runtime-dev:local .
+docker build -f .devcontainer/Dockerfile.cluster \
+  --build-arg BASE_IMAGE=rllib-async-runtime-dev:local \
+  -t workpc411:5000/rllib-marl:<sha> .
+docker push workpc411:5000/rllib-marl:<sha>
+```
+
 ```bash
 git switch feature/dqn-hierarchy-gnn
 git pull --ff-only

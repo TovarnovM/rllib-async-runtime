@@ -103,15 +103,22 @@ def test_spread_uses_dqn_for_discrete_agents_and_supports_shared_gpu(discrete):
 def test_cluster_preflight_requires_the_whole_learner_core_on_one_node(monkeypatch):
     from benchmarks.marl_cluster import build_members, parse_args, preflight
 
-    monkeypatch.setattr("sys.argv", [
-        "marl_cluster", "--mode", "mixed", "--output", "/unused",
-        "--members", "4", "--workers", "128",
-    ])
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "marl_cluster",
+            "--mode",
+            "mixed",
+            "--output",
+            "/unused",
+            "--members",
+            "4",
+            "--workers",
+            "128",
+        ],
+    )
     members = build_members(parse_args())
-    nodes = [
-        {"NodeID": str(i), "Resources": {"CPU": 512, "GPU": 1}}
-        for i in range(2)
-    ]
+    nodes = [{"NodeID": str(i), "Resources": {"CPU": 512, "GPU": 1}} for i in range(2)]
     report = preflight({"members": members}, nodes, {"CPU": 1024, "GPU": 2})
     assert not report["ready"]
     assert report["core_bundle"]["GPU"] == 2

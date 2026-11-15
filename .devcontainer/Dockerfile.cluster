@@ -1,0 +1,21 @@
+# First build .devcontainer/Dockerfile, then pass that image as BASE_IMAGE.
+ARG BASE_IMAGE=rllib-async-runtime-dev:local
+FROM ${BASE_IMAGE}
+
+USER root
+ENV UV_CACHE_DIR=/opt/uv-cache \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    SDL_VIDEODRIVER=dummy \
+    SDL_AUDIODRIVER=dummy
+WORKDIR /opt/rllib-async-runtime
+COPY . .
+RUN uv sync --locked --extra cu118 --extra marl --group dev \
+    && chown -R vscode:vscode /opt/uv-cache /opt/rllib-async-runtime
+
+# Ray may build a project-local .venv in a packaged working directory. Keep
+# dependency wheels/build requirements available there without network access.
+ENV UV_OFFLINE=1
+USER vscode
+CMD ["bash"]

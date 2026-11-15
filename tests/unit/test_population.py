@@ -647,6 +647,9 @@ def test_target_restart_uses_new_identity_shared_replay_and_fails_fast(
             assert graceful
             self.stops += 1
 
+        def stop_for_replacement(self) -> None:
+            self.stop()
+
     class Replacement:
         def __init__(self) -> None:
             self.starts = 0
@@ -1335,7 +1338,7 @@ def test_lifecycle_peer_pump_excludes_owner_paused_and_restarting_members():
 
     population = object.__new__(PopulationAsyncSAC)
     population._servicing_peers = False
-    population._restarting_slot = 'restarting'
+    population._restarting_slot = "restarting"
     calls = []
 
     def pump(slot):
@@ -1344,11 +1347,11 @@ def test_lifecycle_peer_pump_excludes_owner_paused_and_restarting_members():
 
     population._members = {
         slot: SimpleNamespace(
-            state=RuntimeState.PAUSED if slot == 'paused' else RuntimeState.RUNNING,
+            state=RuntimeState.PAUSED if slot == "paused" else RuntimeState.RUNNING,
             pump_once=lambda *, timeout_s, slot=slot: pump(slot),
         )
-        for slot in ('waiting', 'peer', 'paused', 'restarting')
+        for slot in ("waiting", "peer", "paused", "restarting")
     }
-    population._pump_peers('waiting')
-    assert calls == ['peer']
+    population._pump_peers("waiting")
+    assert calls == ["peer"]
     assert not population._servicing_peers

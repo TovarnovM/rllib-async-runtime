@@ -39,12 +39,12 @@ def test_external_monitor_collects_proc_without_runtime_callbacks(ray_runtime):
         result = ray.get(monitor.stop.remote())
         assert result["exit_code"] == 0, result["stderr"]
         records = [
-            json.loads(line)
-            for line in gzip.decompress(result["data"]).splitlines()
+            json.loads(line) for line in gzip.decompress(result["data"]).splitlines()
         ]
         assert records
         assert "cpu" in records[0]["cpu_ticks"]
         assert records[0]["network"]
+        assert records[0]["processes"]
         assert records[0]["memory"]["MemTotal_bytes"] > 0
     finally:
         ray.kill(monitor, no_restart=True)
@@ -146,8 +146,7 @@ def test_marl_population_learns_replaces_and_restores(
             assert before[0]["gpu_ids"] == before[1]["gpu_ids"]
         old_ids = population.runtime_member_ids
         pumps = {
-            slot: member._pump_iterations
-            for slot, member in population.members.items()
+            slot: member._pump_iterations for slot, member in population.members.items()
         }
         population._reports_since_perturbation = 10_000
         event = population.get_report()["pbt"]

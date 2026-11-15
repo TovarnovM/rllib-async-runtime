@@ -2279,7 +2279,7 @@ class PopulationAsyncSAC:
         self._restarting_slot = target_slot
         replacement: SingleMemberAsyncSAC | None = None
         try:
-            old_target.stop()
+            old_target.stop_for_replacement()
             replacement = self._make_member(
                 target_slot,
                 replacement_spec,

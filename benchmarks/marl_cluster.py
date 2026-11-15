@@ -7,6 +7,7 @@ or changes node configuration. Every PBT individual owns a complete policy team.
 from __future__ import annotations
 
 import argparse
+import gzip
 import importlib.metadata
 import json
 import os
@@ -14,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import ray
@@ -46,17 +48,34 @@ class NodeMonitor:
                 "benchmarks.cluster_monitor",
                 "--output",
                 str(self._path),
+                "--parent-pid",
+                str(os.getpid()),
             ],
             stdout=subprocess.DEVNULL,
             stderr=self._log,
         )
 
     def describe(self) -> dict:
+        sample = {}
+        deadline = time.monotonic() + 10
+        while self._process.poll() is None and time.monotonic() < deadline:
+            try:
+                with gzip.open(self._path, "rt") as stream:
+                    sample = json.loads(stream.readline())
+                break
+            except (OSError, EOFError, ValueError):
+                time.sleep(0.05)
         return {
             "node_id": ray.get_runtime_context().get_node_id(),
             "sampler_pid": self._process.pid,
             "sampler_exit_code": self._process.poll(),
-            "sample_written": self._path.exists() and self._path.stat().st_size > 100,
+            "sample_written": bool(sample),
+            "ray_processes_visible": len(sample.get("processes", {})),
+            "gpu_devices_visible": len(sample.get("gpu", {}).get("devices", [])),
+            "network_interfaces": {
+                name: {key: values.get(key) for key in ("physical", "speed_mbps")}
+                for name, values in sample.get("network", {}).items()
+            },
             "cpu_affinity": sorted(os.sched_getaffinity(0)),
             "versions": {
                 name: importlib.metadata.version(name)
@@ -263,8 +282,18 @@ def main() -> None:
         (args.output / "monitors.json").write_text(
             json.dumps(descriptions, indent=2) + "\n"
         )
-        if any(item["sampler_exit_code"] is not None for item in descriptions):
-            raise RuntimeError("An external monitor failed to start")
+        gpu_nodes = {
+            node["NodeID"] for node in nodes if node["Resources"].get("GPU", 0) > 0
+        }
+        if any(
+            item["sampler_exit_code"] is not None
+            or not item["sample_written"]
+            or not item["ray_processes_visible"]
+            or not item["network_interfaces"]
+            or (item["node_id"] in gpu_nodes and not item["gpu_devices_visible"])
+            for item in descriptions
+        ):
+            raise RuntimeError("Monitoring preflight failed; inspect monitors.json")
         results = tune.Tuner(
             PopulationTrainable,
             param_space=param_space,

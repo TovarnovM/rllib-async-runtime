@@ -52,6 +52,26 @@ class LearnerActor:
     pause = RemoteMethod()
 
 
+def test_pbt_stop_commits_episodes_without_draining_live_shared_replay():
+    runtime = object.__new__(SingleMemberAsyncSAC)
+    events = []
+    runtime._config = SimpleNamespace(shutdown_timeout_s=10)
+    runtime._on_wait = lambda: events.append("peer")
+    runtime._rollout_group = SimpleNamespace(
+        drain=lambda **kwargs: events.append("rollout_committed")
+    )
+    runtime._evaluation_group = SimpleNamespace(
+        drain=lambda **kwargs: events.append("evaluation_finished")
+    )
+    runtime._finish_learner_tick = lambda **kwargs: events.append("tick_finished")
+    runtime.stop = lambda **kwargs: events.append(("stopped", kwargs))
+    runtime.stop_for_replacement()
+    assert events == [
+        "rollout_committed", "tick_finished", "evaluation_finished",
+        ("stopped", {"graceful": False}),
+    ]
+
+
 class RolloutGroup:
     def __init__(self) -> None:
         self.paused = False

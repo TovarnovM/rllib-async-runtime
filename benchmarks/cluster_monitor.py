@@ -167,6 +167,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--interval-s", type=float, default=1.0)
+    parser.add_argument("--parent-pid", type=int)
     args = parser.parse_args()
     if not 0 < args.interval_s < float("inf"):
         parser.error("--interval-s must be finite and positive")
@@ -178,6 +179,8 @@ def main() -> None:
     nvidia_smi = shutil.which("nvidia-smi")
     with gzip.open(args.output, "xt", encoding="utf-8") as stream:
         while not stop.is_set():
+            if args.parent_pid is not None and os.getppid() != args.parent_pid:
+                break
             started = time.monotonic()
             current = read_snapshot()
             if previous is not None:
