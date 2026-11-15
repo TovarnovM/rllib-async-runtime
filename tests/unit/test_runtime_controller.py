@@ -54,6 +54,7 @@ class LearnerActor:
 
 def test_pbt_stop_commits_episodes_without_draining_live_shared_replay():
     runtime = object.__new__(SingleMemberAsyncSAC)
+    runtime._state = RuntimeState.RUNNING
     events = []
     runtime._config = SimpleNamespace(shutdown_timeout_s=10)
     runtime._on_wait = lambda: events.append("peer")
@@ -67,7 +68,9 @@ def test_pbt_stop_commits_episodes_without_draining_live_shared_replay():
     runtime.stop = lambda **kwargs: events.append(("stopped", kwargs))
     runtime.stop_for_replacement()
     assert events == [
-        "rollout_committed", "tick_finished", "evaluation_finished",
+        "rollout_committed",
+        "tick_finished",
+        "evaluation_finished",
         ("stopped", {"graceful": False}),
     ]
 

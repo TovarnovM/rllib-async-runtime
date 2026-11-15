@@ -1,34 +1,18 @@
 name: MARL validation
 
 on:
+  pull_request:
   push:
     branches:
       - feature/dqn-hierarchy-gnn
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  lock:
-    if: contains(github.event.head_commit.message, '[marl-lock]')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: "0.11.29"
-          python-version: "3.11"
-      - run: uv lock
-      - uses: actions/upload-artifact@v4
-        with:
-          name: marl-lock
-          path: uv.lock
-          retention-days: 7
-
   acceptance:
-    if: "!contains(github.event.head_commit.message, '[marl-lock]')"
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -45,19 +29,29 @@ jobs:
           python-version: "3.11"
           enable-cache: true
       - run: uv sync --locked --extra cpu --extra marl --group dev
-      - name: Prepare style corrections for review
-        run: |
-          mkdir -p artifacts
-          uv run --locked --extra cpu --extra marl --group dev ruff check --fix . > artifacts/lint.log 2>&1 || true
-          uv run --locked --extra cpu --extra marl --group dev ruff format . >> artifacts/lint.log
-          git diff > artifacts/style.patch
-          cat artifacts/lint.log
+      - run: uv run --locked --extra cpu --extra marl --group dev ruff check .
+      - run: uv run --locked --extra cpu --extra marl --group dev ruff format --check .
       - run: >-
           uv run --locked --extra cpu --extra marl --group dev pytest
           tests/unit/test_marl_spread.py tests/unit/test_cluster_monitor.py
           tests/integration/test_marl_spread.py
           -m "not gpu"
           --junitxml=artifacts/marl-tests.xml
+      - name: Run the actual cluster launcher on a small disposable CPU cluster
+        run: |
+          uv run --locked --extra cpu --extra marl --group dev ray start \
+            --head --num-cpus=4 --num-gpus=0 --include-dashboard=false --disable-usage-stats
+          trap 'uv run --locked --extra cpu --extra marl --group dev ray stop --force' EXIT
+          timeout 300 uv run --locked --extra cpu --extra marl --group dev \
+            python -m benchmarks.marl_cluster --mode mixed --address auto \
+            --members 2 --workers 1 --agents 2 --num-gpus-per-member 0 \
+            --runner-cpus 0.5 --learner-cpus 0.25 --replay-cpus 0.25 \
+            --episode-length 8 --hidden-dim 8 --batch-size 4 --learning-starts 0 \
+            --evaluation-interval 0 --evaluation-episodes 0 \
+            --reports 5 --report-interval-s 2 --pbt-interval-reports 1000 \
+            --output artifacts/marl-launcher
+          uv run --locked --extra cpu --extra marl --group dev \
+            python -m benchmarks.marl_report artifacts/marl-launcher
       - uses: actions/upload-artifact@v4
         if: always()
         with:

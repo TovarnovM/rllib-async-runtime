@@ -64,23 +64,30 @@ def test_offline_summary_uses_training_window_and_keeps_missing_gpu_explicit(tmp
 
     from benchmarks.marl_report import summarize
 
-    trial = tmp_path / 'marl' / 'trial'
+    trial = tmp_path / "marl" / "trial"
     trial.mkdir(parents=True)
     reports = [
-        {'timestamp': timestamp, 'population': {'size': 4}, 'members': {}, 'replay': {}}
+        {"timestamp": timestamp, "population": {"size": 4}, "members": {}, "replay": {}}
         for timestamp in (10, 20)
     ]
-    (trial / 'result.json').write_text('\n'.join(map(json.dumps, reports)))
-    (tmp_path / 'monitor-errors.json').write_text('{}')
-    with gzip.open(tmp_path / 'node-one.jsonl.gz', 'wt') as stream:
+    (trial / "result.json").write_text("\n".join(map(json.dumps, reports)))
+    (tmp_path / "monitor-errors.json").write_text("{}")
+    with gzip.open(tmp_path / "node-one.jsonl.gz", "wt") as stream:
         for timestamp in (1, 15, 30):
-            stream.write(json.dumps({
-                'time_unix_s': timestamp,
-                'cpu_percent': {'cpu': {'busy': timestamp}},
-                'network': {}, 'processes': {}, 'gpu': {'available': False},
-            }) + '\n')
+            stream.write(
+                json.dumps(
+                    {
+                        "time_unix_s": timestamp,
+                        "cpu_percent": {"cpu": {"busy": timestamp}},
+                        "network": {},
+                        "processes": {},
+                        "gpu": {"available": False},
+                    }
+                )
+                + "\n"
+            )
     summary = summarize(tmp_path)
-    node = summary['nodes']['node-one.jsonl.gz']
-    assert node['records'] == 1
-    assert node['metrics']['cpu/busy_percent']['mean'] == 15
-    assert not any(key.startswith('gpu/') for key in node['metrics'])
+    node = summary["nodes"]["node-one.jsonl.gz"]
+    assert node["records"] == 1
+    assert node["metrics"]["cpu/busy_percent"]["mean"] == 15
+    assert not any(key.startswith("gpu/") for key in node["metrics"])

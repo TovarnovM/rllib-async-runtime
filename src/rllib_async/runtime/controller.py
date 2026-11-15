@@ -951,6 +951,8 @@ class SingleMemberAsyncSAC:
         A checkpoint still uses the coordinated full drain above.
         """
 
+        if self._state is RuntimeState.STOPPED:
+            return
         deadline = time.monotonic() + self._config.shutdown_timeout_s
         on_wait = getattr(self, "_on_wait", None)
         try:

@@ -82,8 +82,14 @@ def summarize(directory: Path) -> dict:
         "replay": last["replay"],
         "monitor_errors": json.loads((directory / "monitor-errors.json").read_text()),
         "nodes": nodes,
-        "quality_gate": "Not inferred from utilization or optimizer progress; compare held-out returns.",
-        "network_note": "RX and TX are independent; do not sum virtual and physical interfaces.",
+        "quality_gate": (
+            "Not inferred from utilization or optimizer progress; "
+            "compare held-out returns."
+        ),
+        "network_note": (
+            "RX and TX are independent; "
+            "do not sum virtual and physical interfaces."
+        ),
     }
 
 

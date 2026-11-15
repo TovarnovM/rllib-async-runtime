@@ -134,7 +134,8 @@ def gpu_snapshot(executable: str) -> dict:
     queries = {
         "devices": (
             "gpu",
-            "index,uuid,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu",
+            "index,uuid,utilization.gpu,memory.used,memory.total,"
+            "power.draw,temperature.gpu",
         ),
         "processes": ("compute-apps", "gpu_uuid,pid,used_gpu_memory"),
     }
