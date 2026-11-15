@@ -87,8 +87,7 @@ def summarize(directory: Path) -> dict:
             "compare held-out returns."
         ),
         "network_note": (
-            "RX and TX are independent; "
-            "do not sum virtual and physical interfaces."
+            "RX and TX are independent; do not sum virtual and physical interfaces."
         ),
     }
 
