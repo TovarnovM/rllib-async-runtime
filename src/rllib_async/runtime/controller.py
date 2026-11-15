@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict
 from enum import Enum
@@ -80,6 +80,7 @@ class SingleMemberAsyncSAC:
         pbt_state: PBTModelState | None = None,
         reward_window_episodes: int = 100,
         worker_bundle_start: int = 2,
+        on_wait: Callable[[], None] | None = None,
     ) -> None:
         if not ray.is_initialized():
             raise RuntimeError(f"Ray must be initialized before {type(self).__name__}")
@@ -158,6 +159,7 @@ class SingleMemberAsyncSAC:
         self._budget_updates_origin = self._learner_update_budget_for_sampled(
             self._budget_sampled_origin
         )
+        self._on_wait = on_wait
         self._codec = self._make_codec()
         self._state = RuntimeState.CREATED
         self._replay_actor: Any | None = None
@@ -225,7 +227,7 @@ class SingleMemberAsyncSAC:
                 pbt_state=pbt_state,
                 learning_starts_satisfied=pbt_state is not None,
             )
-            initial_weights = ray.get(
+            initial_weights = self._get(
                 self._learner_actor.get_published_weights.remote()
             )
             if not isinstance(initial_weights, WeightsDescriptor):
@@ -304,6 +306,29 @@ class SingleMemberAsyncSAC:
     def state(self) -> RuntimeState:
         return self._state
 
+    def _get(self, ref: ray.ObjectRef, *, timeout: float | None = None) -> Any:
+        """Keep peer members serviced during serialized lifecycle RPC waits.
+
+        The caller still owns this member. Peers only run nonblocking pumps;
+        no background thread can race a checkpoint, replacement or shutdown.
+        """
+
+        on_wait = getattr(self, "_on_wait", None)
+        if on_wait is None:
+            return ray.get(ref) if timeout is None else ray.get(ref, timeout=timeout)
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            ready, _ = ray.wait(
+                [ref],
+                timeout=0.01 if remaining is None else min(remaining, 0.01),
+            )
+            if ready or remaining == 0:
+                return ray.get(ref, timeout=0)
+            on_wait()
+
     @staticmethod
     def _make_codec() -> FlatEpisodeCodec:
         return FlatEpisodeCodec()
@@ -355,6 +380,7 @@ class SingleMemberAsyncSAC:
         replay_actor: Any,
         reward_window_episodes: int = 100,
         worker_bundle_start: int = 2,
+        on_wait: Callable[[], None] | None = None,
     ) -> SingleMemberAsyncSAC:
         """Restore one member state transferred independently of replay."""
 
@@ -367,6 +393,7 @@ class SingleMemberAsyncSAC:
             member_checkpoint_state=checkpoint_state,
             reward_window_episodes=reward_window_episodes,
             worker_bundle_start=worker_bundle_start,
+            on_wait=on_wait,
         )
 
     @classmethod
@@ -379,6 +406,7 @@ class SingleMemberAsyncSAC:
         replay_actor: Any,
         reward_window_episodes: int,
         worker_bundle_start: int = 2,
+        on_wait: Callable[[], None] | None = None,
     ) -> SingleMemberAsyncSAC:
         """Create one fresh generation from model-only donor state."""
 
@@ -389,6 +417,7 @@ class SingleMemberAsyncSAC:
             pbt_state=pbt_state,
             reward_window_episodes=reward_window_episodes,
             worker_bundle_start=worker_bundle_start,
+            on_wait=on_wait,
         )
 
     @classmethod
@@ -492,7 +521,7 @@ class SingleMemberAsyncSAC:
         assert self._learner_actor is not None
         assert self._rollout_group is not None
         assert self._latest_weights is not None
-        ray.get(self._learner_actor.start.remote())
+        self._get(self._learner_actor.start.remote())
         self._rollout_group.start()
         self._started_at = time.monotonic()
         self._state = RuntimeState.RUNNING
@@ -662,7 +691,7 @@ class SingleMemberAsyncSAC:
 
         self._require_not_stopped()
         assert self._learner_actor is not None
-        state = ray.get(self._learner_actor.export_pbt_state.remote())
+        state = self._get(self._learner_actor.export_pbt_state.remote())
         if not isinstance(state, self._pbt_state_type):
             raise RuntimeError("learner actor returned invalid PBT state")
         return state
@@ -888,13 +917,19 @@ class SingleMemberAsyncSAC:
         assert self._learner_actor is not None
         self._state = RuntimeState.DRAINING
         try:
-            self._rollout_group.drain(timeout_s=self._remaining(deadline))
+            self._rollout_group.drain(
+                timeout_s=self._remaining(deadline),
+                on_wait=getattr(self, "_on_wait", None),
+            )
             self._finish_learner_tick(timeout_s=self._remaining(deadline))
             if self._evaluation_group is not None:
-                self._evaluation_group.drain(timeout_s=self._remaining(deadline))
+                self._evaluation_group.drain(
+                    timeout_s=self._remaining(deadline),
+                    on_wait=getattr(self, "_on_wait", None),
+                )
             rollout = self._rollout_group
             remaining_updates = self._remaining_learner_update_budget(rollout)
-            tick = ray.get(
+            tick = self._get(
                 self._learner_actor.drain.remote(
                     **self._sampled_step_kwargs(rollout),
                     max_updates=remaining_updates,
@@ -937,7 +972,7 @@ class SingleMemberAsyncSAC:
             if self._learner_actor is not None:
                 if graceful:
                     try:
-                        ray.get(
+                        self._get(
                             self._learner_actor.stop.remote(timeout_s=timeout_s),
                             timeout=timeout_s,
                         )
@@ -996,7 +1031,7 @@ class SingleMemberAsyncSAC:
         if self._pending_learner_tick is None:
             return
         ref = self._pending_learner_tick
-        tick = ray.get(ref, timeout=timeout_s)
+        tick = self._get(ref, timeout=timeout_s)
         self._pending_learner_tick = None
         self._accept_learner_tick(tick)
 

@@ -15,6 +15,39 @@ class RemoteMethod:
         return kwargs
 
 
+def test_lifecycle_wait_pumps_peers_until_ready_and_propagates_failure(monkeypatch):
+    runtime = object.__new__(SingleMemberAsyncSAC)
+    calls = []
+    runtime._on_wait = lambda: calls.append("pump")
+    readiness = iter([([], ["ref"]), ([], ["ref"]), (["ref"], [])])
+    monkeypatch.setattr(controller_module.ray, "wait", lambda *a, **k: next(readiness))
+    monkeypatch.setattr(controller_module.ray, "get", lambda *a, **k: "weights")
+    assert runtime._get("ref", timeout=1) == "weights"
+    assert calls == ["pump", "pump"]
+
+    def fail():
+        raise RuntimeError("peer failed")
+
+    runtime._on_wait = fail
+    monkeypatch.setattr(controller_module.ray, "wait", lambda *a, **k: ([], ["ref"]))
+    with pytest.raises(RuntimeError, match="peer failed"):
+        runtime._get("ref", timeout=1)
+
+
+def test_lifecycle_wait_preserves_timeout(monkeypatch):
+    runtime = object.__new__(SingleMemberAsyncSAC)
+    runtime._on_wait = lambda: pytest.fail("zero timeout must not pump")
+    monkeypatch.setattr(controller_module.ray, "wait", lambda *a, **k: ([], ["ref"]))
+
+    def timed_out(ref, *, timeout):
+        assert timeout == 0
+        raise TimeoutError("RPC timeout")
+
+    monkeypatch.setattr(controller_module.ray, "get", timed_out)
+    with pytest.raises(TimeoutError, match="RPC timeout"):
+        runtime._get("ref", timeout=0)
+
+
 class LearnerActor:
     pause = RemoteMethod()
 

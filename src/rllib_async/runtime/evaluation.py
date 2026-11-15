@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import math
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -307,10 +307,17 @@ class AsyncEvaluationGroup:
         self._active_weights = None
         return result
 
-    def drain(self, *, timeout_s: float | None = None) -> EvaluationResult | None:
+    def drain(
+        self,
+        *,
+        timeout_s: float | None = None,
+        on_wait: Callable[[], None] | None = None,
+    ) -> EvaluationResult | None:
         deadline = self._deadline(timeout_s)
         completed: EvaluationResult | None = None
         while self._pending:
+            if on_wait is not None:
+                on_wait()
             remaining = self._remaining(deadline)
             if remaining == 0:
                 raise TimeoutError("timed out draining evaluation actors")

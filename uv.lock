@@ -289,6 +289,20 @@ wheels = [
 ]
 
 [[package]]
+name = "mpe2"
+version = "1.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pettingzoo" },
+    { name = "pygame-ce" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f8/07/13c054603ed4ee42c5b11fd6032828b50f2aa0ce8cfaa598e772f270a656/mpe2-1.1.1.tar.gz", hash = "sha256:489e0e4b108f387eea1d2a70e8c537b8b04d33d009306b4718e67586fbc9e22b", size = 45866, upload-time = "2026-09-11T07:31:28.501Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a4/99/4901701a076c2569cec067c94eb5605f59c86e62b34b3a1b5b2f8279361a/mpe2-1.1.1-py3-none-any.whl", hash = "sha256:cea9ffc0979f249d6fcf0faab097cf6e2af1bbec12f833c253bab80dca08d4c1", size = 64424, upload-time = "2026-09-11T07:31:27.32Z" },
+]
+
+[[package]]
 name = "mpmath"
 version = "1.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -521,6 +535,20 @@ wheels = [
 ]
 
 [[package]]
+name = "pettingzoo"
+version = "1.27.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "gymnasium" },
+    { name = "numpy" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e5/14/2c089f488135e699db7d473490b6ceb84df5b470b4bc64f435d9b42041e9/pettingzoo-1.27.0.tar.gz", hash = "sha256:d61210fff2ba59f54e191796dc8b16b37d201137b28882f4c96dd7121a749033", size = 472105, upload-time = "2026-08-13T18:02:41.809Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7b/1f/ff1bebbe1fc168b6435b482a34d9757249c9da1b14ebc61868cc19998cca/pettingzoo-1.27.0-py3-none-any.whl", hash = "sha256:075a6ab7c32d32d9a674f1af395010198bf09c172341aa38fa5415461601ac61", size = 668492, upload-time = "2026-08-13T18:02:40.528Z" },
+]
+
+[[package]]
 name = "pillow"
 version = "12.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -632,6 +660,26 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ac/ad/5565071e937d8e752842ac241463944c9eb14c87e2d269f2658a5bd05e98/pydantic_core-2.46.4-pp311-pypy311_pp73-musllinux_1_1_armv7l.whl", hash = "sha256:d396ec2b979760aaf3218e76c24e65bd0aca24983298653b3a9d7a45f9e47b30", size = 2310000, upload-time = "2026-05-06T13:37:56.694Z" },
     { url = "https://files.pythonhosted.org/packages/4f/c3/66883a5cec183e7fba4d024b4cbbe61851a63750ef606b0afecc46d1f2bf/pydantic_core-2.46.4-pp311-pypy311_pp73-musllinux_1_1_x86_64.whl", hash = "sha256:86e1a4418c6cd97d60c95c71164158eaf7324fae7b0923264016baa993eba6fc", size = 2361286, upload-time = "2026-05-06T13:40:05.667Z" },
     { url = "https://files.pythonhosted.org/packages/4b/2d/69abac8f838090bbecd5df894befb2c2619e7996a98ddb949db9f3b93225/pydantic_core-2.46.4-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:d51026d73fcfd93610abc7b27789c26b313920fcfb20e27462d74a7f8b06e983", size = 2193071, upload-time = "2026-05-06T13:38:08.682Z" },
+]
+
+[[package]]
+name = "pygame-ce"
+version = "2.5.8"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/26/2d/0f942ec31d558a6a1f2fd0df9965ff0055f165ed5b8d36f6509b1f3768a2/pygame_ce-2.5.8.tar.gz", hash = "sha256:3c8e69088ead310037972c391306ea58e74d7296b35d1890067749235fd554ba", size = 5300831, upload-time = "2026-08-09T11:39:49.226Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/97/9b/884fb7367951e74e7f77061bb08e893272794c07b1212dc61ba258c3c71e/pygame_ce-2.5.8-cp311-cp311-macosx_10_11_universal2.whl", hash = "sha256:9e98223c8874177c8441923a8f60da76b1de9d7f2450602a4c7ef24c15e84f1a", size = 16588698, upload-time = "2026-08-09T11:38:07.009Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/7d/b3f3a58cd09e97dbbedde419bedb7ead1f7e4d3cd6465b00bdf56766ded9/pygame_ce-2.5.8-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:a7b2a54548926eaf535ac574cfa6528f96bd1e2f524a20fea514b2922dd68bcc", size = 12060566, upload-time = "2026-08-09T11:38:09.516Z" },
+    { url = "https://files.pythonhosted.org/packages/ca/8b/7ba5dbf40ff461984327539a6895ada8ab2eac4c035238f97a0fd9da9866/pygame_ce-2.5.8-cp311-cp311-manylinux2014_i686.manylinux_2_17_i686.whl", hash = "sha256:ff283d1bee65e208cf2f0da7f2f4e3d0993d1787938898de2872fbefab1f786b", size = 12599420, upload-time = "2026-08-09T11:38:12.101Z" },
+    { url = "https://files.pythonhosted.org/packages/05/02/c315738725cd08d2ff4cc8f8dd29638e69e70f200d3610bcd291cbb886b8/pygame_ce-2.5.8-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:33e1b5a78cd6d25c2c8f00c09cdc0ba8000eec81b53dc7d8d7323d8319691d69", size = 12155284, upload-time = "2026-08-09T11:38:14.456Z" },
+    { url = "https://files.pythonhosted.org/packages/17/3d/b9d57ebab57fdef946626ae275b111c077b83fe0d0ccc3a2ec12b17523d2/pygame_ce-2.5.8-cp311-cp311-win32.whl", hash = "sha256:b919b49b8a41564f7d0ad43f6dc97a66f29d3956fb592581f4abd62442644c9c", size = 9122893, upload-time = "2026-08-09T11:38:16.789Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/68/54cbebea295bbd9598604e3b4c3ef2aff75df1612482c2d102963151096c/pygame_ce-2.5.8-cp311-cp311-win_amd64.whl", hash = "sha256:0f75f6cf17607e380687aa5551c46aa830c8037b2950c71e48be8891ddc737da", size = 9666898, upload-time = "2026-08-09T11:38:19.213Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/8a/79129cc0c755d639d180a582869e4c7a0d5106dbf611262bcf5d554ce59d/pygame_ce-2.5.8-cp311-cp311-win_arm64.whl", hash = "sha256:8e7931bd6b8ffc1474e7b3d5717e18bf8ff3eed95ab9042f1b9a0907e9ff6519", size = 10212252, upload-time = "2026-08-09T11:38:21.537Z" },
+    { url = "https://files.pythonhosted.org/packages/9f/b8/525dfcfda50ea9e98cd4097d6d0beabcfa0a6007475c04dab2021077c6de/pygame_ce-2.5.8-pp311-pypy311_pp73-macosx_10_15_universal2.whl", hash = "sha256:0aa908c9fce4d508205e0b9cdc0f7338066da63322f6bcaa9a9c8aff9155a87e", size = 16485912, upload-time = "2026-08-09T11:39:37.277Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/33/d02386a4314be22bc6198d93c2d99f372c0c8c7b71fc9c390cf36d5c5c99/pygame_ce-2.5.8-pp311-pypy311_pp73-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:894faf17699ea7f14eabd9161ef532c1d248e40f568dab9240fc68b4c1ea85dc", size = 12008829, upload-time = "2026-08-09T11:39:39.717Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/26/a14abbac97c681385dbb01d5c44c867992dbf2265a784af35141c485813e/pygame_ce-2.5.8-pp311-pypy311_pp73-manylinux2014_i686.manylinux_2_17_i686.whl", hash = "sha256:0d0c4b2b38e1946ea7a7c625ea317e237573e8731e4a56055eb4361b3c2daa0f", size = 12538786, upload-time = "2026-08-09T11:39:42.37Z" },
+    { url = "https://files.pythonhosted.org/packages/28/6c/2a8d9ca41d40e2d30e940107a019bbc17de518948c360789f59a439d689a/pygame_ce-2.5.8-pp311-pypy311_pp73-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:9ea02f653f76d496870766e1fb8419b6a6aebd81d40265057672f1f6d63d3509", size = 12102335, upload-time = "2026-08-09T11:39:44.64Z" },
+    { url = "https://files.pythonhosted.org/packages/47/b5/1068d4d24891b17fcb6cf3556b1de8d5821a2bc44ebbea2b25dbd767ae2b/pygame_ce-2.5.8-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:f2f2f1c03dc8d4460779f9e55f959a7c7e523101b3530f60f3208e5ca65a6216", size = 9635346, upload-time = "2026-08-09T11:39:46.968Z" },
 ]
 
 [[package]]
@@ -772,6 +820,9 @@ cpu = [
 cu118 = [
     { name = "torch", version = "2.7.0+cu118", source = { registry = "https://download.pytorch.org/whl/cu118" } },
 ]
+marl = [
+    { name = "mpe2" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -782,13 +833,14 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "mpe2", marker = "extra == 'marl'", specifier = "==1.1.1" },
     { name = "numpy", specifier = "==2.4.6" },
     { name = "ray", extras = ["rllib"], specifier = "==2.56.1" },
     { name = "tensorboardx", specifier = "==2.6.5" },
     { name = "torch", marker = "extra == 'cpu'", specifier = "==2.7.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "rllib-async-runtime", extra = "cpu" } },
     { name = "torch", marker = "extra == 'cu118'", specifier = "==2.7.0", index = "https://download.pytorch.org/whl/cu118", conflict = { package = "rllib-async-runtime", extra = "cu118" } },
 ]
-provides-extras = ["cpu", "cu118"]
+provides-extras = ["marl", "cpu", "cu118"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -217,6 +217,7 @@ def make_group(
     checkpoint_state: dict[str, object] | None = None,
     seed: int | None = None,
     reward_window_episodes: int = 100,
+    runner_count: int = 4,
 ) -> AsyncRolloutGroup:
     install_fake_ray(monkeypatch)
     codec = FlatEpisodeCodec()
@@ -229,7 +230,7 @@ def make_group(
         FakeReplayActor(codec),
         member_id="member-0",
         initial_weights=initial_weights or make_weights(0),
-        runner_count=4,
+        runner_count=runner_count,
         max_episode_steps=10,
         pending_commit_high_watermark=high,
         pending_commit_low_watermark=low,
@@ -237,6 +238,21 @@ def make_group(
         num_cpus_per_runner=0,
         checkpoint_state=checkpoint_state,
     )
+
+
+def test_large_rollout_group_keeps_all_runners_active_with_bounded_commits(monkeypatch):
+    group = make_group(monkeypatch, high=256, low=128, runner_count=128)
+    group.start()
+    assert group.pending_sample_calls == 128
+    group.poll(timeout_s=0, max_events=128)
+    stats = group.get_stats()
+    assert stats.outstanding_high_watermark <= 256
+    assert stats.sample_calls_started >= 128
+    calls = []
+    group.drain(on_wait=lambda: calls.append(True))
+    assert calls
+    assert group.pending_sample_calls == group.pending_episode_commits == 0
+    group.stop()
 
 
 def test_dqn_exploration_clock_survives_rollout_restore(monkeypatch) -> None:

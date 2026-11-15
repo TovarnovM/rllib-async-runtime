@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -198,6 +198,7 @@ class SingleMemberAsyncTeam(SingleMemberAsyncSAC):
         pbt_state: MixedPBTModelState | None = None,
         reward_window_episodes: int = 100,
         worker_bundle_start: int = 2,
+        on_wait: Callable[[], None] | None = None,
     ) -> None:
         (
             rollout,
@@ -232,6 +233,7 @@ class SingleMemberAsyncTeam(SingleMemberAsyncSAC):
             pbt_state=pbt_state,
             reward_window_episodes=reward_window_episodes,
             worker_bundle_start=worker_bundle_start,
+            on_wait=on_wait,
         )
 
     def _make_codec(self) -> RawMultiModuleEpisodeCodec:
@@ -329,7 +331,7 @@ class SingleMemberAsyncTeam(SingleMemberAsyncSAC):
 
         self._require_not_stopped()
         self._validate_transfer_contract(state)
-        ray.get(self._learner_actor.validate_pbt_state.remote(state))
+        self._get(self._learner_actor.validate_pbt_state.remote(state))
 
     def export_pbt_state(self) -> MixedPBTModelState:
         state = super().export_pbt_state()

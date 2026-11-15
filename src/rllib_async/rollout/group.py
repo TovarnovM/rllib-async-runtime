@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -237,9 +237,9 @@ class AsyncRolloutGroup:
         if (
             not isinstance(runner_count, int)
             or isinstance(runner_count, bool)
-            or not 1 <= runner_count <= 16
+            or runner_count < 1
         ):
-            raise ValueError("runner_count must be between 1 and 16")
+            raise ValueError("runner_count must be a positive integer")
         if (
             not isinstance(pending_commit_high_watermark, int)
             or isinstance(pending_commit_high_watermark, bool)
@@ -389,7 +389,12 @@ class AsyncRolloutGroup:
         self._state = RolloutGroupState.RUNNING
         self._schedule_available()
 
-    def drain(self, *, timeout_s: float | None = None) -> list[RolloutCompletion]:
+    def drain(
+        self,
+        *,
+        timeout_s: float | None = None,
+        on_wait: Callable[[], None] | None = None,
+    ) -> list[RolloutCompletion]:
         """Finish active episodes and commits without starting new episodes."""
 
         if self._state is RolloutGroupState.RUNNING:
@@ -408,6 +413,8 @@ class AsyncRolloutGroup:
         deadline = time.monotonic() + timeout_s if timeout_s is not None else None
         completions: list[RolloutCompletion] = []
         while self._pending_samples or self._pending_commits:
+            if on_wait is not None:
+                on_wait()
             remaining = (
                 None if deadline is None else max(deadline - time.monotonic(), 0.0)
             )

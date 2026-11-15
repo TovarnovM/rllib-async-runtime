@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field, replace
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
@@ -1560,6 +1561,7 @@ class PopulationAsyncSAC:
                 else 100
             ),
             "worker_bundle_start": self._worker_bundle_start(slot_id),
+            "on_wait": partial(self._pump_peers, slot_id),
         }
         if member.module_configs is not None:
             return SingleMemberAsyncTeam(
@@ -1675,6 +1677,17 @@ class PopulationAsyncSAC:
             self._state = RuntimeState.FAILED
             raise
         self._state = RuntimeState.RUNNING
+
+    def _pump_peers(self, waiting_slot: str) -> None:
+        """Service other live members while one member drains or initializes."""
+
+        for slot_id, member in self._members.items():
+            if (
+                slot_id != waiting_slot
+                and slot_id != self._restarting_slot
+                and member.state is RuntimeState.RUNNING
+            ):
+                member.pump_once(timeout_s=0.0)
 
     def pump_once(self) -> None:
         self._require_running()

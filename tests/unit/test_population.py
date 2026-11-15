@@ -675,8 +675,10 @@ def test_target_restart_uses_new_identity_shared_replay_and_fails_fast(
         replay_actor,
         reward_window_episodes,
         worker_bundle_start,
+        on_wait,
     ):
         assert worker_bundle_start == 2
+        assert callable(on_wait)
         del cls
         captured.update(
             {

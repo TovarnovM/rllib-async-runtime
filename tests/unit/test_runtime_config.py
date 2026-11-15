@@ -40,13 +40,20 @@ def test_runtime_config_rejects_unbounded_or_ambiguous_settings() -> None:
             evaluation_interval_env_steps=0,
             evaluation_num_episodes=1,
         )
-    with pytest.raises(ValueError, match="between 1 and 16"):
-        AsyncSACRuntimeConfig(runner_count=17)
-    with pytest.raises(ValueError, match="between 1 and 16"):
+    with pytest.raises(ValueError, match="positive integer"):
         AsyncSACRuntimeConfig(runner_count=0)
     for member_id in (".", "..", "parent/child", r"parent\child"):
         with pytest.raises(ValueError, match="path segment"):
             AsyncSACRuntimeConfig(member_id=member_id)
+
+
+@pytest.mark.parametrize("workers,gpu", [(64, 0.5), (128, 0.25)])
+def test_cluster_scale_and_fractional_gpu_survive_checkpoint_config(workers, gpu):
+    config = AsyncSACRuntimeConfig(runner_count=workers, num_gpus_per_learner=gpu)
+    assert config.matches_checkpoint(asdict(config))
+    for invalid in (-0.25, 1.25, float("nan"), True):
+        with pytest.raises(ValueError, match="num_gpus_per_learner"):
+            replace(config, num_gpus_per_learner=invalid)
 
 
 def test_runtime_config_accepts_phase_11_direct_single_runner_baseline() -> None:

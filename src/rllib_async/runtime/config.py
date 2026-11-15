@@ -93,9 +93,9 @@ class AsyncSACRuntimeConfig:
         if (
             not isinstance(self.runner_count, int)
             or isinstance(self.runner_count, bool)
-            or not 1 <= self.runner_count <= 16
+            or self.runner_count < 1
         ):
-            raise ValueError("runner_count must be between 1 and 16")
+            raise ValueError("runner_count must be a positive integer")
         for name in (
             "max_episode_steps",
             "replay_capacity_transitions",
@@ -165,8 +165,8 @@ class AsyncSACRuntimeConfig:
             "num_gpus_per_learner",
         ):
             self._non_negative_float(name, getattr(self, name))
-        if self.num_gpus_per_learner not in {0.0, 1.0}:
-            raise ValueError("num_gpus_per_learner must be 0 or 1")
+        if self.num_gpus_per_learner > 1.0:
+            raise ValueError("num_gpus_per_learner must be between 0 and 1")
         self._non_negative_float("replay_sync_interval_s", self.replay_sync_interval_s)
         for name in ("validate_startup", "colocate_replay_and_learners"):
             if not isinstance(getattr(self, name), bool):
