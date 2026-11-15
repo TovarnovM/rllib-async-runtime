@@ -99,6 +99,13 @@ not only on the preceding `uv sync`: Ray 2.56 propagates the original `uv run`
 arguments to worker processes, and omitting the extra would create workers
 without PyTorch.
 
+Use uv's default project-local `.venv` in the devcontainer and Ray packaged
+working directories. Do not export an absolute `UV_PROJECT_ENVIRONMENT`: worker
+`uv run` would reinstall the packaged project into the driver environment,
+leaving its editable installation broken when Ray's temporary tree is removed.
+Rebuild older devcontainers that set `UV_PROJECT_ENVIRONMENT` and select
+`${workspaceFolder}/.venv/bin/python` as the editor interpreter.
+
 Target-hardware GPU validation is deliberately separate from the normal
 development loop. Its exact prerequisites, commands, artifact layout, and
 acceptance criteria are maintained in [`debt.md`](debt.md).
