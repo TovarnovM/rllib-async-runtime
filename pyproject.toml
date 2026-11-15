@@ -27,6 +27,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+marl = [
+    "mpe2==1.1.1",
+]
 cpu = [
     "torch==2.7.0",
 ]

@@ -1,0 +1,62 @@
+name: MARL validation
+
+on:
+  push:
+    branches:
+      - feature/dqn-hierarchy-gnn
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lock:
+    if: contains(github.event.head_commit.message, '[marl-lock]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
+          python-version: "3.11"
+      - run: uv lock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: marl-lock
+          path: uv.lock
+          retention-days: 7
+
+  acceptance:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.head_commit.message, '[marl-validation]')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      SDL_VIDEODRIVER: dummy
+      SDL_AUDIODRIVER: dummy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.29"
+          python-version: "3.11"
+          enable-cache: true
+      - run: uv sync --locked --extra cpu --extra marl --group dev
+      - run: uv run --locked --extra cpu --extra marl --group dev ruff check .
+      - run: uv run --locked --extra cpu --extra marl --group dev ruff format --check .
+      - run: >-
+          uv run --locked --extra cpu --extra marl --group dev pytest
+          tests/unit/test_marl_spread.py tests/unit/test_cluster_monitor.py
+          tests/integration/test_marl_spread.py
+          --junitxml=artifacts/marl-tests.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: marl-cpu-${{ github.sha }}
+          path: artifacts/
+          retention-days: 14
