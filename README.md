@@ -53,6 +53,16 @@ Full checkpoint restore preserves those states. C51 with dueling uses corrected
 per-atom value heads; checkpoints from the older scalar-head C51/dueling path
 are rejected explicitly. Other existing DQN/SAC checkpoint paths remain supported.
 
+The optional `marl` extra adds a real MPE2 Simple Spread benchmark with graph
+observations: continuous SAC teams or mixed **DQN + continuous SAC** teams.
+The cluster launcher reserves one colocated replay/learner core, supports
+64–128 rollout actors per member and fractional GPU requests, and collects
+CPU/network/GPU telemetry in external per-node processes. PBT lifecycle waits
+service the other active members. See the [cluster acceptance guide](
+docs/MARL_CLUSTER_ACCEPTANCE_RU.md) for preflight, 4–8 member launch commands,
+checkpoint/resume and the separate target-GPU checks. Resource support and
+short functional tests do not establish learning quality or cluster throughput.
+
 ## Development contract
 
 Local development, dependency installation, linting, tests, and debugging are

@@ -40,8 +40,15 @@ class NodeMonitor:
         self._path = self._directory / "node.jsonl.gz"
         self._log = (self._directory / "stderr.txt").open("w")
         self._process = subprocess.Popen(
-            [sys.executable, "-m", "benchmarks.cluster_monitor", "--output", str(self._path)],
-            stdout=subprocess.DEVNULL, stderr=self._log,
+            [
+                sys.executable,
+                "-m",
+                "benchmarks.cluster_monitor",
+                "--output",
+                str(self._path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=self._log,
         )
 
     def describe(self) -> dict:
@@ -49,8 +56,12 @@ class NodeMonitor:
             "node_id": ray.get_runtime_context().get_node_id(),
             "sampler_pid": self._process.pid,
             "sampler_exit_code": self._process.poll(),
+            "sample_written": self._path.exists() and self._path.stat().st_size > 100,
             "cpu_affinity": sorted(os.sched_getaffinity(0)),
-            "versions": {name: importlib.metadata.version(name) for name in ("ray", "torch", "mpe2")},
+            "versions": {
+                name: importlib.metadata.version(name)
+                for name in ("ray", "torch", "mpe2")
+            },
         }
 
     def stop(self) -> dict:
@@ -136,11 +147,19 @@ def preflight(param_space: dict, nodes: list[dict], available: dict) -> dict:
         for node in nodes
     )
     return {
-        "required": required, "available": available,
-        "core_bundle": core, "core_fits_one_node_total_resources": core_fits,
+        "required": required,
+        "available": available,
+        "core_bundle": core,
+        "core_fits_one_node_total_resources": core_fits,
         "resource_deficits": deficits,
         "ready": not deficits and core_fits,
-        "nodes": [{key: node.get(key) for key in ("NodeID", "NodeManagerAddress", "Resources")} for node in nodes],
+        "nodes": [
+            {
+                key: node.get(key)
+                for key in ("NodeID", "NodeManagerAddress", "Resources")
+            }
+            for node in nodes
+        ],
     }
 
 
@@ -186,16 +205,25 @@ def main() -> None:
     args = parse_args()
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
-    settings = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
+    settings = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
     (args.output / "config.json").write_text(json.dumps(settings, indent=2) + "\n")
-    thread_env = {name: "1" for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS")}
+    thread_env = {
+        name: "1"
+        for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS")
+    }
     thread_env.update({"SDL_VIDEODRIVER": "dummy", "SDL_AUDIODRIVER": "dummy"})
     ray.init(address=args.address, runtime_env={"env_vars": thread_env})
     monitors = {}
     monitor_errors = {}
     try:
         members = build_members(args)
-        mutations = {f"sac/{name}": FloatMutation(1e-5, 1e-3) for name in ("actor_lr", "critic_lr", "alpha_lr")}
+        mutations = {
+            f"sac/{name}": FloatMutation(1e-5, 1e-3)
+            for name in ("actor_lr", "critic_lr", "alpha_lr")
+        }
         if args.mode == "mixed":
             mutations["dqn/lr"] = FloatMutation(1e-5, 1e-3)
         param_space = {
@@ -207,7 +235,8 @@ def main() -> None:
                 metric_key="evaluation/latest_return_mean",
                 reward_window_episodes=100,
                 min_episodes_after_restart=4,
-                mutations=mutations, seed=args.seed,
+                mutations=mutations,
+                seed=args.seed,
             ),
             "run_mode": "resume" if args.resume else "new",
         }
@@ -215,7 +244,9 @@ def main() -> None:
             param_space["checkpoint_path"] = str(args.resume.resolve())
         nodes = [node for node in ray.nodes() if node["Alive"]]
         inventory = preflight(param_space, nodes, ray.available_resources())
-        (args.output / "preflight.json").write_text(json.dumps(inventory, indent=2) + "\n")
+        (args.output / "preflight.json").write_text(
+            json.dumps(inventory, indent=2) + "\n"
+        )
         if not inventory["ready"]:
             raise RuntimeError("Resource preflight failed; inspect preflight.json")
         if args.preflight_only:
@@ -226,25 +257,42 @@ def main() -> None:
             monitors[node_id] = NodeMonitor.options(
                 scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False)
             ).remote()
-        descriptions = ray.get([actor.describe.remote() for actor in monitors.values()], timeout=120)
-        (args.output / "monitors.json").write_text(json.dumps(descriptions, indent=2) + "\n")
+        descriptions = ray.get(
+            [actor.describe.remote() for actor in monitors.values()], timeout=120
+        )
+        (args.output / "monitors.json").write_text(
+            json.dumps(descriptions, indent=2) + "\n"
+        )
         if any(item["sampler_exit_code"] is not None for item in descriptions):
             raise RuntimeError("An external monitor failed to start")
         results = tune.Tuner(
             PopulationTrainable,
             param_space=param_space,
+            tune_config=tune.TuneConfig(
+                time_budget_s=args.reports * args.report_interval_s + 600,
+            ),
             run_config=RunConfig(
-                name="marl", storage_path=str(args.output),
+                name="marl",
+                storage_path=str(args.output),
                 stop={"training_iteration": args.reports},
-                checkpoint_config=CheckpointConfig(num_to_keep=1, checkpoint_at_end=True),
+                checkpoint_config=CheckpointConfig(
+                    num_to_keep=1, checkpoint_at_end=True
+                ),
             ),
         ).fit()
         if len(results) != 1 or results[0].error is not None:
             raise RuntimeError(f"MARL population failed: {results.errors}")
         result = results[0]
-        (args.output / "result.json").write_text(json.dumps(result.metrics, indent=2, default=str) + "\n")
+        (args.output / "result.json").write_text(
+            json.dumps(result.metrics, indent=2, default=str) + "\n"
+        )
+        if result.metrics["training_iteration"] < args.reports:
+            raise RuntimeError("Campaign stopped before its requested report budget")
         if not all(
-            all(dict(counters)["optimizer_updates"] > 0 for _, counters in member["learner"]["module_counters"])
+            all(
+                dict(counters)["optimizer_updates"] > 0
+                for _, counters in member["learner"]["module_counters"]
+            )
             for member in result.metrics["members"].values()
         ):
             raise RuntimeError("Not every policy made learner progress")
@@ -254,14 +302,18 @@ def main() -> None:
         for node_id, actor in monitors.items():
             try:
                 evidence = ray.get(actor.stop.remote(), timeout=20)
-                (args.output / f"node-{node_id}.jsonl.gz").write_bytes(evidence.pop("data"))
+                (args.output / f"node-{node_id}.jsonl.gz").write_bytes(
+                    evidence.pop("data")
+                )
                 if evidence["exit_code"] != 0:
                     monitor_errors[node_id] = evidence
             except Exception as error:
                 monitor_errors[node_id] = repr(error)
             finally:
                 ray.kill(actor, no_restart=True)
-        (args.output / "monitor-errors.json").write_text(json.dumps(monitor_errors, indent=2) + "\n")
+        (args.output / "monitor-errors.json").write_text(
+            json.dumps(monitor_errors, indent=2) + "\n"
+        )
         ray.shutdown()
     if monitor_errors:
         raise RuntimeError("Monitoring was incomplete; inspect monitor-errors.json")

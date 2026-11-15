@@ -10,7 +10,6 @@ from dataclasses import replace
 from typing import Any
 
 import gymnasium as gym
-import ray
 from ray import cloudpickle
 from ray.rllib.algorithms.algorithm_config import AlgorithmConfig
 from ray.rllib.algorithms.dqn import DQNConfig

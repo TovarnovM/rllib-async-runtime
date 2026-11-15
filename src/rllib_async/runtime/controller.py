@@ -606,7 +606,7 @@ class SingleMemberAsyncSAC:
             if include_authoritative_replay
             else None
         )
-        learner = ray.get(self._learner_actor.get_stats.remote())
+        learner = self._get(self._learner_actor.get_stats.remote())
         if replay is not None and not isinstance(replay, ReplayStats):
             raise RuntimeError("replay actor returned invalid stats")
         if not isinstance(learner, LearnerHostStats):

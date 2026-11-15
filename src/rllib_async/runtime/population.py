@@ -1226,6 +1226,7 @@ class PopulationAsyncSAC:
         self._last_exploit_duration_s = 0.0
         self._last_pbt_event = self._empty_pbt_event("not_started")
         self._restarting_slot: str | None = None
+        self._servicing_peers = False
         self._checkpoint_replay_state: EpisodeStoreState | None = None
         self._checkpoint_member_states: (
             dict[
@@ -1681,13 +1682,19 @@ class PopulationAsyncSAC:
     def _pump_peers(self, waiting_slot: str) -> None:
         """Service other live members while one member drains or initializes."""
 
-        for slot_id, member in self._members.items():
-            if (
-                slot_id != waiting_slot
-                and slot_id != self._restarting_slot
-                and member.state is RuntimeState.RUNNING
-            ):
-                member.pump_once(timeout_s=0.0)
+        if self._servicing_peers:
+            return
+        self._servicing_peers = True
+        try:
+            for slot_id, member in self._members.items():
+                if (
+                    slot_id != waiting_slot
+                    and slot_id != self._restarting_slot
+                    and member.state is RuntimeState.RUNNING
+                ):
+                    member.pump_once(timeout_s=0.0)
+        finally:
+            self._servicing_peers = False
 
     def pump_once(self) -> None:
         self._require_running()

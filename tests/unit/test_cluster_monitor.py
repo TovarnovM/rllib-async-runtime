@@ -26,15 +26,33 @@ def test_monitor_rates_use_one_core_and_full_duplex_link_directions():
     assert result["network"]["eth0"]["tx_link_fraction"] == 0.5
     current["processes"]["42"].pop("cpu_percent_one_core")
     current["processes"]["42"]["start_ticks"] = 6
-    assert "cpu_percent_one_core" not in add_rates(current, previous, clock_ticks=100)["processes"]["42"]
+    assert (
+        "cpu_percent_one_core"
+        not in add_rates(current, previous, clock_ticks=100)["processes"]["42"]
+    )
 
 
 def test_gpu_monitor_records_missing_tool_instead_of_faking_zero_load():
     result = gpu_snapshot("/nonexistent/nvidia-smi")
-    assert result == {"devices_error": "FileNotFoundError", "processes_error": "FileNotFoundError"}
+    assert result == {
+        "devices_error": "FileNotFoundError",
+        "processes_error": "FileNotFoundError",
+    }
 
 
 def test_counter_reset_is_not_negative_network_throughput():
-    previous = {"monotonic_s": 1, "cpu_ticks": {}, "processes": {}, "network": {"eth0": {"rx_bytes": 10, "tx_bytes": 20}}}
-    current = {"monotonic_s": 2, "cpu_ticks": {}, "processes": {}, "network": {"eth0": {"rx_bytes": 1, "tx_bytes": 2}}}
-    assert add_rates(current, previous, clock_ticks=100)["network"]["eth0"]["rx_bytes_per_s"] == pytest.approx(0)
+    previous = {
+        "monotonic_s": 1,
+        "cpu_ticks": {},
+        "processes": {},
+        "network": {"eth0": {"rx_bytes": 10, "tx_bytes": 20}},
+    }
+    current = {
+        "monotonic_s": 2,
+        "cpu_ticks": {},
+        "processes": {},
+        "network": {"eth0": {"rx_bytes": 1, "tx_bytes": 2}},
+    }
+    assert add_rates(current, previous, clock_ticks=100)["network"]["eth0"][
+        "rx_bytes_per_s"
+    ] == pytest.approx(0)

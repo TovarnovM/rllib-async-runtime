@@ -8,16 +8,16 @@ from ray.rllib.algorithms.sac import SACConfig
 
 pytest.importorskip("mpe2")
 
-from mpe2 import simple_spread_v3  # noqa: E402
-from pettingzoo.test import parallel_api_test  # noqa: E402
+from mpe2 import simple_spread_v3
+from pettingzoo.test import parallel_api_test
 
-from rllib_async.examples.marl_spread import (  # noqa: E402
+from rllib_async.examples.marl_spread import (
     GraphSpreadEnv,
     GraphSpreadParallelEnv,
     build_spread_configs,
 )
-from rllib_async.runtime import AsyncRuntimeConfig  # noqa: E402
-from rllib_async.runtime.team import prepare_team_config  # noqa: E402
+from rllib_async.runtime import AsyncRuntimeConfig
+from rllib_async.runtime.team import prepare_team_config
 
 
 @pytest.mark.parametrize("discrete", [0, 2])
@@ -45,11 +45,13 @@ def test_discrete_codebook_matches_native_discrete_physics_and_rewards():
         native.reset(seed=31)
         for action in range(5):
             expected = native.step(dict.fromkeys(native.agents, action))
-            actual = wrapped.step({
-                "agent_0": action,
-                "agent_1": action,
-                "agent_2": np.eye(5, dtype=np.float32)[action],
-            })
+            actual = wrapped.step(
+                {
+                    "agent_0": action,
+                    "agent_1": action,
+                    "agent_2": np.eye(5, dtype=np.float32)[action],
+                }
+            )
             assert actual[1:4] == expected[1:4]
             for agent, raw in expected[0].items():
                 graph = actual[0][agent]["node_features"]
@@ -67,9 +69,9 @@ def test_rllib_adapter_preserves_time_limit_and_physical_clock():
     try:
         env.reset(seed=7)
         for step in (1, 2):
-            _, _, terminated, truncated, _ = env.step({
-                "agent_0": 0, "agent_1": np.zeros(5, dtype=np.float32)
-            })
+            _, _, terminated, truncated, _ = env.step(
+                {"agent_0": 0, "agent_1": np.zeros(5, dtype=np.float32)}
+            )
             assert env.world_t == step
             assert not terminated["__all__"]
             assert truncated["__all__"] == (step == 2)
@@ -96,3 +98,29 @@ def test_spread_uses_dqn_for_discrete_agents_and_supports_shared_gpu(discrete):
         assert set(prepared) == {"sac"}
     assert rollout.policy_mapping_fn("agent_0") == ("dqn" if discrete else "sac")
     assert rollout.policy_mapping_fn("agent_3") == "sac"
+
+
+def test_cluster_preflight_requires_the_whole_learner_core_on_one_node(monkeypatch):
+    from benchmarks.marl_cluster import build_members, parse_args, preflight
+
+    monkeypatch.setattr("sys.argv", [
+        "marl_cluster", "--mode", "mixed", "--output", "/unused",
+        "--members", "4", "--workers", "128",
+    ])
+    members = build_members(parse_args())
+    nodes = [
+        {"NodeID": str(i), "Resources": {"CPU": 512, "GPU": 1}}
+        for i in range(2)
+    ]
+    report = preflight({"members": members}, nodes, {"CPU": 1024, "GPU": 2})
+    assert not report["ready"]
+    assert report["core_bundle"]["GPU"] == 2
+    assert not report["resource_deficits"]
+    nodes[0]["Resources"]["GPU"] = 2
+    assert preflight({"members": members}, nodes, {"CPU": 1024, "GPU": 2})["ready"]
+    assert all(
+        spec.runtime_config.pending_commit_high_watermark == 256 for spec in members
+    )
+    assert all(
+        spec.runtime_config.pending_commit_low_watermark == 128 for spec in members
+    )

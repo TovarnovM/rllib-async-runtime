@@ -32,8 +32,12 @@ def read_snapshot(proc: Path = Path("/proc"), sys: Path = Path("/sys")) -> dict:
         name = name.strip()
         values = [int(value) for value in values.split()]
         item = {
-            "rx_bytes": values[0], "rx_errors": values[2], "rx_drops": values[3],
-            "tx_bytes": values[8], "tx_errors": values[10], "tx_drops": values[11],
+            "rx_bytes": values[0],
+            "rx_errors": values[2],
+            "rx_drops": values[3],
+            "tx_bytes": values[8],
+            "tx_errors": values[10],
+            "tx_drops": values[11],
             "physical": (sys / "class/net" / name / "device").exists(),
         }
         try:
@@ -69,11 +73,18 @@ def read_snapshot(proc: Path = Path("/proc"), sys: Path = Path("/sys")) -> dict:
     lines = (proc / "net/snmp").read_text().splitlines()
     for header, values in zip(lines[::2], lines[1::2], strict=True):
         if header.startswith("Tcp:"):
-            tcp = dict(zip(header.split()[1:], map(int, values.split()[1:]), strict=True))
+            tcp = dict(
+                zip(header.split()[1:], map(int, values.split()[1:]), strict=True)
+            )
     return {
-        "time_unix_s": time.time(), "monotonic_s": time.monotonic(),
-        "cpu_ticks": cpu, "network": network, "processes": processes,
-        "memory": memory, "tcp": tcp, "load_average": list(os.getloadavg()),
+        "time_unix_s": time.time(),
+        "monotonic_s": time.monotonic(),
+        "cpu_ticks": cpu,
+        "network": network,
+        "processes": processes,
+        "memory": memory,
+        "tcp": tcp,
+        "load_average": list(os.getloadavg()),
     }
 
 
@@ -104,12 +115,16 @@ def add_rates(current: dict, previous: dict, *, clock_ticks: int) -> dict:
             values[direction + "_bytes_per_s"] = max(0, delta) / elapsed
             speed = values.get("speed_mbps")
             if speed is not None and speed > 0:
-                values[direction + "_link_fraction"] = max(0, delta) * 8 / (elapsed * speed * 1e6)
+                values[direction + "_link_fraction"] = (
+                    max(0, delta) * 8 / (elapsed * speed * 1e6)
+                )
     for pid, values in current["processes"].items():
         old = previous["processes"].get(pid)
         if old and old["start_ticks"] == values["start_ticks"]:
             values["cpu_percent_one_core"] = (
-                max(0, values["cpu_ticks"] - old["cpu_ticks"]) * 100 / (clock_ticks * elapsed)
+                max(0, values["cpu_ticks"] - old["cpu_ticks"])
+                * 100
+                / (clock_ticks * elapsed)
             )
     return current
 
@@ -117,18 +132,31 @@ def add_rates(current: dict, previous: dict, *, clock_ticks: int) -> dict:
 def gpu_snapshot(executable: str) -> dict:
     result = {}
     queries = {
-        "devices": ("gpu", "index,uuid,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu"),
+        "devices": (
+            "gpu",
+            "index,uuid,utilization.gpu,memory.used,memory.total,power.draw,temperature.gpu",
+        ),
         "processes": ("compute-apps", "gpu_uuid,pid,used_gpu_memory"),
     }
     for label, (kind, fields) in queries.items():
         try:
             output = subprocess.run(
-                [executable, f"--query-{kind}={fields}", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, check=True, timeout=2,
+                [
+                    executable,
+                    f"--query-{kind}={fields}",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=2,
             ).stdout
             result[label] = [
-                dict(zip(fields.split(","), (item.strip() for item in row), strict=True))
-                for row in csv.reader(output.splitlines()) if row
+                dict(
+                    zip(fields.split(","), (item.strip() for item in row), strict=True)
+                )
+                for row in csv.reader(output.splitlines())
+                if row
             ]
         except (OSError, subprocess.SubprocessError, ValueError) as error:
             result[label + "_error"] = type(error).__name__
@@ -156,7 +184,9 @@ def main() -> None:
                 add_rates(current, previous, clock_ticks=os.sysconf("SC_CLK_TCK"))
             current["schema_version"] = 1
             current["hostname"] = socket.gethostname()
-            current["gpu"] = gpu_snapshot(nvidia_smi) if nvidia_smi else {"available": False}
+            current["gpu"] = (
+                gpu_snapshot(nvidia_smi) if nvidia_smi else {"available": False}
+            )
             stream.write(json.dumps(current, allow_nan=False) + "\n")
             stream.flush()
             previous = current

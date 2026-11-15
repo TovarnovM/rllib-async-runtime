@@ -1328,3 +1328,27 @@ def test_population_checkpoint_aligns_late_foreign_commit(
         member.state is RuntimeState.RUNNING and member._learner_updates_completed == 7
         for member in population.members.values()
     )
+
+
+def test_lifecycle_peer_pump_excludes_owner_paused_and_restarting_members():
+    from types import SimpleNamespace
+
+    population = object.__new__(PopulationAsyncSAC)
+    population._servicing_peers = False
+    population._restarting_slot = 'restarting'
+    calls = []
+
+    def pump(slot):
+        calls.append(slot)
+        population._pump_peers(slot)  # Nested RPC wait must not re-enter owners.
+
+    population._members = {
+        slot: SimpleNamespace(
+            state=RuntimeState.PAUSED if slot == 'paused' else RuntimeState.RUNNING,
+            pump_once=lambda *, timeout_s, slot=slot: pump(slot),
+        )
+        for slot in ('waiting', 'peer', 'paused', 'restarting')
+    }
+    population._pump_peers('waiting')
+    assert calls == ['peer']
+    assert not population._servicing_peers

@@ -128,6 +128,24 @@ def test_mixed_population_replacement_checkpoint_and_resume(
         donor = population.members["team-1"]
         old_target = population.members["team-0"]
         donor_models = _inspect(donor, "cuda" if num_gpus else "cpu")["learners"]
+        received_before_start = {}
+        make_replacement = population._make_member
+
+        def capture_replacement(slot, spec, **kwargs):
+            member = make_replacement(slot, spec, **kwargs)
+            try:
+                # Peers keep committing while this host starts. Its first tick
+                # may already train, so inspect model-only transfer before start.
+                assert member.state.value == "created"
+                received_before_start[slot] = _inspect(
+                    member, "cuda" if num_gpus else "cpu"
+                )
+                return member
+            except BaseException:
+                member.stop(graceful=False)
+                raise
+
+        monkeypatch.setattr(population, "_make_member", capture_replacement)
         population._reports_since_perturbation = 10_000
         event = population._maybe_run_pbt_step(
             {
@@ -147,7 +165,7 @@ def test_mixed_population_replacement_checkpoint_and_resume(
         assert old_target.state.value == "stopped"
         target = population.members["team-0"]
         assert target._replay_actor._actor_id == replay_id
-        received = _inspect(target, "cuda" if num_gpus else "cpu")
+        received = received_before_start["team-0"]
         for mid, learner in received["learners"].items():
             assert_tree_close(
                 learner[COMPONENT_RL_MODULE], donor_models[mid][COMPONENT_RL_MODULE]
@@ -237,12 +255,26 @@ def test_mixed_population_replacement_checkpoint_and_resume(
                 run_id="warm",
                 pbt_config=mixed_pbt(),
             )
+            warm_snapshots = {}
+            make_warm_member = warm._make_member
+
+            def capture_warm_start(slot, spec, **kwargs):
+                member = make_warm_member(slot, spec, **kwargs)
+                try:
+                    assert member.state.value == "created"
+                    warm_snapshots[slot] = _inspect(member, "cpu")
+                    return member
+                except BaseException:
+                    member.stop(graceful=False)
+                    raise
+
+            monkeypatch.setattr(warm, "_make_member", capture_warm_start)
             warm.start()
             assert warm.runtime_member_ids != ids
             assert warm._generations == {"team-0": 0, "team-1": 0}
             assert warm._current_hparams["team-0"]["manager/lr"] == 5e-4
-            for slot, member in warm.members.items():
-                snapshot = _inspect(member, "cpu")
+            for slot in warm.members:
+                snapshot = warm_snapshots[slot]
                 for mid, learner in snapshot["learners"].items():
                     previous = saved[slot]["adapters"][mid]["learner_group"]["learner"]
                     assert_tree_close(

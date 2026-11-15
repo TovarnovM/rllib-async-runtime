@@ -264,7 +264,9 @@ def build_spread_configs(
         )
         .rl_module(
             rl_module_spec=MultiRLModuleSpec(
-                rl_module_specs={mid: config.rl_module_spec for mid, config in modules.items()}
+                rl_module_specs={
+                    mid: config.rl_module_spec for mid, config in modules.items()
+                }
             )
         )
         .debugging(seed=seed)
